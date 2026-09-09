@@ -1,0 +1,11 @@
+name: DaynAC
+version: '${version}'
+
+main: zov.grusha.daynAC.DaynAC
+api-version: '1.21.11'
+load: POSTWORLD
+
+commands:
+  daynac:
+    description: Daynac anticheat command
+    usage: /daynac ver
