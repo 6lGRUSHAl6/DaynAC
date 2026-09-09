@@ -9,15 +9,22 @@ import org.bukkit.event.Listener
 import org.bukkit.event.entity.EntityDamageByEntityEvent
 import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.plugin.java.JavaPlugin
-import zov.grusha.daynAC.tracking.CombatMath
 import zov.grusha.daynAC.tracking.SnapshotTracker
 import java.util.Locale
 import java.util.UUID
+import zov.grusha.daynAC.tracking.HitTracker
+import zov.grusha.daynAC.ml.DatasetManager
 
 class DaynAC : JavaPlugin(), Listener {
 
     private val hitCounter = mutableMapOf<Pair<UUID, UUID>, Int>()
     private val snapshotTracker = SnapshotTracker(maxSize = 20)
+    private val hitTracker = HitTracker(maxSize = 8)
+
+    private val datasetManager = DatasetManager(dataFolder)
+
+    // ИЗМЕНЕНИЕ: Теперь храним статус записи для каждого игрока отдельно (по UUID)
+    private val recordingPlayers = mutableMapOf<UUID, String>()
 
     override fun onEnable() {
         logger.info("Enabling plugin...")
@@ -34,11 +41,82 @@ class DaynAC : JavaPlugin(), Listener {
     }
 
     override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<out String>): Boolean {
-        if (command.name.equals("daynac", ignoreCase = true) && args.isNotEmpty() && args[0] == "ver") {
-            sender.sendMessage("daynac v${description.version}")
+        if (command.name.equals("daynac", ignoreCase = true)) {
+            when {
+                args.isNotEmpty() && args[0] == "ver" -> {
+                    sender.sendMessage("daynac v${description.version}")
+                }
+                args.isNotEmpty() && args[0] == "record" -> {
+                    // ИЗМЕНЕНИЕ: Проверяем, что передано достаточно аргументов
+                    if (args.size < 3) {
+                        sender.sendMessage("Использование: /daynac record <ник игрока> <legit|cheat|off>")
+                        return true
+                    }
+
+                    val targetName = args[1]
+                    val targetPlayer = Bukkit.getPlayerExact(targetName)
+
+                    if (targetPlayer == null) {
+                        sender.sendMessage("Игрок $targetName не найден или не в сети.")
+                        return true
+                    }
+
+                    val mode = args[2].lowercase()
+                    when (mode) {
+                        "legit", "cheat" -> {
+                            recordingPlayers[targetPlayer.uniqueId] = mode
+                            sender.sendMessage("Запись датасета для ${targetPlayer.name} включена в режиме: $mode")
+                        }
+                        "off" -> {
+                            recordingPlayers.remove(targetPlayer.uniqueId)
+                            sender.sendMessage("Запись датасета для ${targetPlayer.name} выключена.")
+                        }
+                        else -> {
+                            sender.sendMessage("Использование: /daynac record <ник игрока> <legit|cheat|off>")
+                        }
+                    }
+                }
+                else -> {
+                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record>")
+                }
+            }
             return true
         }
         return false
+    }
+
+    // НОВЫЙ МЕТОД: Обработка подсказок (Tab Completion)
+    override fun onTabComplete(
+        sender: CommandSender,
+        command: Command,
+        alias: String,
+        args: Array<out String>
+    ): MutableList<String>? {
+        if (command.name.equals("daynac", ignoreCase = true)) {
+            when (args.size) {
+                1 -> { // Подсказка для первого аргумента (ver, record)
+                    return listOf("ver", "record")
+                        .filter { it.startsWith(args[0], ignoreCase = true) }
+                        .toMutableList()
+                }
+                2 -> { // Подсказка для второго аргумента (ник игрока, если первый record)
+                    if (args[0].equals("record", ignoreCase = true)) {
+                        return Bukkit.getOnlinePlayers()
+                            .map { it.name }
+                            .filter { it.startsWith(args[1], ignoreCase = true) }
+                            .toMutableList()
+                    }
+                }
+                3 -> { // Подсказка для третьего аргумента (режимы, если первый record)
+                    if (args[0].equals("record", ignoreCase = true)) {
+                        return listOf("legit", "cheat", "off")
+                            .filter { it.startsWith(args[2], ignoreCase = true) }
+                            .toMutableList()
+                    }
+                }
+            }
+        }
+        return null
     }
 
     @EventHandler
@@ -46,131 +124,28 @@ class DaynAC : JavaPlugin(), Listener {
         val attacker = event.damager as? Player ?: return
         val victim = event.entity as? Player ?: return
 
-        val aimAngle = CombatMath.getAimAngle(attacker, victim)
-        val distance = CombatMath.getDistance(attacker, victim)
+        val hitData = snapshotTracker.buildHitData(attacker, victim)
+        hitTracker.addHit(attacker, hitData)
 
-        val (hitTimeDelta, prevAimAngle) = snapshotTracker.registerHitWithAngle(attacker, aimAngle)
+        // ИЗМЕНЕНИЕ: Проверяем, записываем ли мы именно этого атакующего
+        recordingPlayers[attacker.uniqueId]?.let { label ->
+            datasetManager.writeSample(label, hitData)
+        }
 
-        val snapFactor = if (prevAimAngle != null && aimAngle != null) {
-            val safeAngle = aimAngle.coerceAtLeast(0.1)
-            val ratio = prevAimAngle / safeAngle
-            if (ratio.isFinite() && ratio > 0) Math.log1p(ratio.coerceAtMost(100.0)) else null
-        } else null
-
-        // Все метрики
-        val hitTimeCV = snapshotTracker.getHitTimeCV(attacker)
-        val yawEntropyAbs = snapshotTracker.getYawEntropyAbs(attacker)
-        val pitchEntropyAbs = snapshotTracker.getPitchEntropyAbs(attacker)
-        val yawEntropySigned = snapshotTracker.getYawEntropySigned(attacker)
-        val pitchEntropySigned = snapshotTracker.getPitchEntropySigned(attacker)
-        val yawJitterAbs = snapshotTracker.getYawJitterAbs(attacker)
-        val pitchJitterAbs = snapshotTracker.getPitchJitterAbs(attacker)
-        val yawJitterSigned = snapshotTracker.getYawJitterSigned(attacker)
-        val pitchJitterSigned = snapshotTracker.getPitchJitterSigned(attacker)
-
-        val speedXZ = snapshotTracker.getSpeedXZ(attacker)
-        val speedXZText = formatDouble(speedXZ?.toDouble(), "%.3f b/t")
-
-        val rotSmoothYaw = snapshotTracker.getRotationSmoothnessYaw(attacker)
-        val rotSmoothPitch = snapshotTracker.getRotationSmoothnessPitch(attacker)
-        val rotSmoothYawText = formatDouble(rotSmoothYaw, "%.3f")
-        val rotSmoothPitchText = formatDouble(rotSmoothPitch, "%.3f")
-
-        val microAdjustYaw = snapshotTracker.getMicroAdjustCountYaw(attacker)
-        val microAdjustPitch = snapshotTracker.getMicroAdjustCountPitch(attacker)
-        val microAdjustYawText = microAdjustYaw?.toString() ?: "N/A"
-        val microAdjustPitchText = microAdjustPitch?.toString() ?: "N/A"
-
-        val jerkValue = snapshotTracker.getJerkValue(attacker)
-        val jerkText = formatDouble(jerkValue, "%.3f")
-
-        // NEW: straightLineRatio (по Yaw)
-        val straightLineRatio = snapshotTracker.getStraightLineRatio(attacker)
-        val straightLineRatioText = formatDouble(straightLineRatio, "%.3f")
-
-        // Счётчик ударов
         val pairKey = Pair(attacker.uniqueId, victim.uniqueId)
         val currentHits = hitCounter.compute(pairKey) { _, count -> (count ?: 0) + 1 }
 
-        // Форматирование
-        val aimText = formatDouble(aimAngle, "%.2f°")
-        val distanceText = formatDouble(distance, "%.2f")
-        val deltaText = hitTimeDelta?.toString() ?: "N/A"
-        val hitTimeCVText = formatDouble(hitTimeCV, "%.3f")
-        val yawEntropyAbsText = formatDouble(yawEntropyAbs)
-        val pitchEntropyAbsText = formatDouble(pitchEntropyAbs)
-        val yawEntropySignedText = formatDouble(yawEntropySigned)
-        val pitchEntropySignedText = formatDouble(pitchEntropySigned)
-        val yawJitterAbsText = formatDouble(yawJitterAbs)
-        val pitchJitterAbsText = formatDouble(pitchJitterAbs)
-        val yawJitterSignedText = formatDouble(yawJitterSigned)
-        val pitchJitterSignedText = formatDouble(pitchJitterSigned)
-        val snapFactorText = formatDouble(snapFactor, "%.2f")
+        val message = "[LOG] ${attacker.name} hit ${victim.name} (count=$currentHits) $hitData"
 
-        // Консольный лог
-        val plainMessage = buildString {
-            append("[LOG] ")
-            append(attacker.name)
-            append(" hit ")
-            append(victim.name)
-            append(" (count=").append(currentHits).append(") ")
-            append("aim=").append(aimText).append(", ")
-            append("hitDelta=").append(deltaText).append("ms, ")
-            append("hitCV=").append(hitTimeCVText).append(", ")
-            append("yawEntropyAbs=").append(yawEntropyAbsText).append(", ")
-            append("pitchEntropyAbs=").append(pitchEntropyAbsText).append(", ")
-            append("yawEntropySigned=").append(yawEntropySignedText).append(", ")
-            append("pitchEntropySigned=").append(pitchEntropySignedText).append(", ")
-            append("yawJitterAbs=").append(yawJitterAbsText).append(", ")
-            append("speedXZ=").append(speedXZText).append(", ")
-            append("pitchJitterAbs=").append(pitchJitterAbsText).append(", ")
-            append("yawJitterSigned=").append(yawJitterSignedText).append(", ")
-            append("pitchJitterSigned=").append(pitchJitterSignedText).append(", ")
-            append("rotSmoothYaw=").append(rotSmoothYawText).append(", ")
-            append("rotSmoothPitch=").append(rotSmoothPitchText).append(", ")
-            append("snapFactor=").append(snapFactorText).append(", ")
-            append("microAdjustYaw=").append(microAdjustYawText).append(", ")
-            append("microAdjustPitch=").append(microAdjustPitchText).append(", ")
-            append("jerk=").append(jerkText).append(", ")
-            append("straightLineRatio=").append(straightLineRatioText).append(", ")
-            append("distance=").append(distanceText)
-        }
-
-        // Цветное сообщение для операторов
-        val coloredMessage = "§c[LOG] §fИгрок §e${attacker.name} §4ударил игрока §e${victim.name} " +
-                "§7(удар #$currentHits) §b[" +
-                "aim=$aimText, " +
-                "Δt=${deltaText}ms, " +
-                "hitCV=$hitTimeCVText, " +
-                "distance=$distanceText, " +
-                "yawEntropyAbs=$yawEntropyAbsText, " +
-                "pitchEntropyAbs=$pitchEntropyAbsText, " +
-                "yawEntropySigned=$yawEntropySignedText, " +
-                "pitchEntropySigned=$pitchEntropySignedText, " +
-                "spd=$speedXZText, " +
-                "yawJitterAbs=$yawJitterAbsText, " +
-                "pitchJitterAbs=$pitchJitterAbsText, " +
-                "yawJitterSigned=$yawJitterSignedText, " +
-                "pitchJitterSigned=$pitchJitterSignedText, " +
-                "rotSmoothYaw=$rotSmoothYawText, " +
-                "rotSmoothPitch=$rotSmoothPitchText, " +
-                "snapFactor=$snapFactorText, " +
-                "microAdjY=$microAdjustYawText, " +
-                "microAdjP=$microAdjustPitchText, " +
-                "jerk=$jerkText, " +
-                "straightLineRatio=$straightLineRatioText" +
-                "]"
-
-        Bukkit.getOnlinePlayers()
-            .filter { it.isOp }
-            .forEach { op -> op.sendMessage(coloredMessage) }
-
-        logger.info(plainMessage)
+        Bukkit.getOnlinePlayers().filter { it.isOp }.forEach { it.sendMessage(message) }
+        logger.info(message)
     }
 
     @EventHandler
     fun onPlayerQuit(event: PlayerQuitEvent) {
         snapshotTracker.removePlayer(event.player)
+        hitTracker.removePlayer(event.player)
+        recordingPlayers.remove(event.player.uniqueId)
     }
 
     private fun formatDouble(value: Double?, format: String = "%.4f"): String {

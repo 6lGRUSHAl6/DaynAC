@@ -446,4 +446,41 @@ class SnapshotTracker(private val maxSize: Int = 20) {
     fun getSpeedXZ(player: Player): Float? {
         return historySnapshot[player.uniqueId]?.lastOrNull()?.speedXZ
     }
+
+    fun buildHitData(attacker: Player, victim: Player): HitData {
+        val aimAngle = CombatMath.getAimAngle(attacker, victim)
+        val distance = CombatMath.getDistance(attacker, victim)
+
+        val (hitTimeDelta, prevAimAngle) = registerHitWithAngle(attacker, aimAngle)
+
+        val snapFactor = if (prevAimAngle != null && aimAngle != null) {
+            val safeAngle = aimAngle.coerceAtLeast(0.1)
+            val ratio = prevAimAngle / safeAngle
+            if (ratio.isFinite() && ratio > 0) kotlin.math.ln(1 + ratio.coerceAtMost(100.0)) else null
+        } else null
+
+        return HitData(
+            timestamp = System.currentTimeMillis(),
+            aimAngle = aimAngle,
+            distance = distance,
+            hitTimeDelta = hitTimeDelta,
+            hitTimeCV = getHitTimeCV(attacker),
+            yawEntropyAbs = getYawEntropyAbs(attacker),
+            pitchEntropyAbs = getPitchEntropyAbs(attacker),
+            yawEntropySigned = getYawEntropySigned(attacker),
+            pitchEntropySigned = getPitchEntropySigned(attacker),
+            yawJitterAbs = getYawJitterAbs(attacker),
+            pitchJitterAbs = getPitchJitterAbs(attacker),
+            yawJitterSigned = getYawJitterSigned(attacker),
+            pitchJitterSigned = getPitchJitterSigned(attacker),
+            speedXZ = getSpeedXZ(attacker),
+            rotSmoothYaw = getRotationSmoothnessYaw(attacker),
+            rotSmoothPitch = getRotationSmoothnessPitch(attacker),
+            snapFactor = snapFactor,
+            microAdjustYaw = getMicroAdjustCountYaw(attacker),
+            microAdjustPitch = getMicroAdjustCountPitch(attacker),
+            jerkValue = getJerkValue(attacker),
+            straightLineRatio = getStraightLineRatio(attacker)
+        )
+    }
 }
