@@ -170,13 +170,13 @@ class SnapshotTracker(private val maxSize: Int = 20) {
     fun getYawEntropyAbs(player: Player, binCount: Int = 10): Double? {
         val history = historySnapshot[player.uniqueId] ?: return null
         if (history.size < 2) return null
-        return calculateEntropyAbs(history, binCount) { it.yawDeltaAbs }
+        return calculateEntropyAbs(history, binCount, maxRange = 20.0) { it.yawDeltaAbs }
     }
 
     fun getPitchEntropyAbs(player: Player, binCount: Int = 10): Double? {
         val history = historySnapshot[player.uniqueId] ?: return null
         if (history.size < 2) return null
-        return calculateEntropyAbs(history, binCount) { it.pitchDeltaAbs }
+        return calculateEntropyAbs(history, binCount, maxRange = 10.0) { it.pitchDeltaAbs }
     }
 
     fun getYawEntropySigned(player: Player, binCount: Int = 10): Double? {
@@ -194,20 +194,18 @@ class SnapshotTracker(private val maxSize: Int = 20) {
     private inline fun calculateEntropyAbs(
         history: ArrayDeque<PlayerSnapshot>,
         binCount: Int,
+        maxRange: Double = 20.0,   // новый параметр вместо жёсткого 180.0
         selector: (PlayerSnapshot) -> Float
     ): Double {
         if (binCount <= 0) return 0.0
         val bins = IntArray(binCount)
-        val binWidth = 180.0 / binCount
+        val binWidth = maxRange / binCount
         var total = 0
 
         for (snapshot in history) {
-            val value = selector(snapshot).toDouble()
-            val binIndex = if (value.isNaN()) {
-                0
-            } else {
-                (value / binWidth).toInt().coerceIn(0, binCount - 1)
-            }
+            val raw = selector(snapshot).toDouble()
+            val value = if (raw.isNaN()) 0.0 else raw.coerceIn(0.0, maxRange)
+            val binIndex = (value / binWidth).toInt().coerceIn(0, binCount - 1)
             bins[binIndex]++
             total++
         }

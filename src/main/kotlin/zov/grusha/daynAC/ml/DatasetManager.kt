@@ -3,16 +3,25 @@ package zov.grusha.daynAC.ml
 import zov.grusha.daynAC.tracking.HitData
 import java.io.File
 
-class DatasetManager(private val dataFolder: File) {
+class DatasetManager(
+    private val dataFolder: File,
+    private val windowSize: Int = 16
+) {
 
     private val legitFile = File(dataFolder, "legit.csv")
     private val cheatFile = File(dataFolder, "cheat.csv")
+    private val legitVectorFile = File(dataFolder, "legit_vectors.csv")
+    private val cheatVectorFile = File(dataFolder, "cheat_vectors.csv")
 
     init {
         if (!dataFolder.exists()) dataFolder.mkdirs()
         if (!legitFile.exists()) legitFile.writeText(header() + "\n")
         if (!cheatFile.exists()) cheatFile.writeText(header() + "\n")
+        if (!legitVectorFile.exists()) legitVectorFile.writeText(vectorHeader() + "\n")
+        if (!cheatVectorFile.exists()) cheatVectorFile.writeText(vectorHeader() + "\n")
     }
+
+    private fun vectorHeader(): String = FeatureExtractor.csvHeader(windowSize)
 
     private fun header(): String {
         return listOf(
@@ -56,5 +65,62 @@ class DatasetManager(private val dataFolder: File) {
         ).joinToString(",") { it?.toString() ?: "" }
 
         targetFile.appendText(row + "\n")
+    }
+
+    /**
+     * Пишет вектор признаков окна ударов (windowSize * 20 + 7 значений).
+     * Вызывается только когда [FeatureExtractor.extract] вернул непустой вектор —
+     * строк в векторных CSV меньше, чем в поштучных, это нормально.
+     */
+    fun writeVectorSample(label: String, vector: FeatureExtractor.FeatureVector) {
+        val targetFile = when (label) {
+            "legit" -> legitVectorFile
+            "cheat" -> cheatVectorFile
+            else -> return // неизвестная метка — не пишем никуда
+        }
+
+        targetFile.appendText(vector.toCsvRow() + "\n")
+    }
+
+    /**
+     * Читает все векторные сэмплы (legit_vectors.csv + cheat_vectors.csv)
+     * для обучения: пара (список векторов, список меток).
+     * Битые строки (не та длина, нечисловые значения) пропускаются молча.
+     */
+    fun readVectorSamples(): Pair<List<DoubleArray>, List<Double>> {
+        val features = mutableListOf<DoubleArray>()
+        val labels = mutableListOf<Double>()
+
+        fun loadFile(file: File, label: Double) {
+            if (!file.exists()) return
+            file.forEachLine { line ->
+                val trimmed = line.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("h0")) return@forEachLine // заголовок
+                val parts = trimmed.split(',')
+                if (parts.size != windowSize * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES) {
+                    return@forEachLine
+                }
+                val vector = DoubleArray(parts.size) { i ->
+                    val v = parts[i].toDoubleOrNull() ?: return@forEachLine
+                    v
+                }
+                features.add(vector)
+                labels.add(label)
+            }
+        }
+
+        loadFile(legitVectorFile, 0.0)
+        loadFile(cheatVectorFile, 1.0)
+
+        return Pair(features, labels)
+    }
+
+    /** Краткая статистика датасета для команды info. */
+    fun getVectorDatasetStats(): Pair<Int, Int> {
+        fun countLines(file: File): Int =
+            if (!file.exists()) 0
+            else file.readLines().count { it.isNotBlank() && !it.startsWith("h0") }
+
+        return Pair(countLines(legitVectorFile), countLines(cheatVectorFile))
     }
 }

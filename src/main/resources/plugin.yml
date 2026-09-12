@@ -8,4 +8,11 @@ load: POSTWORLD
 commands:
   daynac:
     description: Daynac anticheat command
-    usage: /daynac ver
+    usage: /daynac <ver|record|train|info|debug|allinfo|reload>
+    permission: daynac.admin
+    permission-message: 'У вас нет прав на использование DaynAC.'
+
+permissions:
+  daynac.admin:
+    description: Полный доступ к DaynAC (запись датасета, обучение, детекция)
+    default: op
