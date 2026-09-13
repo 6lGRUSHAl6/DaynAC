@@ -49,6 +49,9 @@ class DetectionEngine(
     /** Причина наказания для кика/бана. */
     val punishReason: String
 
+    /** Банить ли одновременно по IP (punish-action: ban). true = бан профиля + бан IP. */
+    val banWithIp: Boolean
+
     init {
         val config = plugin.config
         flagThreshold = config.getDouble("detection.flag-threshold", 0.65)
@@ -59,6 +62,7 @@ class DetectionEngine(
         punishEnabled = config.getBoolean("detection.punish-enabled", true)
         punishAction = config.getString("detection.punish-action", "kick")?.lowercase() ?: "kick"
         punishReason = config.getString("detection.punish-reason", "KillAura (обнаружено нейросетью DaynAC)")!!
+        banWithIp = config.getBoolean("detection.ban-with-ip", false)
 
         require(punishAction in setOf("none", "kick", "ban")) {
             "detection.punish-action должен быть none/kick/ban, получено: \"$punishAction\""
@@ -277,7 +281,8 @@ class DetectionEngine(
      * Наказание согласно detection.punish-action из конфига:
      *  none — только запись в лог (полное бездействие)
      *  kick — кик с сообщением
-     *  ban  — бан + кик (встроенный бан-лист сервера)
+     *  ban  — бан; при detection.ban-with-ip=true дополнительно бан по IP
+     *         (banPlayerFull), иначе только профиль (UUID)
      *
      * После наказания игрок удаляется из tracking-карт: дело закрыто,
      * из /daynac allinfo он пропадает (иначе наказанный висел бы в GUI
@@ -298,8 +303,14 @@ class DetectionEngine(
                 plugin.logger.warning("[DaynAC] Наказание отключено (punish-action: none): ${player.name}, средний скор $average")
             }
             "ban" -> {
-                plugin.logger.warning("[DaynAC] БАН: ${player.name} (средний скор $average)")
-                player.banPlayerFull(message)  // бан + кик, встроенный бан-лист
+                plugin.logger.warning("[DaynAC] БАН: ${player.name} (средний скор $average, IP-бан: ${if (banWithIp) "да" else "нет"})")
+                if (banWithIp) {
+                    // banPlayerFull = бан профиля + бан по IP адресу (и кик)
+                    player.banPlayerFull(message)
+                } else {
+                    // ban() = бан только по профилю (UUID), без IP; с киком
+                    player.ban(message, null as java.util.Date?, message, true)
+                }
             }
             else -> { // "kick" и любое другое значение, прошедшее require
                 plugin.logger.warning("[DaynAC] Кик: ${player.name} (средний скор $average)")

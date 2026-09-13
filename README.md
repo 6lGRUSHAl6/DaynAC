@@ -161,6 +161,7 @@ detection:
   punish-threshold: 0.95    # автокик/бан (мгновенный скор И среднее)
   punish-enabled: true      # false = режим наблюдения (только оповещения)
   punish-action: kick       # none | kick | ban
+  ban-with-ip: false        # ban: дополнительно банить по IP ( NAT-сети могут задеть невиновных)
   punish-reason: "KillAura (обнаружено нейросетью DaynAC)"
   max-recent-predictions: 10 # окно усреднения для урона и наказания
 ```
