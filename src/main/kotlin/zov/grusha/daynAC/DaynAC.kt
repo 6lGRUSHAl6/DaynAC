@@ -70,6 +70,13 @@ class DaynAC : JavaPlugin(), Listener {
             }
         }, 0L, 1L)
 
+        // TTL-чистка tracking-карт по расписанию, а не при открытии GUI:
+        // на сервере без админов за GUI карта предсказаний росла бы бесконечно.
+        // 15 минут — с запасом больше TTL (1 час), нагрузка пренебрежима.
+        Bukkit.getScheduler().runTaskTimer(this, Runnable {
+            detectionEngine.pruneStaleTracking()
+        }, 15L * 60L * 20L, 15L * 60L * 20L) // 15 минут в тиках
+
         // Загрузка обученной модели, если она совместима с текущей структурой признаков
         if (neuralNetwork.isCompatibleWith(modelFile)) {
             try {
