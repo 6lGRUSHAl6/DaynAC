@@ -7,6 +7,7 @@ import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
 import org.bukkit.event.Listener
 import org.bukkit.event.entity.EntityDamageByEntityEvent
+import org.bukkit.event.entity.EntityDamageEvent
 import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.plugin.java.JavaPlugin
 import zov.grusha.daynAC.tracking.SnapshotTracker
@@ -307,8 +308,14 @@ class DaynAC : JavaPlugin(), Listener {
         return null
     }
 
-    @EventHandler
+    // ignoreCancelled: удары, отменённые другими плагинами (регионы, God-режим),
+    // не должны попадать в историю, датасет и запускать inference.
+    // Фильтр по cause: в 1.9+ sweep-атака мечом генерирует отдельные события
+    // для всех задетых игроков с почти нулевым hitTimeDelta и aimAngle на
+    // случайную жертву — тайминговые признаки выглядят механическими.
+    @EventHandler(ignoreCancelled = true)
     fun onEntityDamagePlayer(event: EntityDamageByEntityEvent) {
+        if (event.cause != EntityDamageEvent.DamageCause.ENTITY_ATTACK) return
         val attacker = event.damager as? Player ?: return
         val victim = event.entity as? Player ?: return
 
