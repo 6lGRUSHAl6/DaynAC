@@ -31,7 +31,7 @@ import kotlin.math.sqrt
  *     (distance, hitTimeDelta) приводят к гигантским градиентам и нестабильному
  *     обучению, которое часто «лечат» завышенным lr и переобучают.
  *
- * Числовые защиты (как в daynac.md): clipping градиентов и дельт ±5.0,
+ * Числовые защиты (как в daynac.md): clipping градиентов ±5.0,
  * clamp входа sigmoid в [-500, 500], epsilon 1e-15 в логарифмах BCE.
  *
  * Потокобезопасность: см. комментарий у [Weights] и [snapshot] — lock-free
@@ -75,7 +75,7 @@ class NeuralNetwork(
 
     companion object {
         private const val EPS = 1e-15          // защита log(0) в BCE
-        private const val CLAMP = 5.0          // clipping градиентов и дельт
+        private const val CLAMP = 5.0          // clipping градиентов
         private const val SIGMOID_CLAMP = 500.0
         private const val MIN_STD = 1e-8       // защита от деления на 0 в z-score
         private const val MAGIC = 0x44414E41   // "DANA" — маркер файла модели
@@ -304,7 +304,7 @@ class NeuralNetwork(
     /**
      * Forward + backward + SGD-обновление по одному сэмплу.
      * Дельта выходного слоя для BCE+Sigmoid упрощается до (ŷ − y).
-     * Градиент веса: δ_j · a_k; обновление: w -= lr · (clip(grad) + l2 · w).
+     * Градиент веса: δ_j · a_k; обновление: w -= lr · clip(δ·a + l2·w).
      * @return предсказание до обновления (для подсчёта loss)
      */
     private fun forwardAndBackprop(
@@ -343,7 +343,7 @@ class NeuralNetwork(
         // Backward: дельты по слоям (от последнего к первому)
         val deltas = arrayOfNulls<DoubleArray>(layerCount)
         val lastDeltas = DoubleArray(1)
-        lastDeltas[0] = (output - label).coerceIn(-CLAMP, CLAMP)
+        lastDeltas[0] = output - label
         deltas[layerCount - 1] = lastDeltas
 
         for (l in layerCount - 2 downTo 0) {
@@ -357,12 +357,14 @@ class NeuralNetwork(
                     sum += nextWeights[n][j] * nextDelta[n]
                 }
                 // ReLU': 1 если нейрон был активен (a > 0), иначе 0
-                delta[j] = if (activation[j] > 0.0) sum.coerceIn(-CLAMP, CLAMP) else 0.0
+                delta[j] = if (activation[j] > 0.0) sum else 0.0
             }
             deltas[l] = delta
         }
 
-        // SGD-обновление: w -= lr * (clip(δ·a + l2·w))
+        // SGD-обновление: w -= lr * clip(δ·a + l2·w) — клиппинг только здесь,
+        // на уровне градиента (стандартная схема); дельты не клиппируем —
+        // их отсечение затирает масштаб ошибки при обратном распространении
         for (l in 0 until layerCount) {
             val prev = activations[l]!!
             val delta = deltas[l]!!
@@ -373,7 +375,7 @@ class NeuralNetwork(
                     val grad = (dj * prev[k] + l2Lambda * wj[k]).coerceIn(-CLAMP, CLAMP)
                     wj[k] -= learningRate * grad
                 }
-                state.biases[l][j] -= learningRate * dj.coerceIn(-CLAMP, CLAMP)
+                state.biases[l][j] -= learningRate * dj
             }
         }
 
