@@ -471,23 +471,52 @@ class NeuralNetwork(
 
     fun saveTo(file: File) {
         val state = snapshot.get()
-        DataOutputStream(file.outputStream().buffered()).use { output ->
-            output.writeInt(MAGIC)
-            output.writeInt(FORMAT_VERSION)
-            output.writeInt(inputSize)
-            output.writeInt(layerSizes.size)
-            for (size in layerSizes) output.writeInt(size)
+        // Пишем во временный файл и атомарно переименовываем: обрыв сервера
+        // посреди записи не должен оставлять model.dat с валидным заголовком
+        // и обрезанными весами.
+        val tmpFile = File(file.parentFile, file.name + ".tmp")
+        try {
+            DataOutputStream(tmpFile.outputStream().buffered()).use { output ->
+                output.writeInt(MAGIC)
+                output.writeInt(FORMAT_VERSION)
+                output.writeInt(inputSize)
+                output.writeInt(layerSizes.size)
+                for (size in layerSizes) output.writeInt(size)
 
-            for (layer in state.weights) {
-                for (neuron in layer) {
-                    for (w in neuron) output.writeDouble(w)
+                for (layer in state.weights) {
+                    for (neuron in layer) {
+                        for (w in neuron) output.writeDouble(w)
+                    }
                 }
+                for (layer in state.biases) {
+                    for (b in layer) output.writeDouble(b)
+                }
+                for (m in state.featureMean) output.writeDouble(m)
+                for (s in state.featureStd) output.writeDouble(s)
             }
-            for (layer in state.biases) {
-                for (b in layer) output.writeDouble(b)
+            if (tmpFile.exists() && file.exists()) {
+                // ATOMIC_MOVE с REPLACE_EXISTING не поддерживается всеми ФС
+                // для замены существующего файла — fallback на delete + rename.
+                try {
+                    java.nio.file.Files.move(
+                        tmpFile.toPath(), file.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING
+                    )
+                } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                    file.delete()
+                    if (!tmpFile.renameTo(file)) {
+                        throw java.io.IOException("Не удалось заменить файл модели: $file")
+                    }
+                }
+            } else {
+                java.nio.file.Files.move(
+                    tmpFile.toPath(), file.toPath(),
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE
+                )
             }
-            for (m in state.featureMean) output.writeDouble(m)
-            for (s in state.featureStd) output.writeDouble(s)
+        } catch (e: Exception) {
+            tmpFile.delete() // не оставляем мусорный tmp
+            throw e
         }
     }
 
