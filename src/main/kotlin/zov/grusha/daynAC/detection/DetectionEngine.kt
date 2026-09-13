@@ -64,13 +64,21 @@ class DetectionEngine(
             "detection.punish-action должен быть none/kick/ban, получено: \"$punishAction\""
         }
 
-        // Санитарная проверка: пороги вне (0, 1) или в абсурдном порядке ломают логику
+        // Санитарная проверка: пороги вне (0, 1) или в абсурдном порядке ломают логику.
+        // Инвариант из config.yml: flag ≤ reduce < cancel ≤ punish — без него,
+        // например, punish < flag означал бы автокик без единого оповещения админам.
         require(flagThreshold in 0.0..1.0) { "detection.flag-threshold должен быть в (0, 1), получено $flagThreshold" }
         require(reduceThreshold in 0.0..1.0) { "detection.reduce-threshold должен быть в (0, 1), получено $reduceThreshold" }
         require(cancelThreshold in 0.0..1.0) { "detection.cancel-threshold должен быть в (0, 1), получено $cancelThreshold" }
         require(punishThreshold in 0.0..1.0) { "detection.punish-threshold должен быть в (0, 1), получено $punishThreshold" }
+        require(flagThreshold <= reduceThreshold) {
+            "detection.flag-threshold ($flagThreshold) должен быть ≤ reduce-threshold ($reduceThreshold), иначе наказание срабатывает без оповещения"
+        }
         require(cancelThreshold > reduceThreshold) {
             "detection.cancel-threshold ($cancelThreshold) должен быть больше reduce-threshold ($reduceThreshold)"
+        }
+        require(cancelThreshold <= punishThreshold) {
+            "detection.cancel-threshold ($cancelThreshold) должен быть ≤ punish-threshold ($punishThreshold)"
         }
         require(maxRecentPredictions >= 1) { "detection.max-recent-predictions должен быть ≥ 1, получено $maxRecentPredictions" }
     }
