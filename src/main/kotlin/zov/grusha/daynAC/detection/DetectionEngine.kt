@@ -278,6 +278,10 @@ class DetectionEngine(
      *  none — только запись в лог (полное бездействие)
      *  kick — кик с сообщением
      *  ban  — бан + кик (встроенный бан-лист сервера)
+     *
+     * После наказания игрок удаляется из tracking-карт: дело закрыто,
+     * из /daynac allinfo он пропадает (иначе наказанный висел бы в GUI
+     * как «Не в сети» до истечения TTL).
      */
     fun punishPlayer(player: Player) {
         if (!player.isOnline) return
@@ -302,6 +306,10 @@ class DetectionEngine(
                 player.kickPlayer(message)
             }
         }
+
+        // Наказан — убираем из GUI и tracking-карт
+        predictions.remove(player.uniqueId)
+        hitCounts.remove(player.uniqueId)
     }
 
     /**
