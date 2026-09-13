@@ -4,9 +4,7 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.util.Random
-import java.util.concurrent.locks.ReentrantReadWriteLock
-import kotlin.concurrent.read
-import kotlin.concurrent.write
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
@@ -36,7 +34,8 @@ import kotlin.math.sqrt
  * Числовые защиты (как в daynac.md): clipping градиентов и дельт ±5.0,
  * clamp входа sigmoid в [-500, 500], epsilon 1e-15 в логарифмах BCE.
  *
- * Потокобезопасность: predict/save под read-lock, train под write-lock.
+ * Потокобезопасность: см. комментарий у [Weights] и [snapshot] — lock-free
+ * predict, атомарная публикация результатов train/load.
  */
 class NeuralNetwork(
     val inputSize: Int = 327, // = DaynAC.WINDOW_SIZE * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
@@ -47,20 +46,32 @@ class NeuralNetwork(
     /** Размеры всех слоёв: [inputSize, 128, 64, 32, 1]. */
     val layerSizes: IntArray = intArrayOf(inputSize, *hiddenSizes, 1)
 
-    // weights[l][j][k]: связь k-го нейрона слоя l-1 с j-м нейроном слоя l
-    private val weights: Array<Array<DoubleArray>> =
-        Array(layerSizes.size - 1) { l ->
+    /**
+     * Состояние сети. Объект, извлечённый из [snapshot], менять нельзя —
+     * он может быть опубликован и использоваться другими потоками (это
+     * copy-on-write). Локальные рабочие копии (в train) мутируются свободно
+     * и публикуются одним set() только в готовом виде: AtomicReference
+     * гарантирует безопасную публикацию (happens-before), читатели никогда
+     * не видят частично обновлённые массивы.
+     */
+    private class Weights(
+        var weights: Array<Array<DoubleArray>>,
+        var biases: Array<DoubleArray>,
+        var featureMean: DoubleArray,
+        var featureStd: DoubleArray
+    )
+
+    private fun emptyWeights(): Weights = Weights(
+        weights = Array(layerSizes.size - 1) { l ->
             Array(layerSizes[l + 1]) { DoubleArray(layerSizes[l]) }
-        }
+        },
+        biases = Array(layerSizes.size - 1) { l -> DoubleArray(layerSizes[l + 1]) },
+        featureMean = DoubleArray(inputSize),
+        featureStd = DoubleArray(inputSize) { 1.0 }
+    )
 
-    private val biases: Array<DoubleArray> =
-        Array(layerSizes.size - 1) { l -> DoubleArray(layerSizes[l + 1]) }
-
-    /** Статистики Z-score, вычисляются при обучении и сериализуются вместе с моделью. */
-    private var featureMean: DoubleArray = DoubleArray(inputSize)
-    private var featureStd: DoubleArray = DoubleArray(inputSize) { 1.0 }
-
-    private val lock = ReentrantReadWriteLock()
+    /** Текущее состояние сети; меняется только заменой целиком (copy-on-write). */
+    private val snapshot = AtomicReference(emptyWeights())
 
     companion object {
         private const val EPS = 1e-15          // защита log(0) в BCE
@@ -99,31 +110,29 @@ class NeuralNetwork(
             "Ожидался вектор из $inputSize признаков, получен ${rawFeatures.size}"
         }
 
-        lock.read {
-            val normalized = normalize(rawFeatures)
-            var activation = normalized
+        val state = snapshot.get()
+        var activation = normalize(rawFeatures, state)
 
-            for (l in weights.indices) {
-                val next = DoubleArray(layerSizes[l + 1])
-                val isLast = (l == weights.size - 1)
-                for (j in next.indices) {
-                    var z = biases[l][j]
-                    val wj = weights[l][j]
-                    for (k in activation.indices) {
-                        z += wj[k] * activation[k]
-                    }
-                    next[j] = if (isLast) sigmoid(z) else relu(z)
+        for (l in state.weights.indices) {
+            val next = DoubleArray(layerSizes[l + 1])
+            val isLast = (l == state.weights.size - 1)
+            for (j in next.indices) {
+                var z = state.biases[l][j]
+                val wj = state.weights[l][j]
+                for (k in activation.indices) {
+                    z += wj[k] * activation[k]
                 }
-                activation = next
+                next[j] = if (isLast) sigmoid(z) else relu(z)
             }
-            return activation[0]
+            activation = next
         }
+        return activation[0]
     }
 
-    private fun normalize(features: DoubleArray): DoubleArray {
+    private fun normalize(features: DoubleArray, state: Weights): DoubleArray {
         val out = DoubleArray(features.size)
         for (i in features.indices) {
-            out[i] = (features[i] - featureMean[i]) / featureStd[i]
+            out[i] = (features[i] - state.featureMean[i]) / state.featureStd[i]
         }
         return out
     }
@@ -171,100 +180,114 @@ class NeuralNetwork(
         require(samples.size >= 10) { "Датасет слишком мал: ${samples.size} сэмплов (нужно ≥ 10)" }
         require(samples.all { it.size == inputSize }) { "Все сэмплы должны быть длиной $inputSize" }
 
-        lock.write {
-            // 1. Перемешиваем с фиксированным seed и делим 80/20
-            val indices = samples.indices.shuffled(Random(seed))
-            val valCount = max(1, (samples.size * VAL_FRACTION).toInt().coerceAtMost(indices.size / 2))
-            val valIdx = indices.take(valCount)
-            val trainIdx = indices.drop(valCount)
-
-            // 2. Инициализация весов заново — чистый старт (He init)
-            initWeights()
-
-            // 3. Нормализационные статистики — ТОЛЬКО по train-части (без утечки данных)
-            computeNormStats(trainIdx.map { samples[it] })
-            val trainFeatures = trainIdx.map { normalize(samples[it]) }
-            val valFeatures = valIdx.map { normalize(samples[it]) }
-            val trainLabels = trainIdx.map { labels[it] }
-            val valLabels = valIdx.map { labels[it] }
-
-            // 4. Цикл обучения
-            val valCheckInterval = max(1, min(5, maxEpochs / 50))
-            var bestValLoss = Double.POSITIVE_INFINITY
-            var bestEpoch = 0
-            var staleCount = 0
-            var earlyStopped = false
-            var bestWeights = copyWeights()
-            var bestBiases = copyBiases()
-
-            var epoch = 0
-            val epochOrder = ArrayList<Int>(trainFeatures.size)
-            while (epoch < maxEpochs) {
-                // SGD: перемешиваем порядок сэмплов каждую эпоху
-                epochOrder.clear()
-                for (i in trainFeatures.indices) epochOrder.add(i)
-                epochOrder.shuffle(Random(seed + epoch + 1))
-
-                var epochLoss = 0.0
-                for (i in epochOrder) {
-                    val prediction = forwardAndBackprop(trainFeatures[i], trainLabels[i], learningRate, l2Lambda)
-                    epochLoss += bceLoss(prediction, trainLabels[i])
-                }
-                val trainLoss = epochLoss / trainFeatures.size
-
-                // Проверка валидации каждые valCheckInterval эпох
-                if (epoch % valCheckInterval == 0) {
-                    val valResult = evaluateNormalized(valFeatures, valLabels)
-                    onProgress?.invoke(epoch, trainLoss, valResult.avgLoss, valResult.accuracy)
-
-                    if (valResult.avgLoss < bestValLoss) {
-                        bestValLoss = valResult.avgLoss
-                        bestEpoch = epoch
-                        staleCount = 0
-                        bestWeights = copyWeights()
-                        bestBiases = copyBiases()
-                    } else {
-                        staleCount++
-                        if (patience > 0 && staleCount >= patience) {
-                            earlyStopped = true
-                            break
-                        }
-                    }
-                } else {
-                    onProgress?.invoke(epoch, trainLoss, null, null)
-                }
-
-                epoch++
-            }
-
-            // 5. Восстанавливаем лучшие веса — не последнюю (возможно переобученную) версию
-            restoreWeights(bestWeights, bestBiases)
-
-            // 6. Финальные метрики
-            val finalTrain = evaluateNormalized(trainFeatures, trainLabels)
-            val finalVal = evaluateNormalized(valFeatures, valLabels)
-
-            return TrainResult(
-                epochsRun = epoch,
-                bestEpoch = bestEpoch,
-                earlyStopped = earlyStopped,
-                trainLoss = finalTrain.avgLoss,
-                valLoss = finalVal.avgLoss,
-                trainAccuracy = finalTrain.accuracy,
-                valAccuracy = finalVal.accuracy
+        // Обучаем ЛОКАЛЬНУЮ копию — боевой снапшот, по которому работает
+        // inference, не меняется до конца обучения и публикуется атомарно.
+        val local = snapshot.get().let {
+            Weights(
+                weights = it.weights.map { layer -> layer.map { neuron -> neuron.copyOf() }.toTypedArray() }.toTypedArray(),
+                biases = it.biases.map { it.copyOf() }.toTypedArray(),
+                featureMean = it.featureMean.copyOf(),
+                featureStd = it.featureStd.copyOf()
             )
         }
+
+        // 1. Перемешиваем с фиксированным seed и делим 80/20
+        val indices = samples.indices.shuffled(Random(seed))
+        val valCount = max(1, (samples.size * VAL_FRACTION).toInt().coerceAtMost(indices.size / 2))
+        val valIdx = indices.take(valCount)
+        val trainIdx = indices.drop(valCount)
+
+        // 2. Инициализация весов заново — чистый старт (He init)
+        initWeights(local)
+
+        // 3. Нормализационные статистики — ТОЛЬКО по train-части (без утечки данных)
+        computeNormStats(local, trainIdx.map { samples[it] })
+        val trainFeatures = trainIdx.map { normalize(samples[it], local) }
+        val valFeatures = valIdx.map { normalize(samples[it], local) }
+        val trainLabels = trainIdx.map { labels[it] }
+        val valLabels = valIdx.map { labels[it] }
+
+        // 4. Цикл обучения
+        val valCheckInterval = max(1, min(5, maxEpochs / 50))
+        var bestValLoss = Double.POSITIVE_INFINITY
+        var bestEpoch = 0
+        var staleCount = 0
+        var earlyStopped = false
+        var bestWeights = copyWeights(local)
+        var bestBiases = copyBiases(local)
+
+        var epoch = 0
+        val epochOrder = ArrayList<Int>(trainFeatures.size)
+        while (epoch < maxEpochs) {
+            // SGD: перемешиваем порядок сэмплов каждую эпоху
+            epochOrder.clear()
+            for (i in trainFeatures.indices) epochOrder.add(i)
+            epochOrder.shuffle(Random(seed + epoch + 1))
+
+            var epochLoss = 0.0
+            for (i in epochOrder) {
+                val prediction = forwardAndBackprop(local, trainFeatures[i], trainLabels[i], learningRate, l2Lambda)
+                epochLoss += bceLoss(prediction, trainLabels[i])
+            }
+            val trainLoss = epochLoss / trainFeatures.size
+
+            // Проверка валидации каждые valCheckInterval эпох
+            if (epoch % valCheckInterval == 0) {
+                val valResult = evaluateNormalized(local, valFeatures, valLabels)
+                onProgress?.invoke(epoch, trainLoss, valResult.avgLoss, valResult.accuracy)
+
+                if (valResult.avgLoss < bestValLoss) {
+                    bestValLoss = valResult.avgLoss
+                    bestEpoch = epoch
+                    staleCount = 0
+                    bestWeights = copyWeights(local)
+                    bestBiases = copyBiases(local)
+                } else {
+                    staleCount++
+                    if (patience > 0 && staleCount >= patience) {
+                        earlyStopped = true
+                        break
+                    }
+                }
+            } else {
+                onProgress?.invoke(epoch, trainLoss, null, null)
+            }
+
+            epoch++
+        }
+
+        // 5. Восстанавливаем лучшие веса — не последнюю (возможно переобученную) версию
+        local.weights = bestWeights
+        local.biases = bestBiases
+
+        // 6. Финальные метрики
+        val finalTrain = evaluateNormalized(local, trainFeatures, trainLabels)
+        val finalVal = evaluateNormalized(local, valFeatures, valLabels)
+
+        // 7. Публикуем готовую модель атомарно — inference мгновенно
+        //    переключается на неё, промежуточных состояний не бывает.
+        snapshot.set(local)
+
+        return TrainResult(
+            epochsRun = epoch,
+            bestEpoch = bestEpoch,
+            earlyStopped = earlyStopped,
+            trainLoss = finalTrain.avgLoss,
+            valLoss = finalVal.avgLoss,
+            trainAccuracy = finalTrain.accuracy,
+            valAccuracy = finalVal.accuracy
+        )
     }
 
     /** He-инициализация (2015) — оптимальна для ReLU; bias нулями. */
-    private fun initWeights() {
+    private fun initWeights(state: Weights) {
         val rng = Random(seed)
-        for (l in weights.indices) {
+        for (l in state.weights.indices) {
             val scale = sqrt(2.0 / layerSizes[l]) // fan-in слоя l
-            for (j in weights[l].indices) {
-                biases[l][j] = 0.0
-                for (k in weights[l][j].indices) {
-                    weights[l][j][k] = rng.nextGaussian() * scale
+            for (j in state.weights[l].indices) {
+                state.biases[l][j] = 0.0
+                for (k in state.weights[l][j].indices) {
+                    state.weights[l][j][k] = rng.nextGaussian() * scale
                 }
             }
         }
@@ -277,12 +300,13 @@ class NeuralNetwork(
      * @return предсказание до обновления (для подсчёта loss)
      */
     private fun forwardAndBackprop(
+        state: Weights,
         features: DoubleArray,
         label: Double,
         learningRate: Double,
         l2Lambda: Double
     ): Double {
-        val layerCount = weights.size
+        val layerCount = state.weights.size
 
         // Forward: сохраняем pre-activation (z) и activation (a) для backward
         val activations = arrayOfNulls<DoubleArray>(layerCount + 1)
@@ -293,8 +317,8 @@ class NeuralNetwork(
             val a = DoubleArray(layerSizes[l + 1])
             val prev = activations[l]!!
             for (j in z.indices) {
-                var sum = biases[l][j]
-                val wj = weights[l][j]
+                var sum = state.biases[l][j]
+                val wj = state.weights[l][j]
                 for (k in prev.indices) {
                     sum += wj[k] * prev[k]
                 }
@@ -317,7 +341,7 @@ class NeuralNetwork(
         for (l in layerCount - 2 downTo 0) {
             val delta = DoubleArray(layerSizes[l + 1])
             val nextDelta = deltas[l + 1]!!
-            val nextWeights = weights[l + 1]
+            val nextWeights = state.weights[l + 1]
             val activation = activations[l + 1]!!
             for (j in delta.indices) {
                 var sum = 0.0
@@ -334,14 +358,14 @@ class NeuralNetwork(
         for (l in 0 until layerCount) {
             val prev = activations[l]!!
             val delta = deltas[l]!!
-            for (j in weights[l].indices) {
+            for (j in state.weights[l].indices) {
                 val dj = delta[j]
-                val wj = weights[l][j]
+                val wj = state.weights[l][j]
                 for (k in wj.indices) {
                     val grad = (dj * prev[k] + l2Lambda * wj[k]).coerceIn(-CLAMP, CLAMP)
                     wj[k] -= learningRate * grad
                 }
-                biases[l][j] -= learningRate * dj.coerceIn(-CLAMP, CLAMP)
+                state.biases[l][j] -= learningRate * dj.coerceIn(-CLAMP, CLAMP)
             }
         }
 
@@ -355,12 +379,12 @@ class NeuralNetwork(
     }
 
     /** Оценка на уже нормализованных сэмплах: средний BCE и accuracy (порог 0.5). */
-    private fun evaluateNormalized(features: List<DoubleArray>, labels: List<Double>): Evaluation {
+    private fun evaluateNormalized(state: Weights, features: List<DoubleArray>, labels: List<Double>): Evaluation {
         if (features.isEmpty()) return Evaluation(0.0, 0.0)
         var totalLoss = 0.0
         var correct = 0
         for (i in features.indices) {
-            val prediction = forwardOnly(features[i])
+            val prediction = forwardOnly(state, features[i])
             totalLoss += bceLoss(prediction, labels[i])
             val predictedClass = if (prediction >= 0.5) 1.0 else 0.0
             if (predictedClass == labels[i]) correct++
@@ -370,15 +394,15 @@ class NeuralNetwork(
 
     private data class Evaluation(val avgLoss: Double, val accuracy: Double)
 
-    /** Прямой проход по уже нормализованным признакам (без взятия lock — вызывается под write-lock). */
-    private fun forwardOnly(normalizedFeatures: DoubleArray): Double {
+    /** Прямой проход по уже нормализованным признакам по заданному состоянию сети. */
+    private fun forwardOnly(state: Weights, normalizedFeatures: DoubleArray): Double {
         var activation = normalizedFeatures
-        for (l in weights.indices) {
+        for (l in state.weights.indices) {
             val next = DoubleArray(layerSizes[l + 1])
-            val isLast = (l == weights.size - 1)
+            val isLast = (l == state.weights.size - 1)
             for (j in next.indices) {
-                var z = biases[l][j]
-                val wj = weights[l][j]
+                var z = state.biases[l][j]
+                val wj = state.weights[l][j]
                 for (k in activation.indices) {
                     z += wj[k] * activation[k]
                 }
@@ -390,7 +414,7 @@ class NeuralNetwork(
     }
 
     /** Z-score статистики по train-выборке. Константный признак получает std = 1.0. */
-    private fun computeNormStats(trainFeatures: List<DoubleArray>) {
+    private fun computeNormStats(state: Weights, trainFeatures: List<DoubleArray>) {
         val n = trainFeatures.size
         for (i in 0 until inputSize) {
             var mean = 0.0
@@ -404,8 +428,8 @@ class NeuralNetwork(
             }
             variance /= n
 
-            featureMean[i] = mean
-            featureStd[i] = if (sqrt(variance) < MIN_STD) 1.0 else sqrt(variance)
+            state.featureMean[i] = mean
+            state.featureStd[i] = if (sqrt(variance) < MIN_STD) 1.0 else sqrt(variance)
         }
     }
 
@@ -413,19 +437,10 @@ class NeuralNetwork(
     // Снапшоты весов (для early stopping)
     // ------------------------------------------------------------------
 
-    private fun copyWeights(): Array<Array<DoubleArray>> =
-        weights.map { layer -> layer.map { it.copyOf() }.toTypedArray() }.toTypedArray()
+    private fun copyWeights(state: Weights): Array<Array<DoubleArray>> =
+        state.weights.map { layer -> layer.map { it.copyOf() }.toTypedArray() }.toTypedArray()
 
-    private fun copyBiases(): Array<DoubleArray> = biases.map { it.copyOf() }.toTypedArray()
-
-    private fun restoreWeights(w: Array<Array<DoubleArray>>, b: Array<DoubleArray>) {
-        for (l in weights.indices) {
-            for (j in weights[l].indices) {
-                System.arraycopy(w[l][j], 0, weights[l][j], 0, w[l][j].size)
-            }
-            System.arraycopy(b[l], 0, biases[l], 0, b[l].size)
-        }
-    }
+    private fun copyBiases(state: Weights): Array<DoubleArray> = state.biases.map { it.copyOf() }.toTypedArray()
 
     // ------------------------------------------------------------------
     // Сохранение / загрузка (бинарный формат, без Java Serialization)
@@ -447,51 +462,52 @@ class NeuralNetwork(
     }
 
     fun saveTo(file: File) {
-        lock.read {
-            DataOutputStream(file.outputStream().buffered()).use { output ->
-                output.writeInt(MAGIC)
-                output.writeInt(FORMAT_VERSION)
-                output.writeInt(inputSize)
-                output.writeInt(layerSizes.size)
-                for (size in layerSizes) output.writeInt(size)
+        val state = snapshot.get()
+        DataOutputStream(file.outputStream().buffered()).use { output ->
+            output.writeInt(MAGIC)
+            output.writeInt(FORMAT_VERSION)
+            output.writeInt(inputSize)
+            output.writeInt(layerSizes.size)
+            for (size in layerSizes) output.writeInt(size)
 
-                for (layer in weights) {
-                    for (neuron in layer) {
-                        for (w in neuron) output.writeDouble(w)
-                    }
+            for (layer in state.weights) {
+                for (neuron in layer) {
+                    for (w in neuron) output.writeDouble(w)
                 }
-                for (layer in biases) {
-                    for (b in layer) output.writeDouble(b)
-                }
-                for (m in featureMean) output.writeDouble(m)
-                for (s in featureStd) output.writeDouble(s)
             }
+            for (layer in state.biases) {
+                for (b in layer) output.writeDouble(b)
+            }
+            for (m in state.featureMean) output.writeDouble(m)
+            for (s in state.featureStd) output.writeDouble(s)
         }
     }
 
     fun loadFrom(file: File) {
-        lock.write {
-            DataInputStream(file.inputStream().buffered()).use { input ->
-                check(input.readInt() == MAGIC) { "Файл модели повреждён (неверный маркер)" }
-                check(input.readInt() == FORMAT_VERSION) { "Неподдерживаемая версия формата модели" }
-                check(input.readInt() == inputSize) { "Размер входа модели не совпадает с текущим ($inputSize)" }
-                val layerCount = input.readInt()
-                check(layerCount == layerSizes.size) { "Структура слоёв модели не совпадает" }
-                for (l in layerSizes.indices) {
-                    check(input.readInt() == layerSizes[l]) { "Размер слоя $l не совпадает" }
-                }
-
-                for (layer in weights) {
-                    for (neuron in layer) {
-                        for (k in neuron.indices) neuron[k] = input.readDouble()
-                    }
-                }
-                for (layer in biases) {
-                    for (j in layer.indices) layer[j] = input.readDouble()
-                }
-                for (i in featureMean.indices) featureMean[i] = input.readDouble()
-                for (i in featureStd.indices) featureStd[i] = input.readDouble()
+        DataInputStream(file.inputStream().buffered()).use { input ->
+            check(input.readInt() == MAGIC) { "Файл модели повреждён (неверный маркер)" }
+            check(input.readInt() == FORMAT_VERSION) { "Неподдерживаемая версия формата модели" }
+            check(input.readInt() == inputSize) { "Размер входа модели не совпадает с текущим ($inputSize)" }
+            val layerCount = input.readInt()
+            check(layerCount == layerSizes.size) { "Структура слоёв модели не совпадает" }
+            for (l in layerSizes.indices) {
+                check(input.readInt() == layerSizes[l]) { "Размер слоя $l не совпадает" }
             }
+
+            val loaded = emptyWeights()
+            for (layer in loaded.weights) {
+                for (neuron in layer) {
+                    for (k in neuron.indices) neuron[k] = input.readDouble()
+                }
+            }
+            for (layer in loaded.biases) {
+                for (j in layer.indices) layer[j] = input.readDouble()
+            }
+            for (i in loaded.featureMean.indices) loaded.featureMean[i] = input.readDouble()
+            for (i in loaded.featureStd.indices) loaded.featureStd[i] = input.readDouble()
+
+            // Публикуем атомарно: либо старая модель, либо полностью загруженная новая
+            snapshot.set(loaded)
         }
     }
 }
