@@ -46,9 +46,10 @@ class DaynAC : JavaPlugin(), Listener {
     private val allInfoGUI = AllInfoGUI(this, detectionEngine)
     private val modelFile = File(dataFolder, "model.dat")
 
-    /** Обучение идёт в фоне — блокируем повторный запуск /daynac train. */
-    @Volatile
-    private var training = false
+    /** Обучение идёт в фоне. AtomicBoolean: два почти одновременных /daynac train
+     *  не должны оба увидеть false, оба поставить true и оба запустить обучение —
+     *  @Volatile даёт видимость, но не атомарность read-then-write. */
+    private val training = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Подробное логгирование ударов (чат опам + консоль). Управляется /daynac debug. */
     @Volatile
@@ -121,7 +122,7 @@ class DaynAC : JavaPlugin(), Listener {
                     )
                 }
                 args.isNotEmpty() && args[0] == "train" -> {
-                    if (training) {
+                    if (training.get()) {
                         sender.sendMessage("Обучение уже идёт, дождитесь завершения.")
                         return true
                     }
@@ -144,7 +145,12 @@ class DaynAC : JavaPlugin(), Listener {
                         return true
                     }
 
-                    training = true
+                    // Атомарная попытка занять слот обучения — после валидации датасета,
+                    // чтобы ранние return выше не оставляли флаг навечно поднятым.
+                    if (!training.compareAndSet(false, true)) {
+                        sender.sendMessage("Обучение уже идёт, дождитесь завершения.")
+                        return true
+                    }
                     sender.sendMessage("Обучение запущено: $legitCount легит / $cheatCount чит векторов...")
 
                     thread(name = "DaynAC-Training", isDaemon = true) {
@@ -190,7 +196,7 @@ class DaynAC : JavaPlugin(), Listener {
                             logger.severe("Обучение упало: ${e.message}")
                             report("§c[DaynAC] Ошибка обучения: ${e.message}")
                         } finally {
-                            training = false
+                            training.set(false)
                         }
                     }
                 }
