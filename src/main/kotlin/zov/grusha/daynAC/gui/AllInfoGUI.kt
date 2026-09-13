@@ -7,6 +7,8 @@ import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
 import org.bukkit.event.Listener
 import org.bukkit.event.inventory.InventoryClickEvent
+import org.bukkit.event.inventory.InventoryCloseEvent
+import org.bukkit.event.inventory.InventoryAction
 import org.bukkit.inventory.Inventory
 import org.bukkit.inventory.ItemStack
 import org.bukkit.inventory.meta.CompassMeta
@@ -143,8 +145,21 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
         if (player.uniqueId !in openGuis) return
         if (event.view.title != TITLE) return
 
-        event.isCancelled = true // клики по GUI только читают
+        // Отменяем только взаимодействия с нашим (верхним) инвентарём —
+        // иначе админ не может пользоваться собственным инвентарём,
+        // пока GUI открыт.
+        // MOVE_TO_OTHER_INVENTORY: shift-клик из нижнего инвентаря
+        // перекладывает предметы в верхний — тоже блокируем.
+        // COLLECT_TO_CURSOR (двойной клик) собирает предметы и из верхнего.
+        val clickTop = event.clickedInventory === event.view.topInventory
+        if (clickTop ||
+            event.action == InventoryAction.MOVE_TO_OTHER_INVENTORY ||
+            event.action == InventoryAction.COLLECT_TO_CURSOR
+        ) {
+            event.isCancelled = true
+        }
 
+        if (!clickTop) return // клики по своему инвентарю — не наши
         if (event.currentItem == null || event.currentItem!!.type != Material.COMPASS) return
         val meta = event.currentItem!!.itemMeta ?: return
         val uuidString = meta.persistentDataContainer.get(suspectKey, PersistentDataType.STRING) ?: return
@@ -160,6 +175,14 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
         player.gameMode = org.bukkit.GameMode.SPECTATOR
         player.teleport(target.location)
         player.sendMessage("§7[DaynAC] Наблюдение за §c${target.name}§7. Выйти из наблюдателя: /gamemode survival")
+    }
+
+    /** Чистка при закрытии GUI (ESC/кнопка) — иначе UUID зависал в openGuis навсегда. */
+    @EventHandler
+    fun onClose(event: InventoryCloseEvent) {
+        if (event.view.title == TITLE) {
+            openGuis.remove(event.player.uniqueId)
+        }
     }
 
     /** Очистка при выходе админа с открытым GUI. */
