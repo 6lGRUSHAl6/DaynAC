@@ -126,8 +126,8 @@ class DaynAC : JavaPlugin(), Listener {
                         return true
                     }
 
-                    val (features, labels) = datasetManager.readVectorSamples()
-                    val (legitCount, cheatCount) = datasetManager.getVectorDatasetStats()
+                    val (features, labels, parsedCounts) = datasetManager.readVectorSamples()
+                    val (legitCount, cheatCount) = parsedCounts
 
                     if (features.size < 10) {
                         sender.sendMessage(

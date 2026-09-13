@@ -84,12 +84,19 @@ class DatasetManager(
 
     /**
      * Читает все векторные сэмплы (legit_vectors.csv + cheat_vectors.csv)
-     * для обучения: пара (список векторов, список меток).
-     * Битые строки (не та длина, нечисловые значения) пропускаются молча.
+     * для обучения.
+     *
+     * @return Triple(векторы, метки, счётчики реально распарсенных сэмплов
+     *         по классам: (legit, cheat)). Битые строки (не та длина,
+     *         нечисловые значения) пропускаются молча — поэтому счётчик
+     *         строк файла и счётчик сэмплов могут расходиться; валидировать
+     *         обучаемость датасета нужно по этим счётчикам, а не по строкам.
      */
-    fun readVectorSamples(): Pair<List<DoubleArray>, List<Double>> {
+    fun readVectorSamples(): Triple<List<DoubleArray>, List<Double>, Pair<Int, Int>> {
         val features = mutableListOf<DoubleArray>()
         val labels = mutableListOf<Double>()
+        var legitParsed = 0
+        var cheatParsed = 0
 
         fun loadFile(file: File, label: Double) {
             if (!file.exists()) return
@@ -106,13 +113,14 @@ class DatasetManager(
                 }
                 features.add(vector)
                 labels.add(label)
+                if (label == 0.0) legitParsed++ else cheatParsed++
             }
         }
 
         loadFile(legitVectorFile, 0.0)
         loadFile(cheatVectorFile, 1.0)
 
-        return Pair(features, labels)
+        return Triple(features, labels, Pair(legitParsed, cheatParsed))
     }
 
     /** Краткая статистика датасета для команды info. */

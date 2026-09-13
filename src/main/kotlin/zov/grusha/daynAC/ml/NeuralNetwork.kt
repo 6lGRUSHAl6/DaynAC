@@ -191,11 +191,19 @@ class NeuralNetwork(
             )
         }
 
-        // 1. Перемешиваем с фиксированным seed и делим 80/20
-        val indices = samples.indices.shuffled(Random(seed))
-        val valCount = max(1, (samples.size * VAL_FRACTION).toInt().coerceAtMost(indices.size / 2))
-        val valIdx = indices.take(valCount)
-        val trainIdx = indices.drop(valCount)
+        // 1. Делим 80/20 СТРАТИФИЦИРОВАННО — каждый класс отдельно, чтобы в
+        // val гарантированно попали оба класса. При случайном split мелкого
+        // датасета val мог состоять из одного класса: accuracy 100% на шуме,
+        // early stopping принимает решения на бессмысленной метрике.
+        val rng = Random(seed)
+        val trainIdx = ArrayList<Int>(samples.size)
+        val valIdx = ArrayList<Int>()
+        for (label in listOf(0.0, 1.0)) {
+            val classIdx = samples.indices.filter { labels[it] == label }.shuffled(rng)
+            val valCount = max(1, (classIdx.size * VAL_FRACTION).toInt().coerceAtMost(classIdx.size / 2))
+            valIdx.addAll(classIdx.take(valCount))
+            trainIdx.addAll(classIdx.drop(valCount))
+        }
 
         // 2. Инициализация весов заново — чистый старт (He init)
         initWeights(local)
