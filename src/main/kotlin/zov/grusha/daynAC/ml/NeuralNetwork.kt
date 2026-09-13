@@ -5,6 +5,8 @@ import java.io.DataOutputStream
 import java.io.File
 import java.util.Random
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
@@ -72,6 +74,15 @@ class NeuralNetwork(
 
     /** Текущее состояние сети; меняется только заменой целиком (copy-on-write). */
     private val snapshot = AtomicReference(emptyWeights())
+
+    /**
+     * Сериализует изменяющие операции (train, loadFrom). Сам по себе
+     * AtomicReference даёт атомарность публикации, но не взаимное исключение:
+     * без лока train, стартовавший до loadFrom, в конце делал snapshot.set()
+     * и затирал только что загруженную модель. Читатели (predict, saveTo)
+     * лок не берут — им достаточно AtomicReference.get().
+     */
+    private val mutationLock = ReentrantLock()
 
     companion object {
         private const val EPS = 1e-15          // защита log(0) в BCE
@@ -180,6 +191,7 @@ class NeuralNetwork(
         require(samples.size >= 10) { "Датасет слишком мал: ${samples.size} сэмплов (нужно ≥ 10)" }
         require(samples.all { it.size == inputSize }) { "Все сэмплы должны быть длиной $inputSize" }
 
+        mutationLock.withLock {
         // Обучаем ЛОКАЛЬНУЮ копию — боевой снапшот, по которому работает
         // inference, не меняется до конца обучения и публикуется атомарно.
         val local = snapshot.get().let {
@@ -285,6 +297,7 @@ class NeuralNetwork(
             trainAccuracy = finalTrain.accuracy,
             valAccuracy = finalVal.accuracy
         )
+        } // mutationLock.withLock
     }
 
     /** He-инициализация (2015) — оптимальна для ReLU; bias нулями. */
@@ -523,30 +536,33 @@ class NeuralNetwork(
     }
 
     fun loadFrom(file: File) {
-        DataInputStream(file.inputStream().buffered()).use { input ->
-            check(input.readInt() == MAGIC) { "Файл модели повреждён (неверный маркер)" }
-            check(input.readInt() == FORMAT_VERSION) { "Неподдерживаемая версия формата модели" }
-            check(input.readInt() == inputSize) { "Размер входа модели не совпадает с текущим ($inputSize)" }
-            val layerCount = input.readInt()
-            check(layerCount == layerSizes.size) { "Структура слоёв модели не совпадает" }
-            for (l in layerSizes.indices) {
-                check(input.readInt() == layerSizes[l]) { "Размер слоя $l не совпадает" }
-            }
-
-            val loaded = emptyWeights()
-            for (layer in loaded.weights) {
-                for (neuron in layer) {
-                    for (k in neuron.indices) neuron[k] = input.readDouble()
+        mutationLock.withLock {
+            DataInputStream(file.inputStream().buffered()).use { input ->
+                check(input.readInt() == MAGIC) { "Файл модели повреждён (неверный маркер)" }
+                check(input.readInt() == FORMAT_VERSION) { "Неподдерживаемая версия формата модели" }
+                check(input.readInt() == inputSize) { "Размер входа модели не совпадает с текущим ($inputSize)" }
+                val layerCount = input.readInt()
+                check(layerCount == layerSizes.size) { "Структура слоёв модели не совпадает" }
+                for (l in layerSizes.indices) {
+                    check(input.readInt() == layerSizes[l]) { "Размер слоя $l не совпадает" }
                 }
-            }
-            for (layer in loaded.biases) {
-                for (j in layer.indices) layer[j] = input.readDouble()
-            }
-            for (i in loaded.featureMean.indices) loaded.featureMean[i] = input.readDouble()
-            for (i in loaded.featureStd.indices) loaded.featureStd[i] = input.readDouble()
 
-            // Публикуем атомарно: либо старая модель, либо полностью загруженная новая
-            snapshot.set(loaded)
+                val loaded = emptyWeights()
+                for (layer in loaded.weights) {
+                    for (neuron in layer) {
+                        for (k in neuron.indices) neuron[k] = input.readDouble()
+                    }
+                }
+                for (layer in loaded.biases) {
+                    for (j in layer.indices) layer[j] = input.readDouble()
+                }
+                for (i in loaded.featureMean.indices) loaded.featureMean[i] = input.readDouble()
+                for (i in loaded.featureStd.indices) loaded.featureStd[i] = input.readDouble()
+
+                // Публикуем атомарно: либо старая модель, либо полностью загруженная новая.
+                // Под mutationLock — параллельный train не сможет затереть её своим set().
+                snapshot.set(loaded)
+            }
         }
     }
 }
