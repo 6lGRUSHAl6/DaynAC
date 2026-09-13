@@ -69,9 +69,9 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
                 val meta = watch.itemMeta
                 meta.setDisplayName("§e$name " + (if (isOnline(uuid)) "§a● В сети" else "§c● Не в сети"))
                 meta.lore = listOf(
-                    "§7Ударов: §f$hitCount§7/§f16",
+                    "§7Ударов: §f$hitCount§7/§f${zov.grusha.daynAC.DaynAC.WINDOW_SIZE}",
                     "§7Предсказаний ещё нет — окно",
-                    "§7признаков не заполнено (нужно 16 ударов)."
+                    "§7признаков не заполнено (нужно ${zov.grusha.daynAC.DaynAC.WINDOW_SIZE} ударов)."
                 )
                 watch.itemMeta = meta
                 if (inventory.firstEmpty() == -1) break
