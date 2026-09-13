@@ -171,18 +171,72 @@ class DaynAC : JavaPlugin(), Listener {
                             }
                         }
 
+                        // --- Визуализация обучения ---
+                        // Игроку: живой прогресс-бар в action bar (не засоряет чат),
+                        // обновляется не чаще 2 раз/сек. Консоли: только контрольные
+                        // точки в чат/лог каждые 10% эпох. Action bar очищается по завершении.
+                        val senderPlayer = sender as? Player
+                        val maxEpochs = 1000
+                        val milestoneStep = maxOf(1, maxEpochs / 10)
+                        val lastActionBarMs = java.util.concurrent.atomic.AtomicLong(0L)
+
+                        fun progressBar(fraction: Double, width: Int = 20): String {
+                            val filled = (fraction.coerceIn(0.0, 1.0) * width).toInt()
+                            return "§a" + "▮".repeat(filled) + "§8" + "▯".repeat(width - filled)
+                        }
+
+                        fun actionBar(text: String) {
+                            if (senderPlayer == null || !isEnabled) return
+                            Bukkit.getScheduler().runTask(this@DaynAC, Runnable {
+                                senderPlayer.sendActionBar(
+                                    net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer
+                                        .legacySection().deserialize(text)
+                                )
+                            })
+                        }
+
                         try {
                             val startTime = System.currentTimeMillis()
                             val result = neuralNetwork.train(
                                 samples = features,
                                 labels = labels,
                                 learningRate = 0.001,
-                                maxEpochs = 1000,
-                                patience = 15
+                                maxEpochs = maxEpochs,
+                                patience = 15,
+                                onProgress = { epoch, trainLoss, valLoss, valAcc ->
+                                    val now = System.currentTimeMillis()
+
+                                    // Action bar — не чаще двух раз в секунду
+                                    if (senderPlayer != null && now - lastActionBarMs.get() >= 500L) {
+                                        lastActionBarMs.set(now)
+                                        val lossText = String.format(Locale.US, "%.4f", trainLoss)
+                                        val valText = valAcc?.let { " §7| val §f" + String.format(Locale.US, "%.1f%%", it * 100) } ?: ""
+                                        actionBar(
+                                            "${progressBar((epoch + 1).toDouble() / maxEpochs)} " +
+                                                "§f${epoch + 1}/$maxEpochs §7| loss §f$lossText$valText"
+                                        )
+                                    }
+
+                                    // Контрольная точка в чат каждые 10% эпох.
+                                    // milestoneStep кратен valCheckInterval, поэтому здесь
+                                    // valLoss/valAcc уже посчитаны и не равны null.
+                                    if (epoch > 0 && epoch % milestoneStep == 0) {
+                                        val valPart = valLoss?.let {
+                                            " §7| val §f" + String.format(Locale.US, "%.4f", it) +
+                                                " §7/ acc §f" + String.format(Locale.US, "%.1f%%", (valAcc ?: 0.0) * 100)
+                                        } ?: ""
+                                        report(
+                                            "§7[DaynAC] ${progressBar(epoch.toDouble() / maxEpochs, 10)} " +
+                                                "эпоха §f$epoch/$maxEpochs §7| loss §f" +
+                                                String.format(Locale.US, "%.4f", trainLoss) + "$valPart"
+                                        )
+                                    }
+                                }
                             )
 
                             neuralNetwork.saveTo(modelFile)
                             detectionEngine.enableDetection()
+                            actionBar("") // очищаем action bar
 
                             val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
                             report(buildString {
@@ -200,6 +254,7 @@ class DaynAC : JavaPlugin(), Listener {
                                 append("§aМодель сохранена, детекция активна.")
                             })
                         } catch (e: Exception) {
+                            actionBar("") // убираем зависший прогресс-бар
                             logger.severe("Обучение упало: ${e.message}")
                             report("§c[DaynAC] Ошибка обучения: ${e.message}")
                         } finally {
