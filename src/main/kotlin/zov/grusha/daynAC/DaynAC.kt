@@ -320,9 +320,15 @@ class DaynAC : JavaPlugin(), Listener {
         recordingPlayers[attacker.uniqueId]?.let { label ->
             datasetManager.writeSample(label, hitData)
 
-            // Вектор признаков по окну последних ударов (если истории уже достаточно)
-            featureExtractor.extract(hitTracker.getHistory(attacker))?.let { vector ->
-                datasetManager.writeVectorSample(label, vector)
+            // Вектор признаков пишем только на каждый WINDOW_SIZE-й удар
+            // (stride = windowSize). При записи на каждый удар соседние окна
+            // совпадают на 15/16 признаков, и случайный train/val split в
+            // обучении кладёт почти-дубликаты в обе выборки — val-метрики
+            // фиктивны, early stopping ломается.
+            if (detectionEngine.getHitCount(attacker.uniqueId) % WINDOW_SIZE == 0) {
+                featureExtractor.extract(hitTracker.getHistory(attacker))?.let { vector ->
+                    datasetManager.writeVectorSample(label, vector)
+                }
             }
         }
 
