@@ -201,16 +201,16 @@ class FeatureExtractor(
     }
 
     /**
-     * Энтропия Шеннона распределения углов прицеливания по 8 бинам в диапазоне [0, 90] градусов.
-     * Ровный читерский аим кучкуется в 1-2 бинах -> низкая энтропия;
-     * человеческий разбросан -> высокая.
+     * Энтропия Шеннона распределения углов прицеливания по 8 бинам в диапазоне [0, 180] градусов
+     * (весь фактический диапазон CombatMath.getAimAngle). Ровный читерский аим
+     * кучкуется в 1-2 бинах -> низкая энтропия; человеческий разбросан -> высокая.
      */
     private fun aimAngleEntropy(window: List<HitData>): Double? {
         val values = finiteValues(window) { it.aimAngle }
         if (values.size < 2) return null
 
         val binCount = 8
-        val maxRange = 90.0
+        val maxRange = 180.0
         val bins = IntArray(binCount)
         for (v in values) {
             val binIndex = ((v.coerceIn(0.0, maxRange) / maxRange) * binCount).toInt().coerceIn(0, binCount - 1)
