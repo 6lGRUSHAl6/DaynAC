@@ -90,7 +90,7 @@ class NeuralNetwork(
         private const val SIGMOID_CLAMP = 500.0
         private const val MIN_STD = 1e-8       // защита от деления на 0 в z-score
         private const val MAGIC = 0x44414E41   // "DANA" — маркер файла модели
-        private const val FORMAT_VERSION = 1
+        private const val FORMAT_VERSION = 2   // v2: + блок метрик обучения в конце файла
 
         /** Разделение train/validation при обучении. */
         private const val VAL_FRACTION = 0.2
@@ -165,6 +165,15 @@ class NeuralNetwork(
         /** Разрыв train/val — грубая метрика переобучения (0.05+ уже подозрительно). */
         val overfitGap: Double get() = trainAccuracy - valAccuracy
     }
+
+    /**
+     * Метрики последнего обучения. Устанавливается train()/loadFrom(),
+     * читается /daynac info. @Volatile достаточно: запись одна, чтений много,
+     * конкурентность не нужна — ссылка публикуется целиком.
+     */
+    @Volatile
+    var lastTrainResult: TrainResult? = null
+        private set
 
     /**
      * Полный цикл обучения: split 80/20, нормализация по train-части,
@@ -288,7 +297,7 @@ class NeuralNetwork(
         //    переключается на неё, промежуточных состояний не бывает.
         snapshot.set(local)
 
-        return TrainResult(
+        val result = TrainResult(
             epochsRun = epoch,
             bestEpoch = bestEpoch,
             earlyStopped = earlyStopped,
@@ -297,6 +306,8 @@ class NeuralNetwork(
             trainAccuracy = finalTrain.accuracy,
             valAccuracy = finalVal.accuracy
         )
+        lastTrainResult = result
+        return result
         } // mutationLock.withLock
     }
 
@@ -508,6 +519,21 @@ class NeuralNetwork(
                 }
                 for (m in state.featureMean) output.writeDouble(m)
                 for (s in state.featureStd) output.writeDouble(s)
+
+                // v2: метрики обучения — /daynac info показывает их и после рестарта
+                val tr = lastTrainResult
+                if (tr != null) {
+                    output.writeBoolean(true)
+                    output.writeInt(tr.epochsRun)
+                    output.writeInt(tr.bestEpoch)
+                    output.writeBoolean(tr.earlyStopped)
+                    output.writeDouble(tr.trainLoss)
+                    output.writeDouble(tr.valLoss)
+                    output.writeDouble(tr.trainAccuracy)
+                    output.writeDouble(tr.valAccuracy)
+                } else {
+                    output.writeBoolean(false)
+                }
             }
             if (tmpFile.exists() && file.exists()) {
                 // ATOMIC_MOVE с REPLACE_EXISTING не поддерживается всеми ФС
@@ -558,6 +584,20 @@ class NeuralNetwork(
                 }
                 for (i in loaded.featureMean.indices) loaded.featureMean[i] = input.readDouble()
                 for (i in loaded.featureStd.indices) loaded.featureStd[i] = input.readDouble()
+
+                // v2: блок метрик обучения. Файл может закончиться здесь (v1 после
+                // чистки версии — прочитанный ещё до bump'а) — тогда метрик нет.
+                lastTrainResult = if (input.available() > 0 && input.readBoolean()) {
+                    TrainResult(
+                        epochsRun = input.readInt(),
+                        bestEpoch = input.readInt(),
+                        earlyStopped = input.readBoolean(),
+                        trainLoss = input.readDouble(),
+                        valLoss = input.readDouble(),
+                        trainAccuracy = input.readDouble(),
+                        valAccuracy = input.readDouble()
+                    )
+                } else null
 
                 // Публикуем атомарно: либо старая модель, либо полностью загруженная новая.
                 // Под mutationLock — параллельный train не сможет затереть её своим set().

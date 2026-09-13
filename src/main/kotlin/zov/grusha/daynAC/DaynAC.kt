@@ -282,11 +282,25 @@ class DaynAC : JavaPlugin(), Listener {
                 }
                 args.isNotEmpty() && args[0] == "info" -> {
                     val (legitCount, cheatCount) = datasetManager.getVectorDatasetStats()
+                    val trainInfo = neuralNetwork.lastTrainResult
                     sender.sendMessage(
                         buildString {
                             appendLine("[DaynAC] Датасет: $legitCount легит / $cheatCount чит векторов")
                             appendLine("[DaynAC] Модель: " + (if (detectionEngine.detectionEnabled) "активна" else "не обучена") +
                                 ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)")
+                            if (trainInfo != null) {
+                                fun num(v: Double) = String.format(Locale.US, "%.4f", v)
+                                fun pct(v: Double) = String.format(Locale.US, "%.1f%%", v * 100)
+                                appendLine("[DaynAC] Обучение: эпох ${trainInfo.epochsRun}" +
+                                    " (лучшая: ${trainInfo.bestEpoch}" +
+                                    if (trainInfo.earlyStopped) ", early stop)" else ")")
+                                appendLine("[DaynAC] Train loss/acc: ${num(trainInfo.trainLoss)} / ${pct(trainInfo.trainAccuracy)}")
+                                appendLine("[DaynAC] Val loss/acc:   ${num(trainInfo.valLoss)} / ${pct(trainInfo.valAccuracy)}")
+                                appendLine("[DaynAC] Разрыв train/val (переобучение): ${pct(trainInfo.overfitGap)}" +
+                                    if (trainInfo.overfitGap > 0.05) " §c— выше нормы, соберите больше данных" else "")
+                            } else {
+                                appendLine("[DaynAC] Метрики обучения неизвестны (модель из старого формата файла)")
+                            }
                             append("[DaynAC] Пороги: flag ${detectionEngine.flagThreshold} / reduce ${detectionEngine.reduceThreshold}" +
                                 " / cancel ${detectionEngine.cancelThreshold} / punish ${detectionEngine.punishThreshold}" +
                                 " / окно усреднения ${detectionEngine.maxRecentPredictions}")
@@ -294,7 +308,8 @@ class DaynAC : JavaPlugin(), Listener {
                             append("[DaynAC] Наказание: " + when {
                                 !detectionEngine.punishEnabled -> "§eВЫКЛЮЧЕНО (режим наблюдения)"
                                 detectionEngine.punishAction == "none" -> "§7ничего (только лог)"
-                                else -> "§c${detectionEngine.punishAction}"
+                                else -> "§c${detectionEngine.punishAction}" +
+                                    (if (detectionEngine.punishAction == "ban" && detectionEngine.banWithIp) " + IP" else "")
                             })
                         }
                     )
