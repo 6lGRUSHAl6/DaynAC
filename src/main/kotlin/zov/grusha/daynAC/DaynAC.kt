@@ -376,6 +376,9 @@ class DaynAC : JavaPlugin(), Listener {
         hitTracker.removePlayer(event.player)
         detectionEngine.removePlayer(event.player)
         recordingPlayers.remove(event.player.uniqueId)
+        // hitCounter чистим по обеим сторонам пары: он ключуется Pair<UUID, UUID>,
+        // и без чистки монотонно растёт на каждую пару игроков навсегда.
+        hitCounter.keys.removeAll { it.first == event.player.uniqueId || it.second == event.player.uniqueId }
     }
 
     private fun formatDouble(value: Double?, format: String = "%.4f"): String {

@@ -46,6 +46,7 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
 
     /** Собирает и открывает GUI для администратора. */
     fun open(admin: Player) {
+        engine.pruneStaleTracking() // TTL-чистка накопившихся записей о неактивных игроках
         val inventory = Bukkit.createInventory(null, GUI_SIZE, TITLE)
         populate(inventory)
         openGuis.add(admin.uniqueId)

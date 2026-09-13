@@ -80,6 +80,9 @@ class DetectionEngine(
         val timestamp: Long
     )
 
+    /** Записи о неактивных игроках старше этого возраста удаляются (TTL против монотонного роста карт). */
+    private val trackedTtlMs = 60L * 60L * 1000L // 1 час
+
     private val inferencePool: ExecutorService = Executors.newFixedThreadPool(2) { runnable ->
         Thread(runnable, "DaynAC-Inference").apply { isDaemon = true }
     }
@@ -110,6 +113,26 @@ class DetectionEngine(
 
     /** Сколько ударов у игрока и хватает ли их для анализа (окно 16). */
     fun getHitCount(playerId: UUID): Int = hitCounts[playerId] ?: 0
+
+    /**
+     * Удаляет записи о неактивных игроках старше TTL. Предсказания и счётчики
+     * ударов сохраняются после выхода игрока специально (GUI показывает и
+     * оффлайн-игроков), но без ограничения срока они копятся бесконечно на
+     * долгоживущем сервере. Вызывается при построении GUI — редкой,
+     * не горячей операции.
+     */
+    fun pruneStaleTracking() {
+        val now = System.currentTimeMillis()
+        predictions.entries.removeIf { (_, deque) ->
+            val lastTs = synchronized(deque) { deque.lastOrNull()?.timestamp }
+            lastTs == null || now - lastTs > trackedTtlMs
+        }
+        // Счётчик ударов мал сам по себе; удаляем только записи оффлайн-игроков,
+        // которых уже нет и в предсказаниях (иначе GUI потеряет «прогресс окна»).
+        hitCounts.keys.retainAll { uuid ->
+            predictions.containsKey(uuid) || Bukkit.getPlayer(uuid) != null
+        }
+    }
 
     /**
      * Асинхронный анализ удара. Вектор признаков уже извлечён на главном потоке
