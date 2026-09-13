@@ -160,12 +160,16 @@ class DetectionEngine(
 
             if (!probability.isFinite()) return@execute
 
-            // Обратно на главный поток — трогать Bukkit API из пула нельзя
-            Bukkit.getScheduler().runTask(plugin, Runnable {
-                if (!attacker.isOnline) return@Runnable
-                recordVerdict(attacker, probability)
-                onVerdict(attacker, probability)
-            })
+            // Обратно на главный поток — трогать Bukkit API из пула нельзя.
+            // После onDisable планировщик отвергает задачи (IllegalPluginAccessException),
+            // а inference-потоки daemon и могут закончить работу во время shutdown.
+            if (plugin.isEnabled) {
+                Bukkit.getScheduler().runTask(plugin, Runnable {
+                    if (!attacker.isOnline) return@Runnable
+                    recordVerdict(attacker, probability)
+                    onVerdict(attacker, probability)
+                })
+            }
         }
     }
 

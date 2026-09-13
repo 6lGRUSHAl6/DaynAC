@@ -148,9 +148,14 @@ class DaynAC : JavaPlugin(), Listener {
                     sender.sendMessage("Обучение запущено: $legitCount легит / $cheatCount чит векторов...")
 
                     thread(name = "DaynAC-Training", isDaemon = true) {
-                        // Отчёты отправляем на главный поток — Bukkit API из async-потока нельзя
+                        // Отчёты отправляем на главный поток — Bukkit API из async-потока нельзя.
+                        // Если плагин уже выключается, планировщик отвергнет задачу — логируем напрямую.
                         fun report(message: String) {
-                            Bukkit.getScheduler().runTask(this@DaynAC, Runnable { sender.sendMessage(message) })
+                            if (isEnabled) {
+                                Bukkit.getScheduler().runTask(this@DaynAC, Runnable { sender.sendMessage(message) })
+                            } else {
+                                logger.info(message.replace("§[0-9a-f]".toRegex(), ""))
+                            }
                         }
 
                         try {
