@@ -32,3 +32,6 @@ build/
 learning/
 run/
 .claude/
+
+.csv
+.dat
