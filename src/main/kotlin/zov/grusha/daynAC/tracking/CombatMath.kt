@@ -3,6 +3,7 @@ package zov.grusha.daynAC.tracking
 import org.bukkit.Location
 import org.bukkit.entity.Player
 import kotlin.math.acos
+import org.bukkit.util.Vector
 
 object CombatMath {
 
@@ -68,6 +69,17 @@ object CombatMath {
         val attackerEye = attacker.eyeLocation
         val victimCenter = getBodyCenter(victim)
         return attackerEye.distance(victimCenter)
+    }
+
+    fun getReachDistance(attacker: Player, victim: Player): Double {
+        val eye = attacker.eyeLocation.toVector()
+        val box = victim.boundingBox
+        val closest = Vector(
+            eye.x.coerceIn(box.minX, box.maxX),
+            eye.y.coerceIn(box.minY, box.maxY),
+            eye.z.coerceIn(box.minZ, box.maxZ)
+        )
+        return eye.distance(closest)
     }
 
 }

@@ -448,6 +448,7 @@ class SnapshotTracker(private val maxSize: Int = 20) {
     fun buildHitData(attacker: Player, victim: Player): HitData {
         val aimAngle = CombatMath.getAimAngle(attacker, victim)
         val distance = CombatMath.getDistance(attacker, victim)
+        val reachDistance = CombatMath.getReachDistance(attacker, victim)
 
         val (hitTimeDelta, prevAimAngle) = registerHitWithAngle(attacker, aimAngle)
 
@@ -461,6 +462,7 @@ class SnapshotTracker(private val maxSize: Int = 20) {
             timestamp = System.currentTimeMillis(),
             aimAngle = aimAngle,
             distance = distance,
+            reachDistance = reachDistance,
             hitTimeDelta = hitTimeDelta,
             hitTimeCV = getHitTimeCV(attacker),
             yawEntropyAbs = getYawEntropyAbs(attacker),

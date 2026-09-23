@@ -4,6 +4,7 @@ data class HitData(
     val timestamp: Long,
     val aimAngle: Double?,
     val distance: Double,
+    val reachDistance: Double,
     val hitTimeDelta: Long?,
     val hitTimeCV: Double?,
     val yawEntropyAbs: Double?,
@@ -21,5 +22,5 @@ data class HitData(
     val microAdjustYaw: Int?,
     val microAdjustPitch: Int?,
     val jerkValue: Double?,
-    val straightLineRatio: Double?
+    val straightLineRatio: Double?,
 )
