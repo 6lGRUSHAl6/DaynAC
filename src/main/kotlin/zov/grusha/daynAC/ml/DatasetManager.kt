@@ -25,12 +25,44 @@ class DatasetManager(
 
     private fun header(): String {
         return listOf(
-            "timestamp", "aimAngle", "distance", "hitTimeDelta", "hitTimeCV",
+            "timestamp", "aimAngle", "distance", "reachDistance", "hitTimeDelta", "hitTimeCV",
             "yawEntropyAbs", "pitchEntropyAbs", "yawEntropySigned", "pitchEntropySigned",
             "yawJitterAbs", "pitchJitterAbs", "yawJitterSigned", "pitchJitterSigned",
             "speedXZ", "rotSmoothYaw", "rotSmoothPitch", "snapFactor",
             "microAdjustYaw", "microAdjustPitch", "jerkValue", "straightLineRatio"
         ).joinToString(",")
+    }
+
+    /** Результат парсинга отдельной строки CSV. */
+    private sealed class ParseResult {
+        object Ignored : ParseResult() // Заголовок или пустая строка
+        class Success(val vector: DoubleArray) : ParseResult()
+        class Error(val reason: String) : ParseResult()
+    }
+
+    /**
+     * Единая функция парсинга строки векторного датасета.
+     * Отвечает за проверку формата, количества колонок и корректности чисел.
+     */
+    private fun parseVectorLine(line: String, expectedSize: Int): ParseResult {
+        val trimmed = line.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith("h0")) return ParseResult.Ignored
+
+        val parts = trimmed.split(',')
+        if (parts.size != expectedSize) {
+            return ParseResult.Error("ожидалось $expectedSize элементов, получено ${parts.size}")
+        }
+
+        val vector = DoubleArray(parts.size)
+        for (i in parts.indices) {
+            val v = parts[i].trim().toDoubleOrNull()
+            if (v == null) {
+                return ParseResult.Error("нечисловое значение '${parts[i]}' на позиции $i")
+            }
+            vector[i] = v
+        }
+
+        return ParseResult.Success(vector)
     }
 
     fun writeSample(label: String, hit: HitData) {
@@ -44,6 +76,7 @@ class DatasetManager(
             hit.timestamp,
             hit.aimAngle,
             hit.distance,
+            hit.reachDistance,
             hit.hitTimeDelta,
             hit.hitTimeCV,
             hit.yawEntropyAbs,
@@ -66,9 +99,8 @@ class DatasetManager(
 
         targetFile.appendText(row + "\n")
     }
-
     /**
-     * Пишет вектор признаков окна ударов (windowSize * 20 + 7 значений).
+     * Пишет вектор признаков окна ударов (windowSize * 21 + 7 значений).
      * Вызывается только когда [FeatureExtractor.extract] вернул непустой вектор —
      * строк в векторных CSV меньше, чем в поштучных, это нормально.
      */
@@ -83,14 +115,7 @@ class DatasetManager(
     }
 
     /**
-     * Читает все векторные сэмплы (legit_vectors.csv + cheat_vectors.csv)
-     * для обучения.
-     *
-     * @return Triple(векторы, метки, счётчики реально распарсенных сэмплов
-     *         по классам: (legit, cheat)). Битые строки (не та длина,
-     *         нечисловые значения) пропускаются молча — поэтому счётчик
-     *         строк файла и счётчик сэмплов могут расходиться; валидировать
-     *         обучаемость датасета нужно по этим счётчикам, а не по строкам.
+     * Читает все векторные сэмплы (legit_vectors.csv + cheat_vectors.csv) для обучения.
      */
     fun readVectorSamples(): Triple<List<DoubleArray>, List<Double>, Pair<Int, Int>> {
         val features = mutableListOf<DoubleArray>()
@@ -98,22 +123,40 @@ class DatasetManager(
         var legitParsed = 0
         var cheatParsed = 0
 
+        val expectedSize = windowSize * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
+
         fun loadFile(file: File, label: Double) {
             if (!file.exists()) return
+            var lineNumber = 0
+            var skippedCount = 0
+            val maxDetailedWarnings = 5
+
+            fun logWarning(reason: String) {
+                if (skippedCount < maxDetailedWarnings) {
+                    System.err.println("[WARN] [${file.name}:$lineNumber] Пропуск: $reason")
+                } else if (skippedCount == maxDetailedWarnings) {
+                    System.err.println("[WARN] [${file.name}] Достигнут лимит подробных предупреждений ($maxDetailedWarnings). Дальнейшие пропуски выводятся только в итоговый счетчик.")
+                }
+            }
+
             file.forEachLine { line ->
-                val trimmed = line.trim()
-                if (trimmed.isEmpty() || trimmed.startsWith("h0")) return@forEachLine // заголовок
-                val parts = trimmed.split(',')
-                if (parts.size != windowSize * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES) {
-                    return@forEachLine
+                lineNumber++
+                when (val result = parseVectorLine(line, expectedSize)) {
+                    is ParseResult.Ignored -> return@forEachLine
+                    is ParseResult.Error -> {
+                        logWarning(result.reason)
+                        skippedCount++
+                    }
+                    is ParseResult.Success -> {
+                        features.add(result.vector)
+                        labels.add(label)
+                        if (label == 0.0) legitParsed++ else cheatParsed++
+                    }
                 }
-                val vector = DoubleArray(parts.size) { i ->
-                    val v = parts[i].toDoubleOrNull() ?: return@forEachLine
-                    v
-                }
-                features.add(vector)
-                labels.add(label)
-                if (label == 0.0) legitParsed++ else cheatParsed++
+            }
+
+            if (skippedCount > 0) {
+                System.err.println("[INFO] [${file.name}] Всего пропущено некорректных строк: $skippedCount")
             }
         }
 
@@ -123,12 +166,16 @@ class DatasetManager(
         return Triple(features, labels, Pair(legitParsed, cheatParsed))
     }
 
-    /** Краткая статистика датасета для команды info. */
+    /** Краткая статистика датасета для команды info (учитывает только валидные сэмплы). */
     fun getVectorDatasetStats(): Pair<Int, Int> {
-        fun countLines(file: File): Int =
-            if (!file.exists()) 0
-            else file.readLines().count { it.isNotBlank() && !it.startsWith("h0") }
+        val expectedSize = windowSize * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
 
-        return Pair(countLines(legitVectorFile), countLines(cheatVectorFile))
+        fun countValidSamples(file: File): Int =
+            if (!file.exists()) 0
+            else file.useLines { lines ->
+                lines.count { line -> parseVectorLine(line, expectedSize) is ParseResult.Success }
+            }
+
+        return Pair(countValidSamples(legitVectorFile), countValidSamples(cheatVectorFile))
     }
 }
