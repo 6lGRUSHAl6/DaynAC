@@ -16,8 +16,8 @@ import kotlin.math.sqrt
 /**
  * MLP-классификатор «читер / легит» на чистом Kotlin, без внешних ML-библиотек.
  *
- * Архитектура: 327 → 128 → 64 → 32 → 1
- * (327 = 16 ударов × 20 признаков + 7 агрегатов из [FeatureExtractor]).
+ * Архитектура: 343 → 128 → 64 → 32 → 1
+ * (343 = 16 ударов × 21 признаков + 7 агрегатов из [FeatureExtractor]).
  * Скрытые слои — ReLU, выход — Sigmoid (вероятность чита от 0 до 1).
  *
  * Обучение: Binary Cross-Entropy + backpropagation + SGD (по одному сэмплу).
@@ -40,7 +40,7 @@ import kotlin.math.sqrt
  * predict, атомарная публикация результатов train/load.
  */
 class NeuralNetwork(
-    val inputSize: Int = 327, // = DaynAC.WINDOW_SIZE * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
+    val inputSize: Int,   // без дефолта, размер входа диктует FeatureExtractor
     hiddenSizes: IntArray = intArrayOf(128, 64, 32),
     private val seed: Long = 42L
 ) {

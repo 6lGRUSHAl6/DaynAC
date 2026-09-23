@@ -8,8 +8,8 @@ import kotlin.math.sqrt
  * Преобразует историю последних ударов игрока (из [zov.grusha.daynAC.tracking.HitTracker])
  * в фиксированный вектор признаков для нейросети.
  *
- * Структура вектора (windowSize * 20 + 7 элементов, при windowSize=16 -> 327):
- *  - windowSize (16) последних ударов × 20 признаков на удар = 320
+ * Структура вектора (windowSize * 21 + 7 элементов, при windowSize=16 -> 343):
+ *  - windowSize (16) последних ударов × 21 признаков на удар = 336
  *  - 7 агрегатных статистик по окну
  *
  * CPS (clicks per second) сознательно НЕ включён: проект целится в 1.9 no-cooldown
@@ -52,7 +52,7 @@ class FeatureExtractor(
 
     companion object {
         /** Сколько числовых признаков берётся из каждого HitData (timestamp не считается). */
-        const val PER_HIT_FEATURES = 20
+        const val PER_HIT_FEATURES = 21
 
         /** Сколько агрегатных статистик считается по всему окну ударов. */
         const val AGGREGATE_FEATURES = 7
@@ -81,7 +81,8 @@ class FeatureExtractor(
             "microAdjustYaw",
             "microAdjustPitch",
             "jerkValue",
-            "straightLineRatio"
+            "straightLineRatio",
+            "reachDistance"
         )
 
         val AGGREGATE_NAMES: List<String> = listOf(
@@ -106,7 +107,7 @@ class FeatureExtractor(
      *
      * @param history удары в хронологическом порядке (старые -> новые),
      *                как их отдаёт HitTracker.getHistory()
-     * @return вектор длины windowSize * 20 + 7 или null, если ударов меньше windowSize
+     * @return вектор длины windowSize * 21 + 7 или null, если ударов меньше windowSize
      */
     fun extract(history: List<HitData>): FeatureVector? {
         if (history.size < windowSize) return null
@@ -137,6 +138,7 @@ class FeatureExtractor(
             out[base + 17] = sanitize(hit.microAdjustPitch)
             out[base + 18] = sanitize(hit.jerkValue)
             out[base + 19] = sanitize(hit.straightLineRatio)
+            out[base + 20] = normalizeReach(hit.reachDistance)
         }
 
         val aggBase = windowSize * PER_HIT_FEATURES
@@ -167,6 +169,22 @@ class FeatureExtractor(
 
     private fun sanitize(value: Int?): Double =
         value?.toDouble() ?: 0.0
+
+    /**
+     * Нормализует reach в диапазон [-1, 1] относительно ванильного порога 3.0.
+     *
+     *   reach <= 3.0      -> [-1, 0)   (безопасная зона)
+     *   reach  3.0..6.0   -> [0, 1]    (зона подозрения)
+     *   reach > 6.0       -> 1.0       (почти наверняка чит/телепорт)
+     *   NaN / Inf         -> 0.0       (нейтральное значение)
+     *
+     * Сырые блоки подавать нельзя: на лагах reach улетает за 5-6, и сигмоида
+     * на выходе сети начинает насыщаться, ломая градиент.
+     */
+    private fun normalizeReach(reach: Double): Double {
+        if (!reach.isFinite()) return 0.0
+        return ((reach - 3.0) / 3.0).coerceIn(-1.0, 1.0)
+    }
 
     /** Только конечные значения поля по окну (null пропускаем). */
     private fun finiteValues(window: List<HitData>, selector: (HitData) -> Double?): List<Double> =
