@@ -63,6 +63,21 @@ class NeuralNetwork(
         var featureStd: DoubleArray
     )
 
+    /**
+     * Нормализованный validation-сет последнего train() в этом сеансе.
+     * Нужен для /daynac eval — переиспользует ТОТ ЖЕ holdout, на котором
+     * училась модель, чтобы метрики не были смещены новым split'ом.
+     * Не сохраняется в model.dat: после рестарта сеанса eval недоступен
+     * до следующего train().
+     */
+    private data class ValidationSet(
+        val normalizedFeatures: List<DoubleArray>,
+        val labels: List<Double>
+    )
+
+    @Volatile
+    private var lastValidationSet: ValidationSet? = null
+
     private fun emptyWeights(): Weights = Weights(
         weights = Array(layerSizes.size - 1) { l ->
             Array(layerSizes[l + 1]) { DoubleArray(layerSizes[l]) }
@@ -201,6 +216,11 @@ class NeuralNetwork(
         require(samples.all { it.size == inputSize }) { "Все сэмплы должны быть длиной $inputSize" }
 
         mutationLock.withLock {
+            // Инвалидируем предыдущий holdout на время обучения: пока идут эпохи,
+            // ни eval, ни /daynac info не должны видеть устаревший val-сет в паре
+            // с ещё не обученными весами.
+            lastValidationSet = null
+
         // Обучаем ЛОКАЛЬНУЮ копию — боевой снапшот, по которому работает
         // inference, не меняется до конца обучения и публикуется атомарно.
         val local = snapshot.get().let {
@@ -293,9 +313,12 @@ class NeuralNetwork(
         val finalTrain = evaluateNormalized(local, trainFeatures, trainLabels)
         val finalVal = evaluateNormalized(local, valFeatures, valLabels)
 
-        // 7. Публикуем готовую модель атомарно — inference мгновенно
-        //    переключается на неё, промежуточных состояний не бывает.
-        snapshot.set(local)
+        // 7. Публикуем валидационный holdout и веса вместе. Порядок важен:
+        // lastValidationSet до snapshot.set, чтобы читатель, увидевший новые
+        // веса, гарантированно увидел и новый holdout. Обратный порядок
+        // допустил бы крохотное окно с новым val-сетом и старыми весами.
+            lastValidationSet = ValidationSet(valFeatures, valLabels)
+            snapshot.set(local)
 
         val result = TrainResult(
             epochsRun = epoch,
@@ -309,6 +332,76 @@ class NeuralNetwork(
         lastTrainResult = result
         return result
         } // mutationLock.withLock
+    }
+
+    /**
+     * Матрица ошибок при фиксированном пороге. Precision/recall/F1 — привычные
+     * метрики, но для античита критичнее FPR и FNR: FPR — доля легитных
+     * ударов, ошибочно помеченных как чит (то, за что банят невиновных),
+     * FNR — доля читов, которые проскочили.
+     */
+    data class ThresholdMetrics(
+        val threshold: Double,
+        val truePositives: Int,
+        val falsePositives: Int,
+        val trueNegatives: Int,
+        val falseNegatives: Int,
+        val totalLegit: Int,
+        val totalCheat: Int
+    ) {
+        val precision: Double get() =
+            if (truePositives + falsePositives == 0) 0.0
+            else truePositives.toDouble() / (truePositives + falsePositives)
+
+        val recall: Double get() =
+            if (truePositives + falseNegatives == 0) 0.0
+            else truePositives.toDouble() / (truePositives + falseNegatives)
+
+        val f1: Double get() =
+            if (precision + recall == 0.0) 0.0
+            else 2.0 * precision * recall / (precision + recall)
+
+        val falsePositiveRate: Double get() =
+            if (totalLegit == 0) 0.0
+            else falsePositives.toDouble() / totalLegit
+
+        val falseNegativeRate: Double get() =
+            if (totalCheat == 0) 0.0
+            else falseNegatives.toDouble() / totalCheat
+    }
+
+    /**
+     * Считает матрицу ошибок на validation-сете последнего train() для каждого
+     * порога из [thresholds]. Forward pass выполняется один раз — вероятности
+     * не зависят от порога, меняется только решение.
+     *
+     * @return список метрик (в порядке [thresholds]) или null, если в этом
+     *         сеансе ещё не было train() — eval недоступен без holdout'а.
+     */
+    fun evaluateThresholds(thresholds: DoubleArray): List<ThresholdMetrics>? {
+        val valSet = lastValidationSet ?: return null
+        val state = snapshot.get()
+
+        // Один forward pass на весь набор — переиспользуем для всех порогов.
+        val probabilities = valSet.normalizedFeatures.map { forwardOnly(state, it) }
+
+        val totalLegit = valSet.labels.count { it < 0.5 }
+        val totalCheat = valSet.labels.count { it >= 0.5 }
+
+        return thresholds.map { threshold ->
+            var tp = 0; var fp = 0; var tn = 0; var fn = 0
+            for (i in probabilities.indices) {
+                val predictedCheat = probabilities[i] >= threshold
+                val actualCheat = valSet.labels[i] >= 0.5
+                when {
+                    predictedCheat && actualCheat  -> tp++
+                    predictedCheat && !actualCheat -> fp++
+                    !predictedCheat && !actualCheat -> tn++
+                    else -> fn++
+                }
+            }
+            ThresholdMetrics(threshold, tp, fp, tn, fn, totalLegit, totalCheat)
+        }
     }
 
     /** He-инициализация (2015) — оптимальна для ReLU; bias нулями. */
@@ -601,6 +694,7 @@ class NeuralNetwork(
 
                 // Публикуем атомарно: либо старая модель, либо полностью загруженная новая.
                 // Под mutationLock — параллельный train не сможет затереть её своим set().
+                lastValidationSet = null
                 snapshot.set(loaded)
             }
         }

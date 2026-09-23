@@ -103,9 +103,9 @@ class DaynAC : JavaPlugin(), Listener {
                     if (args.size < 2) {
                         // Без аргументов — общий статус
                         sender.sendMessage(
-                            "daynac v${description.version} | модель: " +
-                                (if (detectionEngine.detectionEnabled) "активна" else "не обучена") +
-                                " | вход: $inputSize признаков"
+                            "daynac v${pluginMeta.version} | модель: " +
+                                    (if (detectionEngine.detectionEnabled) "активна" else "не обучена") +
+                                    " | вход: $inputSize признаков"
                         )
                         return true
                     }
@@ -123,9 +123,9 @@ class DaynAC : JavaPlugin(), Listener {
                     val hits = detectionEngine.getHitCount(target.uniqueId)
                     sender.sendMessage(
                         "[DaynAC] ${target.name}: последний скор = " +
-                            (last?.let { String.format(Locale.US, "%.3f", it) } ?: "нет данных") +
-                            ", средний = " + (avg?.let { String.format(Locale.US, "%.3f", it) } ?: "нет данных") +
-                            ", ударов = $hits" + if (hits < DaynAC.WINDOW_SIZE) " (нужно ${DaynAC.WINDOW_SIZE} для анализа)" else ""
+                                (last?.let { String.format(Locale.US, "%.3f", it) } ?: "нет данных") +
+                                ", средний = " + (avg?.let { String.format(Locale.US, "%.3f", it) } ?: "нет данных") +
+                                ", ударов = $hits" + if (hits < DaynAC.WINDOW_SIZE) " (нужно ${DaynAC.WINDOW_SIZE} для анализа)" else ""
                     )
                 }
                 args.isNotEmpty() && args[0] == "train" -> {
@@ -140,14 +140,14 @@ class DaynAC : JavaPlugin(), Listener {
                     if (features.size < 10) {
                         sender.sendMessage(
                             "Недостаточно данных: $legitCount легит / $cheatCount чит векторов " +
-                                "(нужно ≥ 10). Соберите через /daynac record."
+                                    "(нужно ≥ 10). Соберите через /daynac record."
                         )
                         return true
                     }
                     if (legitCount == 0 || cheatCount == 0) {
                         sender.sendMessage(
                             "Датасет однобок: $legitCount легит / $cheatCount чит. " +
-                                "Нужны оба класса — соберите и legit, и cheat сэмплы."
+                                    "Нужны оба класса — соберите и legit, и cheat сэмплы."
                         )
                         return true
                     }
@@ -213,7 +213,7 @@ class DaynAC : JavaPlugin(), Listener {
                                         val valText = valAcc?.let { " §7| val §f" + String.format(Locale.US, "%.1f%%", it * 100) } ?: ""
                                         actionBar(
                                             "${progressBar((epoch + 1).toDouble() / maxEpochs)} " +
-                                                "§f${epoch + 1}/$maxEpochs §7| loss §f$lossText$valText"
+                                                    "§f${epoch + 1}/$maxEpochs §7| loss §f$lossText$valText"
                                         )
                                     }
 
@@ -223,12 +223,12 @@ class DaynAC : JavaPlugin(), Listener {
                                     if (epoch > 0 && epoch % milestoneStep == 0) {
                                         val valPart = valLoss?.let {
                                             " §7| val §f" + String.format(Locale.US, "%.4f", it) +
-                                                " §7/ acc §f" + String.format(Locale.US, "%.1f%%", (valAcc ?: 0.0) * 100)
+                                                    " §7/ acc §f" + String.format(Locale.US, "%.1f%%", (valAcc ?: 0.0) * 100)
                                         } ?: ""
                                         report(
                                             "§7[DaynAC] ${progressBar(epoch.toDouble() / maxEpochs, 10)} " +
-                                                "эпоха §f$epoch/$maxEpochs §7| loss §f" +
-                                                String.format(Locale.US, "%.4f", trainLoss) + "$valPart"
+                                                    "эпоха §f$epoch/$maxEpochs §7| loss §f" +
+                                                    String.format(Locale.US, "%.4f", trainLoss) + "$valPart"
                                         )
                                     }
                                 }
@@ -244,7 +244,7 @@ class DaynAC : JavaPlugin(), Listener {
                                 fun num(v: Double) = String.format(Locale.US, "%.4f", v)
                                 appendLine("§a[DaynAC] Обучение завершено за ${String.format(Locale.US, "%.1f", elapsed)}с")
                                 appendLine("§7Эпох: §f${result.epochsRun} §7(лучшая: ${result.bestEpoch}" +
-                                    if (result.earlyStopped) ", early stop)" else ")")
+                                        if (result.earlyStopped) ", early stop)" else ")")
                                 appendLine("§7Train loss/acc: §f${num(result.trainLoss)} / ${pct(result.trainAccuracy)}")
                                 appendLine("§7Val loss/acc:   §f${num(result.valLoss)} / ${pct(result.valAccuracy)}")
                                 appendLine(
@@ -287,29 +287,29 @@ class DaynAC : JavaPlugin(), Listener {
                         buildString {
                             appendLine("[DaynAC] Датасет: $legitCount легит / $cheatCount чит векторов")
                             appendLine("[DaynAC] Модель: " + (if (detectionEngine.detectionEnabled) "активна" else "не обучена") +
-                                ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)")
+                                    ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)")
                             if (trainInfo != null) {
                                 fun num(v: Double) = String.format(Locale.US, "%.4f", v)
                                 fun pct(v: Double) = String.format(Locale.US, "%.1f%%", v * 100)
                                 appendLine("[DaynAC] Обучение: эпох ${trainInfo.epochsRun}" +
-                                    " (лучшая: ${trainInfo.bestEpoch}" +
-                                    if (trainInfo.earlyStopped) ", early stop)" else ")")
+                                        " (лучшая: ${trainInfo.bestEpoch}" +
+                                        if (trainInfo.earlyStopped) ", early stop)" else ")")
                                 appendLine("[DaynAC] Train loss/acc: ${num(trainInfo.trainLoss)} / ${pct(trainInfo.trainAccuracy)}")
                                 appendLine("[DaynAC] Val loss/acc:   ${num(trainInfo.valLoss)} / ${pct(trainInfo.valAccuracy)}")
                                 appendLine("[DaynAC] Разрыв train/val (переобучение): ${pct(trainInfo.overfitGap)}" +
-                                    if (trainInfo.overfitGap > 0.05) " §c— выше нормы, соберите больше данных" else "")
+                                        if (trainInfo.overfitGap > 0.05) " §c— выше нормы, соберите больше данных" else "")
                             } else {
                                 appendLine("[DaynAC] Метрики обучения неизвестны (модель из старого формата файла)")
                             }
                             append("[DaynAC] Пороги: flag ${detectionEngine.flagThreshold} / reduce ${detectionEngine.reduceThreshold}" +
-                                " / cancel ${detectionEngine.cancelThreshold} / punish ${detectionEngine.punishThreshold}" +
-                                " / окно усреднения ${detectionEngine.maxRecentPredictions}")
+                                    " / cancel ${detectionEngine.cancelThreshold} / punish ${detectionEngine.punishThreshold}" +
+                                    " / окно усреднения ${detectionEngine.maxRecentPredictions}")
                             appendLine()
                             append("[DaynAC] Наказание: " + when {
                                 !detectionEngine.punishEnabled -> "§eВЫКЛЮЧЕНО (режим наблюдения)"
                                 detectionEngine.punishAction == "none" -> "§7ничего (только лог)"
                                 else -> "§c${detectionEngine.punishAction}" +
-                                    (if (detectionEngine.punishAction == "ban" && detectionEngine.banWithIp) " + IP" else "")
+                                        (if (detectionEngine.punishAction == "ban" && detectionEngine.banWithIp) " + IP" else "")
                             })
                         }
                     )
@@ -324,7 +324,6 @@ class DaynAC : JavaPlugin(), Listener {
                     sender.sendMessage("§eПороги детекции читаются при старте плагина — для их применения перезапустите сервер.")
                 }
                 args.isNotEmpty() && args[0] == "record" -> {
-                    // ИЗМЕНЕНИЕ: Проверяем, что передано достаточно аргументов
                     if (args.size < 3) {
                         sender.sendMessage("Использование: /daynac record <ник игрока> <legit|cheat|off>")
                         return true
@@ -353,8 +352,47 @@ class DaynAC : JavaPlugin(), Listener {
                         }
                     }
                 }
+                args.isNotEmpty() && args[0] == "eval" -> {
+                    if (training.get()) {
+                        sender.sendMessage("§e[DaynAC] Обучение идёт прямо сейчас — дождитесь завершения, затем /daynac eval.")
+                        return true
+                    }
+
+                    val thresholds = doubleArrayOf(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
+                    val metrics = neuralNetwork.evaluateThresholds(thresholds)
+                    if (metrics == null) {
+                        sender.sendMessage("§c[DaynAC] Validation-сет недоступен. Модель не обучалась в этом сеансе или загружена с диска — запустите /daynac train.")
+                        return true
+                    }
+
+                    val first = metrics.first()
+                    sender.sendMessage("§7[DaynAC] Оценка модели на holdout (val: §f${first.totalLegit} §7legit / §f${first.totalCheat} §7cheat)")
+                    sender.sendMessage("§7Порог  Precision  Recall   F1     FPR     FNR")
+
+                    metrics.forEach { m ->
+                        val marker = if (kotlin.math.abs(m.threshold - detectionEngine.reduceThreshold) < 0.001) " §e←reduce" else ""
+                        sender.sendMessage(String.format(
+                            Locale.US,
+                            "§f%.2f   %.3f      %.3f    %.3f  §c%.1f%%   §c%.1f%%%s",
+                            m.threshold, m.precision, m.recall, m.f1,
+                            m.falsePositiveRate * 100, m.falseNegativeRate * 100, marker
+                        ))
+                    }
+
+                    val recommended = metrics.filter { it.falsePositiveRate <= 0.01 }
+                        .maxByOrNull { it.recall }
+                    if (recommended != null) {
+                        sender.sendMessage(String.format(
+                            Locale.US,
+                            "§aРекомендация:§f reduce-threshold = %.2f (FPR=%.1f%%, recall=%.1f%%)",
+                            recommended.threshold, recommended.falsePositiveRate * 100, recommended.recall * 100
+                        ))
+                    } else {
+                        sender.sendMessage("§eНи один порог не даёт FPR ≤ 1%. Модель пока не различает классы — нужно больше данных или пересмотреть признаки.")
+                    }
+                }
                 else -> {
-                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|reload>")
+                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|eval|reload>")
                 }
             }
             return true
@@ -362,7 +400,6 @@ class DaynAC : JavaPlugin(), Listener {
         return false
     }
 
-    // НОВЫЙ МЕТОД: Обработка подсказок (Tab Completion)
     override fun onTabComplete(
         sender: CommandSender,
         command: Command,
@@ -371,12 +408,12 @@ class DaynAC : JavaPlugin(), Listener {
     ): MutableList<String>? {
         if (command.name.equals("daynac", ignoreCase = true)) {
             when (args.size) {
-                1 -> { // Подсказка для первого аргумента
-                    return listOf("ver", "record", "train", "info", "debug", "allinfo", "reload")
+                1 -> {
+                    return listOf("ver", "record", "train", "info", "debug", "allinfo", "reload", "eval")
                         .filter { it.startsWith(args[0], ignoreCase = true) }
                         .toMutableList()
                 }
-                2 -> { // Подсказка для второго аргумента (ник игрока)
+                2 -> {
                     if (args[0].equals("ver", ignoreCase = true) || args[0].equals("record", ignoreCase = true)) {
                         return Bukkit.getOnlinePlayers()
                             .map { it.name }
@@ -384,7 +421,7 @@ class DaynAC : JavaPlugin(), Listener {
                             .toMutableList()
                     }
                 }
-                3 -> { // Подсказка для третьего аргумента (режимы, если первый record)
+                3 -> {
                     if (args[0].equals("record", ignoreCase = true)) {
                         return listOf("legit", "cheat", "off")
                             .filter { it.startsWith(args[2], ignoreCase = true) }
@@ -411,7 +448,6 @@ class DaynAC : JavaPlugin(), Listener {
         hitTracker.addHit(attacker, hitData)
         detectionEngine.recordHit(attacker)
 
-        // ИЗМЕНЕНИЕ: Проверяем, записываем ли мы именно этого атакующего
         recordingPlayers[attacker.uniqueId]?.let { label ->
             datasetManager.writeSample(label, hitData)
 
@@ -449,7 +485,6 @@ class DaynAC : JavaPlugin(), Listener {
 
         val pairKey = Pair(attacker.uniqueId, victim.uniqueId)
         val currentHits = hitCounter.compute(pairKey) { _, count -> (count ?: 0) + 1 }
-
         // Подробное логгирование каждого удара — включается/выключается через /daynac debug
         if (hitLogging) {
             val message = "[LOG] ${attacker.name} hit ${victim.name} (count=$currentHits) $hitData"
