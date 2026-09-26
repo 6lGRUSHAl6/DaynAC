@@ -284,7 +284,13 @@ class DetectionEngine(
      *  ban  — бан; при detection.ban-with-ip=true дополнительно бан по IP
      *         (banPlayerFull), иначе только профиль (UUID)
      *
-     * После наказания игрок удаляется из tracking-карт: дело закрыто,
+     * При "none" игрок остаётся на сервере, поэтому tracking-карты НЕ трогаем.
+     * predictions — это та самая история, по которой handlePrediction считает
+     * среднее для второй ступени защиты; стерев её, получаем avg == мгновенному
+     * скору, из-за чего наказание срабатывает на каждом ударе ≥ punishThreshold,
+     * а окно навсегда остаётся из одного элемента (в алерте: «1.00 (средний: 1.000)»).
+     *
+     * После кика/бана игрок удаляется из tracking-карт: дело закрыто,
      * из /daynac allinfo он пропадает (иначе наказанный висел бы в GUI
      * как «Не в сети» до истечения TTL).
      */
@@ -301,6 +307,9 @@ class DetectionEngine(
         when (punishAction) {
             "none" -> {
                 plugin.logger.warning("[DaynAC] Наказание отключено (punish-action: none): ${player.name}, средний скор $average")
+                // Игрок остался на сервере: историю предсказаний сохраняем —
+                // по ней считается среднее для решения о наказании и строится GUI.
+                return
             }
             "ban" -> {
                 plugin.logger.warning("[DaynAC] БАН: ${player.name} (средний скор $average, IP-бан: ${if (banWithIp) "да" else "нет"})")
@@ -318,7 +327,7 @@ class DetectionEngine(
             }
         }
 
-        // Наказан — убираем из GUI и tracking-карт
+        // Кик/бан — игрока на сервере больше нет: убираем из GUI и tracking-карт
         predictions.remove(player.uniqueId)
         hitCounts.remove(player.uniqueId)
     }
