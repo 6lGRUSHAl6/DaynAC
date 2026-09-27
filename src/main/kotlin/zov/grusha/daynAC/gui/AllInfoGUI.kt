@@ -70,7 +70,8 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
                 meta.lore = listOf(
                     "§7Ударов: §f$hitCount§7/§f${zov.grusha.daynAC.DaynAC.WINDOW_SIZE}",
                     "§7Предсказаний ещё нет — окно",
-                    "§7признаков не заполнено (нужно ${zov.grusha.daynAC.DaynAC.WINDOW_SIZE} ударов)."
+                    "§7признаков не заполнено (нужно ${zov.grusha.daynAC.DaynAC.WINDOW_SIZE} ударов).",
+                    "§7Пинг: ${pingValue(uuid)}"
                 )
                 watch.itemMeta = meta
                 if (inventory.firstEmpty() == -1) break
@@ -85,7 +86,7 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
             val meta = compass.itemMeta as CompassMeta
 
             meta.setDisplayName("§c$name " + (if (isOnline(uuid)) "§a● В сети" else "§c● Не в сети"))
-            meta.lore = buildLore(maxScore, average, recent, hitCount)
+            meta.lore = buildLore(maxScore, average, recent, hitCount, uuid)
             meta.persistentDataContainer.set(suspectKey, PersistentDataType.STRING, uuid.toString())
             compass.itemMeta = meta
 
@@ -110,7 +111,13 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
         }
     }
 
-    private fun buildLore(maxScore: Double, average: Double, recent: List<Double>, hitCount: Int): List<String> {
+    private fun buildLore(
+        maxScore: Double,
+        average: Double,
+        recent: List<Double>,
+        hitCount: Int,
+        uuid: UUID
+    ): List<String> {
         val lore = mutableListOf<String>()
         lore.add("▲ Макс: ${scoreIcon(maxScore)} ${fmt(maxScore)}")
         lore.add("")
@@ -123,6 +130,7 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
         lore.add("Среднее: ${fmt(average)}")
         lore.add("Всего ударов: $hitCount")
         lore.add("Вердикт: ${verdict(average)}")
+        lore.add("Пинг: ${pingValue(uuid)}")
         lore.add("")
         lore.add("§7ЛКМ — телепорт в режиме наблюдателя")
         return lore
@@ -136,6 +144,25 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
     }
 
     private fun isOnline(uuid: UUID): Boolean = Bukkit.getPlayer(uuid) != null
+
+    /**
+     * Готовое к вставке в лор значение пинга. Возвращает уже окрашенную строку
+     * («§a45»), поэтому вызывающие не думают о цвете.
+     *
+     * У оффлайн-игрока соединения нет и Bukkit пинг не отдаёт — показываем прочерк,
+     * а не 0: ноль читался бы как «идеальный пинг» у игрока, которого нет на сервере.
+     */
+    private fun pingValue(uuid: UUID): String {
+        val ping = Bukkit.getPlayer(uuid)?.ping ?: return "§8— §7(не в сети)"
+        return "${pingColor(ping)}$ping§7 мс"
+    }
+
+    /** Цвет пинга: зелёный — норма, жёлтый — заметная задержка, красный — лаги. */
+    private fun pingColor(ping: Int): String = when {
+        ping < 100 -> "§a"
+        ping < 200 -> "§e"
+        else -> "§c"
+    }
 
     private fun fmt(v: Double): String = String.format(java.util.Locale.US, "%.3f", v)
 
