@@ -43,7 +43,7 @@ class DaynAC : JavaPlugin(), Listener {
     private val inputSize = WINDOW_SIZE * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
     private val neuralNetwork = NeuralNetwork(inputSize = inputSize)
     private val detectionEngine = DetectionEngine(this, neuralNetwork)
-    private val allInfoGUI = AllInfoGUI(this, detectionEngine)
+    private val allInfoGUI = AllInfoGUI(this, detectionEngine, hitTracker)
     private val modelFile = File(dataFolder, "model.dat")
 
     /** Обучение идёт в фоне. AtomicBoolean: два почти одновременных /daynac train
@@ -76,6 +76,16 @@ class DaynAC : JavaPlugin(), Listener {
         Bukkit.getScheduler().runTaskTimer(this, Runnable {
             detectionEngine.pruneStaleTracking()
         }, 15L * 60L * 20L, 15L * 60L * 20L) // 15 минут в тиках
+
+        // Сброс после простоя: игрок не бьёт никого дольше
+        // detection.inactivity-reset-seconds — флаги снимаются, окно ударов
+        // начинается заново. Раз в секунду: обход онлайна дёшев, а задержка
+        // сброса не превышает секунды.
+        Bukkit.getScheduler().runTaskTimer(this, Runnable {
+            for (player in Bukkit.getOnlinePlayers()) {
+                resetIfIdle(player.uniqueId)
+            }
+        }, 20L, 20L)
 
         // Загрузка обученной модели, если она совместима с текущей структурой признаков
         if (neuralNetwork.isCompatibleWith(modelFile)) {
@@ -444,6 +454,11 @@ class DaynAC : JavaPlugin(), Listener {
         val attacker = event.damager as? Player ?: return
         val victim = event.entity as? Player ?: return
 
+        // Простой проверяем и здесь, до сбора признаков: удар может прийти в том же
+        // тике, что и плановый скан, и тогда он посчитался бы по старому окну.
+        // Движок флаги не трогает, если простоя нет, так что вызов безусловный.
+        resetIfIdle(attacker.uniqueId)
+
         val hitData = snapshotTracker.buildHitData(attacker, victim)
         hitTracker.addHit(attacker, hitData)
         detectionEngine.recordHit(attacker)
@@ -496,12 +511,33 @@ class DaynAC : JavaPlugin(), Listener {
     @EventHandler
     fun onPlayerQuit(event: PlayerQuitEvent) {
         snapshotTracker.removePlayer(event.player)
-        hitTracker.removePlayer(event.player)
+        hitTracker.removePlayer(event.player.uniqueId)
         detectionEngine.removePlayer(event.player)
         recordingPlayers.remove(event.player.uniqueId)
         // hitCounter чистим по обеим сторонам пары: он ключуется Pair<UUID, UUID>,
         // и без чистки монотонно растёт на каждую пару игроков навсегда.
         hitCounter.keys.removeAll { it.first == event.player.uniqueId || it.second == event.player.uniqueId }
+    }
+
+    /**
+     * Снимает с игрока состояние после простоя: флаги (активные предсказания),
+     * окно ударов и тайминг ударов. Следующие WINDOW_SIZE ударов снова набирают
+     * окно с нуля — до этого предсказаний не будет. Размер урона тоже берётся
+     * из истории, так что первый удар новой серии проходит целиком.
+     *
+     * Из /daynac allinfo игрок не пропадает и его удары не теряются: журнал
+     * скоров движок не чистит (см. DetectionEngine.resetFlags), поэтому карточка
+     * остаётся с «Последними ударами» и максом за всё время, а вердикт показывает
+     * «Флаги сняты после простоя».
+     *
+     * @return true, если сброс действительно произошёл
+     */
+    private fun resetIfIdle(playerId: UUID): Boolean {
+        if (!detectionEngine.isIdle(playerId)) return false
+        detectionEngine.resetFlags(playerId)
+        hitTracker.removePlayer(playerId)
+        snapshotTracker.resetHitTiming(playerId)
+        return true
     }
 
     private fun formatDouble(value: Double?, format: String = "%.4f"): String {

@@ -40,6 +40,12 @@ class DetectionEngine(
     val punishThreshold: Double
     val maxRecentPredictions: Int
 
+    /**
+     * Простой в секундах, после которого с игрока снимаются флаги и окно ударов
+     * начинается заново (0 = сброс выключен). См. [isIdle] и [resetFlags].
+     */
+    val inactivityResetSeconds: Int
+
     /** Автонаказание (кик) включено? false = режим наблюдения: только оповещения и снижение урона. */
     val punishEnabled: Boolean
 
@@ -59,6 +65,7 @@ class DetectionEngine(
         cancelThreshold = config.getDouble("detection.cancel-threshold", 0.90)
         punishThreshold = config.getDouble("detection.punish-threshold", 0.95)
         maxRecentPredictions = config.getInt("detection.max-recent-predictions", 10)
+        inactivityResetSeconds = config.getInt("detection.inactivity-reset-seconds", 30)
         punishEnabled = config.getBoolean("detection.punish-enabled", true)
         punishAction = config.getString("detection.punish-action", "kick")?.lowercase() ?: "kick"
         punishReason = config.getString("detection.punish-reason", "KillAura (обнаружено нейросетью DaynAC)")!!
@@ -85,6 +92,7 @@ class DetectionEngine(
             "detection.cancel-threshold ($cancelThreshold) должен быть ≤ punish-threshold ($punishThreshold)"
         }
         require(maxRecentPredictions >= 1) { "detection.max-recent-predictions должен быть ≥ 1, получено $maxRecentPredictions" }
+        require(inactivityResetSeconds >= 0) { "detection.inactivity-reset-seconds должен быть ≥ 0 (0 = выключен), получено $inactivityResetSeconds" }
     }
 
     private data class PlayerVerdict(
@@ -95,15 +103,41 @@ class DetectionEngine(
     /** Записи о неактивных игроках старше этого возраста удаляются (TTL против монотонного роста карт). */
     private val trackedTtlMs = 60L * 60L * 1000L // 1 час
 
+    /**
+     * Длина журнала скоров ([scoreHistory]). Заметно больше окна усреднения:
+     * журнал — витрина для админа («Последние удары», «Макс»), а не вход для
+     * решений, и должен переживать сброс по простою.
+     */
+    private val maxScoreHistory = 100
+
     private val inferencePool: ExecutorService = Executors.newFixedThreadPool(2) { runnable ->
         Thread(runnable, "DaynAC-Inference").apply { isDaemon = true }
     }
 
-    /** Последние предсказания по игрокам (для усреднения и GUI/ver). */
+    /**
+     * АКТИВНЫЕ предсказания по игрокам — то, чем движок реально руководствуется:
+     * множитель урона, оповещения, автонаказание. Сбрасываются по простою
+     * ([resetFlags]), наказанием и TTL-чисткой.
+     */
     private val predictions = ConcurrentHashMap<UUID, ArrayDeque<PlayerVerdict>>()
+
+    /**
+     * Журнал ВСЕХ скоров игрока — то, что видит админ в /daynac allinfo
+     * («Последние удары», «Макс»). Сброс по простою его НЕ трогает: с игрока
+     * снимаются флаги, но история ударов остаётся для разбора. Чистится только
+     * наказанием и TTL-чисткой.
+     */
+    private val scoreHistory = ConcurrentHashMap<UUID, ArrayDeque<PlayerVerdict>>()
 
     /** Сколько ударов игрок сделал (для /daynac ver и GUI — видно, почему нет предсказаний). */
     val hitCounts = java.util.concurrent.ConcurrentHashMap<UUID, Int>()
+
+    /**
+     * Время последнего удара игрока (мс). По нему считается простой: игрок,
+     * не бивший никого дольше [inactivityResetSeconds], начинает с чистого листа.
+     * Заполняется в [recordHit], очищается в [resetFlags] и [punishPlayer].
+     */
+    private val lastHitTimes = ConcurrentHashMap<UUID, Long>()
 
     /** Модель обучена и загружена — детекция активна. */
     @Volatile
@@ -121,10 +155,41 @@ class DetectionEngine(
     /** Регистрирует удар игрока (вызывается на главном потоке при каждом ударе). */
     fun recordHit(player: Player) {
         hitCounts.merge(player.uniqueId, 1, Int::plus)
+        lastHitTimes[player.uniqueId] = System.currentTimeMillis()
     }
 
     /** Сколько ударов у игрока и хватает ли их для анализа (окно 16). */
     fun getHitCount(playerId: UUID): Int = hitCounts[playerId] ?: 0
+
+    /**
+     * Прошло ли с последнего удара игрока больше [inactivityResetSeconds].
+     * Игрок без единого удара или уже сброшенный простаивающим не считается —
+     * сбрасывать нечего.
+     */
+    fun isIdle(playerId: UUID): Boolean {
+        if (inactivityResetSeconds <= 0) return false
+        val lastHit = lastHitTimes[playerId] ?: return false
+        return System.currentTimeMillis() - lastHit > inactivityResetSeconds * 1000L
+    }
+
+    /**
+     * Снимает с игрока флаги после простоя: активные предсказания стираются,
+     * поэтому урон снова проходит целиком, а автонаказание не срабатывает, пока
+     * игрок не наберёт окно ударов заново ([FeatureExtractor.extract] до этого
+     * возвращает null — предсказаний нет).
+     *
+     * Журнал ([scoreHistory]) и счётчик ударов ([hitCounts]) СОЗНАТЕЛЬНО остаются:
+     * это витрина админа в /daynac allinfo — игрок не исчезает из списка, а его
+     * «Последние удары» и «Макс» переживают сброс. В карточке такой игрок
+     * показан как «Флаги сняты после простоя».
+     *
+     * Окно ударов (HitTracker) и тайминги (SnapshotTracker) чистит вызывающая
+     * сторона — движок их не знает.
+     */
+    fun resetFlags(playerId: UUID) {
+        predictions.remove(playerId)
+        lastHitTimes.remove(playerId)
+    }
 
     /**
      * Удаляет записи о неактивных игроках старше TTL. Предсказания и счётчики
@@ -139,10 +204,23 @@ class DetectionEngine(
             val lastTs = synchronized(deque) { deque.lastOrNull()?.timestamp }
             lastTs == null || now - lastTs > trackedTtlMs
         }
+        // Журнал чистится по тому же TTL: админ видит историю игрока час после
+        // последнего удара, дальше запись забывается вместе с активными флагами.
+        scoreHistory.entries.removeIf { (_, deque) ->
+            val lastTs = synchronized(deque) { deque.lastOrNull()?.timestamp }
+            lastTs == null || now - lastTs > trackedTtlMs
+        }
         // Счётчик ударов мал сам по себе; удаляем только записи оффлайн-игроков,
-        // которых уже нет и в предсказаниях (иначе GUI потеряет «прогресс окна»).
+        // которых уже нет ни в журнале, ни в предсказаниях (иначе GUI потеряет
+        // «прогресс окна»).
         hitCounts.keys.retainAll { uuid ->
-            predictions.containsKey(uuid) || Bukkit.getPlayer(uuid) != null
+            scoreHistory.containsKey(uuid) || predictions.containsKey(uuid) || Bukkit.getPlayer(uuid) != null
+        }
+        // Время последнего удара нужно только тем, кого мы ещё отслеживаем:
+        // для забытого игрока (оффлайн, без предсказаний и ударов) хранить его нечего.
+        lastHitTimes.keys.retainAll { uuid ->
+            scoreHistory.containsKey(uuid) || predictions.containsKey(uuid) ||
+                    hitCounts.containsKey(uuid) || Bukkit.getPlayer(uuid) != null
         }
     }
 
@@ -178,10 +256,20 @@ class DetectionEngine(
     }
 
     private fun recordVerdict(attacker: Player, probability: Double) {
+        val verdict = PlayerVerdict(probability, System.currentTimeMillis())
+
         val deque = predictions.computeIfAbsent(attacker.uniqueId) { ArrayDeque() }
         synchronized(deque) {
             if (deque.size >= maxRecentPredictions) deque.removeFirst()
-            deque.addLast(PlayerVerdict(probability, System.currentTimeMillis()))
+            deque.addLast(verdict)
+        }
+
+        // Тот же скор — в журнал. Он длиннее окна усреднения: GUI показывает
+        // «Последние удары» и «Макс» за всю историю, а не только за активное окно.
+        val history = scoreHistory.computeIfAbsent(attacker.uniqueId) { ArrayDeque() }
+        synchronized(history) {
+            if (history.size >= maxScoreHistory) history.removeFirst()
+            history.addLast(verdict)
         }
     }
 
@@ -217,18 +305,32 @@ class DetectionEngine(
     fun getLastPrediction(player: Player): Double? =
         predictions[player.uniqueId]?.let { deque -> synchronized(deque) { deque.lastOrNull()?.probability } }
 
-    /** Последние предсказания игрока (новые в конце), для GUI. */
+    /**
+     * Последние АКТИВНЫЕ предсказания игрока (новые в конце) — окно усреднения.
+     * После сброса по простою пусто, пока игрок не наберёт окно ударов заново;
+     * сводка в оповещении админам строится именно по ним.
+     */
     fun getRecentPredictions(playerId: UUID): List<Double> {
         val deque = predictions[playerId] ?: return emptyList()
         return synchronized(deque) { deque.map { it.probability } }
     }
 
-    /** Максимальный скор за историю наблюдений игрока. */
-    fun getMaxPrediction(playerId: UUID): Double? =
-        getRecentPredictions(playerId).maxOrNull()
+    /** Журнал скоров игрока (новые в конце) — «Последние удары» в GUI. Сброс по простою его не трогает. */
+    fun getScoreHistory(playerId: UUID): List<Double> {
+        val deque = scoreHistory[playerId] ?: return emptyList()
+        return synchronized(deque) { deque.map { it.probability } }
+    }
 
-    /** Все UUID, по которым есть хоть одно предсказание (для GUI). */
-    fun getTrackedPlayerIds(): Set<UUID> = predictions.keys.toSet()
+    /** Максимальный скор за всю историю наблюдений игрока (журнал, не окно). */
+    fun getMaxPrediction(playerId: UUID): Double? =
+        getScoreHistory(playerId).maxOrNull()
+
+    /**
+     * Все UUID, по которым есть хоть одно предсказание (для GUI). Берём журнал,
+     * а не активные предсказания: после сброса по простою он пуст, но игрок
+     * должен остаться в /daynac allinfo.
+     */
+    fun getTrackedPlayerIds(): Set<UUID> = scoreHistory.keys.toSet()
 
     /**
      * Проверка порогов на главном потоке: оповещение админов при подозрении,
@@ -329,7 +431,9 @@ class DetectionEngine(
 
         // Кик/бан — игрока на сервере больше нет: убираем из GUI и tracking-карт
         predictions.remove(player.uniqueId)
+        scoreHistory.remove(player.uniqueId)
         hitCounts.remove(player.uniqueId)
+        lastHitTimes.remove(player.uniqueId)
     }
 
     /**

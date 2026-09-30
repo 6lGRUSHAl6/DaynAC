@@ -14,7 +14,9 @@ import org.bukkit.inventory.ItemStack
 import org.bukkit.inventory.meta.CompassMeta
 import org.bukkit.persistence.PersistentDataType
 import org.bukkit.plugin.Plugin
+import zov.grusha.daynAC.DaynAC
 import zov.grusha.daynAC.detection.DetectionEngine
+import zov.grusha.daynAC.tracking.HitTracker
 import java.util.UUID
 
 /**
@@ -24,7 +26,11 @@ import java.util.UUID
  *
  * Компас в ведущую руку не даёт — игрок сразу видит, куда телепортируется.
  */
-class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine) : Listener {
+class AllInfoGUI(
+    private val plugin: Plugin,
+    private val engine: DetectionEngine,
+    private val hitTracker: HitTracker
+) : Listener {
 
     companion object {
         private const val TITLE = "§8DaynAC — наблюдаемые игроки"
@@ -58,35 +64,59 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
         val trackedIds = engine.getTrackedPlayerIds() + engine.hitCounts.keys
 
         for (uuid in trackedIds) {
-            val recent = engine.getRecentPredictions(uuid)
+            // Журнал скоров, а не активное окно: после сброса по простою флаги
+            // сняты, но «Последние удары» игрока остаются для разбора.
+            val history = engine.getScoreHistory(uuid)
             val hitCount = engine.getHitCount(uuid)
             val name = Bukkit.getOfflinePlayer(uuid).name ?: uuid.toString().take(8)
 
-            if (recent.isEmpty()) {
-                // Удары есть, но окно ещё не набралось — показываем прогресс
+            if (history.isEmpty()) {
+                // Предсказаний у игрока ещё не было. Прогресс берём из самого окна,
+                // а не из счётчика ударов: счётчик суммарный, и после сброса по
+                // простою окно могло обнулиться — «5/16» вводило бы в заблуждение.
                 val watch = ItemStack(Material.CLOCK)
                 val meta = watch.itemMeta
+                val windowFill = hitTracker.getWindowFill(uuid)
                 meta.setDisplayName("§e$name " + (if (isOnline(uuid)) "§a● В сети" else "§c● Не в сети"))
-                meta.lore = listOf(
-                    "§7Ударов: §f$hitCount§7/§f${zov.grusha.daynAC.DaynAC.WINDOW_SIZE}",
-                    "§7Предсказаний ещё нет — окно",
-                    "§7признаков не заполнено (нужно ${zov.grusha.daynAC.DaynAC.WINDOW_SIZE} ударов).",
-                    "§7Пинг: ${pingValue(uuid)}"
-                )
+
+                val lore = mutableListOf("§7Ударов: §f$windowFill§7/§f${DaynAC.WINDOW_SIZE}")
+                if (windowFill < DaynAC.WINDOW_SIZE) {
+                    lore.add("§7Предсказаний ещё нет — окно")
+                    lore.add("§7признаков не заполнено (нужно ${DaynAC.WINDOW_SIZE} ударов).")
+                } else {
+                    // Окно полное, а предсказаний нет: анализ этого игрока не ведётся
+                    // вовсе — он в режиме записи датасета, либо детекция выключена.
+                    lore.add("§7Предсказаний нет — анализ не ведётся:")
+                    lore.add("§7игрок в режиме записи или детекция выключена.")
+                }
+                lore.add("§7Пинг: ${pingValue(uuid)}")
+
+                meta.lore = lore
                 watch.itemMeta = meta
                 if (inventory.firstEmpty() == -1) break
                 inventory.setItem(inventory.firstEmpty(), watch)
                 continue
             }
 
-            val maxScore = recent.max()
-            val average = recent.average()
+            // Активные флаги: по ним считаются урон и наказание. После сброса по
+            // простою они пусты, хотя журнал ударов сохранён — карточка это покажет.
+            val active = engine.getRecentPredictions(uuid)
+            val flagsCleared = active.isEmpty()
+            val average = active.average() // NaN при снятых флагах — тогда в лоре прочерк
 
             val compass = ItemStack(Material.COMPASS)
             val meta = compass.itemMeta as CompassMeta
 
             meta.setDisplayName("§c$name " + (if (isOnline(uuid)) "§a● В сети" else "§c● Не в сети"))
-            meta.lore = buildLore(maxScore, average, recent, hitCount, uuid)
+            meta.lore = buildLore(
+                maxScore = history.max(),
+                average = average,
+                history = history,
+                hitCount = hitCount,
+                uuid = uuid,
+                flagsCleared = flagsCleared,
+                windowFill = hitTracker.getWindowFill(uuid)
+            )
             meta.persistentDataContainer.set(suspectKey, PersistentDataType.STRING, uuid.toString())
             compass.itemMeta = meta
 
@@ -114,22 +144,36 @@ class AllInfoGUI(private val plugin: Plugin, private val engine: DetectionEngine
     private fun buildLore(
         maxScore: Double,
         average: Double,
-        recent: List<Double>,
+        history: List<Double>,
         hitCount: Int,
-        uuid: UUID
+        uuid: UUID,
+        flagsCleared: Boolean,
+        windowFill: Int
     ): List<String> {
         val lore = mutableListOf<String>()
-        lore.add("▲ Макс: ${scoreIcon(maxScore)} ${fmt(maxScore)}")
+        // Макс — по журналу за всё время: после сброса по простою он остаётся
+        // исторической отметкой и помечается, чтобы не читался как текущий флаг.
+        lore.add("▲ Макс: ${scoreIcon(maxScore)} ${fmt(maxScore)}" + if (flagsCleared) " §7(история)" else "")
         lore.add("")
         lore.add("Последние удары:")
         // Показываем последние 10, новые первыми — как в daynac.md
-        recent.takeLast(10).asReversed().forEachIndexed { i, score ->
+        history.takeLast(10).asReversed().forEachIndexed { i, score ->
             lore.add(" #${i + 1} ${scoreIcon(score)} ${fmt(score)}")
         }
         lore.add("")
-        lore.add("Среднее: ${fmt(average)}")
+        if (flagsCleared) {
+            // Флаги снял сброс по простою: показываем прогресс нового окна и
+            // объясняем, почему предсказаний нет, — иначе карточка выглядит
+            // как «данных нет» без причины.
+            lore.add("Ударов: §f$windowFill§7/§f${DaynAC.WINDOW_SIZE} §7(окно набирается заново)")
+            lore.add("§7Предсказаний нет — после сброса флагов")
+            lore.add("§7окно признаков ещё не заполнено.")
+            lore.add("Среднее: §7—")
+        } else {
+            lore.add("Среднее: ${fmt(average)}")
+        }
         lore.add("Всего ударов: $hitCount")
-        lore.add("Вердикт: ${verdict(average)}")
+        lore.add("Вердикт: " + if (flagsCleared) "§aФлаги сняты после простоя" else verdict(average))
         lore.add("Пинг: ${pingValue(uuid)}")
         lore.add("")
         lore.add("§7ЛКМ — телепорт в режиме наблюдателя")

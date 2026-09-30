@@ -441,6 +441,21 @@ class SnapshotTracker(private val maxSize: Int = 20) {
         lastAimAngles.remove(player.uniqueId)
     }
 
+    /**
+     * Сбрасывает тайминг ударов игрока, не трогая снимки поворотов: они пишутся
+     * каждый тик и после простоя и так свежие, а вот последний удар остался в
+     * прошлом — без сброса первый удар новой серии получил бы hitTimeDelta
+     * в десятки секунд, которого сеть на реальных боях не видела.
+     * После сброса первый удар серии даёт delta = null → в вектор идёт 0.0,
+     * как и у самого первого удара игрока за сессию.
+     */
+    fun resetHitTiming(playerId: UUID) {
+        val state = playerStates[playerId] ?: return
+        state.lastHitTime = null
+        state.hitDeltasCount = 0
+        state.hitDeltasIndex = 0
+    }
+
     fun getSpeedXZ(player: Player): Float? {
         return historySnapshot[player.uniqueId]?.lastOrNull()?.speedXZ
     }

@@ -27,7 +27,14 @@ class HitTracker(private val maxSize: Int) {
 
     fun getHistory(player: Player): List<HitData> = history[player.uniqueId]?.toList() ?: emptyList()
 
-    fun removePlayer(player: Player) {
-        history.remove(player.uniqueId)
+    /**
+     * Сколько ударов сейчас в окне (0..maxSize). Для GUI: после сброса флагов
+     * по простою видно, сколько ударов игрок уже набрал в новом окне — окно
+     * признаков заполняется заново, и предсказаний до этого не будет.
+     */
+    fun getWindowFill(playerId: UUID): Int = history[playerId]?.size ?: 0
+
+    fun removePlayer(playerId: UUID) {
+        history.remove(playerId)
     }
 }
