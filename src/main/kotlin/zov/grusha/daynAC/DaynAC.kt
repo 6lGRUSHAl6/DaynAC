@@ -56,7 +56,20 @@ class DaynAC : JavaPlugin(), Listener {
     private var hitLogging: Boolean = false
 
     // ИЗМЕНЕНИЕ: Теперь храним статус записи для каждого игрока отдельно (по UUID)
-    private val recordingPlayers = mutableMapOf<UUID, String>()
+    private val recordingPlayers = mutableMapOf<UUID, RecordingSession>()
+
+    /** Сессия записи датасета: метка класса и идентификатор сессии (от `record <ник> legit|cheat` до `off`). */
+    private data class RecordingSession(val label: String, val sessionId: String) {
+        /** Сколько векторов (семплов для обучения) записано в этой сессии. */
+        var vectors: Int = 0
+    }
+
+    /** Идентификатор сессии: время начала + случайный суффикс, например `20261010-174225-3fa9`. */
+    private fun newSessionId(): String {
+        val time = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
+        val suffix = String.format("%04x", java.util.concurrent.ThreadLocalRandom.current().nextInt(0x10000))
+        return "$time-$suffix"
+    }
 
     override fun onEnable() {
         logger.info("Enabling plugin...")
@@ -144,8 +157,17 @@ class DaynAC : JavaPlugin(), Listener {
                         return true
                     }
 
-                    val (features, labels, parsedCounts) = datasetManager.readVectorSamples()
-                    val (legitCount, cheatCount) = parsedCounts
+                    val dataset = datasetManager.readVectorSamples()
+                    val features = dataset.samples.map { it.features }
+                    val labels = dataset.samples.map { it.label }
+                    val legitCount = dataset.legitCount
+                    val cheatCount = dataset.cheatCount
+
+                    // По какой группе делить выборку, чтобы окна одной сессии/игрока не попали
+                    // сразу в train и test (training.split-by: session | player).
+                    val splitBy = config.getString("training.split-by", "session")?.lowercase()
+                        ?.takeIf { it == "session" || it == "player" } ?: "session"
+                    val groups: List<String?> = dataset.samples.map { if (splitBy == "player") it.playerHash else it.sessionId }
 
                     if (features.size < 10) {
                         sender.sendMessage(
@@ -219,6 +241,7 @@ class DaynAC : JavaPlugin(), Listener {
                             val result = neuralNetwork.train(
                                 samples = features,
                                 labels = labels,
+                                groups = groups,
                                 learningRate = 0.001,
                                 maxEpochs = maxEpochs,
                                 patience = 15,
@@ -269,6 +292,7 @@ class DaynAC : JavaPlugin(), Listener {
                                 result.testLoss?.let { tl ->
                                     appendLine("§7Test loss/acc:  §f${num(tl)} / ${pct(result.testAccuracy ?: 0.0)}")
                                 }
+                                result.split?.let { appendLine(describeSplit(it, splitBy)) }
                                 appendLine(
                                     if (result.overfitGap > 0.05) "§eПереобучение: разрыв train/val ${pct(result.overfitGap)} — соберите больше данных"
                                     else "§aРазрыв train/val: ${pct(result.overfitGap)} — в норме"
@@ -304,10 +328,13 @@ class DaynAC : JavaPlugin(), Listener {
                 }
                 args.isNotEmpty() && args[0] == "info" -> {
                     val (legitCount, cheatCount) = datasetManager.getVectorDatasetStats()
+                    val (legitSessions, cheatSessions) = datasetManager.getSessionStats()
                     val trainInfo = neuralNetwork.lastTrainResult
                     sender.sendMessage(
                         buildString {
                             appendLine("[DaynAC] Датасет: $legitCount легит / $cheatCount чит векторов")
+                            appendLine("[DaynAC] Сессий записи: $legitSessions легит / $cheatSessions чит " +
+                                    "(для разбиения по сессиям нужно ≥ ${NeuralNetwork.MIN_GROUPS_PER_CLASS} на класс)")
                             appendLine("[DaynAC] Модель: " + (if (detectionEngine.detectionEnabled) "активна" else "не обучена") +
                                     ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)")
                             if (trainInfo != null) {
@@ -366,12 +393,19 @@ class DaynAC : JavaPlugin(), Listener {
                     val mode = args[2].lowercase()
                     when (mode) {
                         "legit", "cheat" -> {
-                            recordingPlayers[targetPlayer.uniqueId] = mode
-                            sender.sendMessage("Запись датасета для ${targetPlayer.name} включена в режиме: $mode")
+                            val session = RecordingSession(mode, newSessionId())
+                            recordingPlayers[targetPlayer.uniqueId] = session
+                            sender.sendMessage("Запись датасета для ${targetPlayer.name} включена в режиме: $mode (сессия ${session.sessionId})")
+                            sendActionBar(targetPlayer, "§aЗапись датасета включена: §f$mode")
                         }
                         "off" -> {
-                            recordingPlayers.remove(targetPlayer.uniqueId)
-                            sender.sendMessage("Запись датасета для ${targetPlayer.name} выключена.")
+                            val finished = recordingPlayers.remove(targetPlayer.uniqueId)
+                            sender.sendMessage(
+                                "Запись датасета для ${targetPlayer.name} выключена." +
+                                        (if (finished != null) " Записано семплов за сессию: ${finished.vectors}." else "")
+                            )
+                            sendActionBar(targetPlayer, "§7Запись датасета остановлена" +
+                                    (if (finished != null) " §8| §7семплов: §f${finished.vectors}" else ""))
                         }
                         else -> {
                             sender.sendMessage("Использование: /daynac record <ник игрока> <legit|cheat|off>")
@@ -393,6 +427,11 @@ class DaynAC : JavaPlugin(), Listener {
 
                     val first = metrics.first()
                     sender.sendMessage("§7[DaynAC] Оценка модели на test-сете (§f${first.totalLegit} §7legit / §f${first.totalCheat} §7cheat§7, в обучении не участвовал)")
+                    neuralNetwork.lastTrainResult?.split?.let { sp ->
+                        if (!sp.fullyGrouped) {
+                            sender.sendMessage("§e⚠ Test-сет получен случайным разбиением окон (мало сессий/игроков) — метрики оптимистичны.")
+                        }
+                    }
                     sender.sendMessage("§7Порог  Precision  Recall   F1     FPR  [95% ДИ]")
 
                     metrics.forEach { m ->
@@ -503,7 +542,8 @@ class DaynAC : JavaPlugin(), Listener {
         hitTracker.addHit(attacker, hitData)
         detectionEngine.recordHit(attacker)
 
-        recordingPlayers[attacker.uniqueId]?.let { label ->
+        recordingPlayers[attacker.uniqueId]?.let { session ->
+            val label = session.label
             datasetManager.writeSample(label, hitData)
 
             // Вектор признаков пишем только на каждый WINDOW_SIZE-й удар
@@ -513,9 +553,20 @@ class DaynAC : JavaPlugin(), Listener {
             // фиктивны, early stopping ломается.
             if (detectionEngine.getHitCount(attacker.uniqueId) % WINDOW_SIZE == 0) {
                 featureExtractor.extract(hitTracker.getHistory(attacker))?.let { vector ->
-                    datasetManager.writeVectorSample(label, vector)
+                    datasetManager.writeVectorSample(
+                        label, vector, session.sessionId, datasetManager.playerHash(attacker.uniqueId)
+                    )
+                    session.vectors++
                 }
             }
+
+            // Счётчик над хотбаром для записываемого игрока: сколько семплов набито
+            // в этой сессии и сколько ударов до следующего.
+            val untilNext = WINDOW_SIZE - detectionEngine.getHitCount(attacker.uniqueId) % WINDOW_SIZE
+            sendActionBar(
+                attacker,
+                "§7Запись §a$label§7: §f${session.vectors} §7семплов §8| §7до следующего: §f$untilNext §7ударов"
+            )
         }
 
         // Детекция: асинхронный inference. Записывающего игрока не проверяем —
@@ -578,6 +629,30 @@ class DaynAC : JavaPlugin(), Listener {
         hitTracker.removePlayer(playerId)
         snapshotTracker.resetHitTiming(playerId)
         return true
+    }
+
+    /** Сообщение над хотбаром (legacy-цвета §). Вызывать с главного потока. */
+    private fun sendActionBar(player: Player, text: String) {
+        player.sendActionBar(
+            net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer
+                .legacySection().deserialize(text)
+        )
+    }
+
+    /** Строка отчёта о том, как датасет был разбит на train/val/test. */
+    private fun describeSplit(split: NeuralNetwork.SplitSummary, splitBy: String): String {
+        val unit = if (splitBy == "player") "игроков" else "сессий"
+        val sizes = "train/val/test: ${split.trainSize}/${split.valSize}/${split.testSize} окон"
+        return if (split.fullyGrouped) {
+            val unbalanced = if (split.trainSize < maxOf(split.valSize, split.testSize)) {
+                " §e— train меньше val/test: $unit сильно разного размера, лучше записать ещё"
+            } else ""
+            "§7Split: §aпо $unit §7(legit: ${split.legitGroups}, cheat: ${split.cheatGroups}; $sizes)$unbalanced"
+        } else {
+            "§eSplit: случайный по окнам — мало $unit (legit: ${split.legitGroups}, cheat: ${split.cheatGroups}, " +
+                    "нужно ≥ ${NeuralNetwork.MIN_GROUPS_PER_CLASS} на класс). Окна одного игрока могут быть и в train, " +
+                    "и в test — метрики завышены. §7($sizes)"
+        }
     }
 
     private fun formatDouble(value: Double?, format: String = "%.4f"): String {

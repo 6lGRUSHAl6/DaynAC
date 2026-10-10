@@ -120,6 +120,12 @@ class NeuralNetwork(
          * Меньше — какой-то из сетов остаётся без класса и метрики теряют смысл.
          */
         const val MIN_SAMPLES_PER_CLASS = 5
+
+        /**
+         * Минимум групп (сессий/игроков) на класс для разбиения по группам: по одной в
+         * train, val и test. Меньше — разбиение случайное по окнам, метрики завышены.
+         */
+        const val MIN_GROUPS_PER_CLASS = 3
     }
 
     // ------------------------------------------------------------------
@@ -178,6 +184,24 @@ class NeuralNetwork(
     // Обучение
     // ------------------------------------------------------------------
 
+    /**
+     * Как разбит датасет. [legitGrouped]/[cheatGrouped] = true: группы (сессии или игроки)
+     * класса целиком попали в один из сетов, утечки между train и test нет. false: групп
+     * меньше [MIN_GROUPS_PER_CLASS] (или метаданных нет), разбиение случайное по окнам —
+     * окна одного игрока могут быть и в train, и в test, метрики оптимистичны.
+     */
+    data class SplitSummary(
+        val legitGrouped: Boolean,
+        val cheatGrouped: Boolean,
+        val legitGroups: Int,
+        val cheatGroups: Int,
+        val trainSize: Int,
+        val valSize: Int,
+        val testSize: Int
+    ) {
+        val fullyGrouped: Boolean get() = legitGrouped && cheatGrouped
+    }
+
     /** Результат обучения — для отчёта администратору и диагностики переобучения. */
     data class TrainResult(
         val epochsRun: Int,
@@ -189,7 +213,9 @@ class NeuralNetwork(
         val valAccuracy: Double,
         /** Метрики на test-сете. null — результат загружен из model.dat (test в файл не пишется). */
         val testLoss: Double? = null,
-        val testAccuracy: Double? = null
+        val testAccuracy: Double? = null,
+        /** Как был разбит датасет. null — результат загружен из model.dat. */
+        val split: SplitSummary? = null
     ) {
         /** Разрыв train/val — грубая метрика переобучения (0.05+ уже подозрительно). */
         val overfitGap: Double get() = trainAccuracy - valAccuracy
@@ -210,6 +236,10 @@ class NeuralNetwork(
      * с восстановлением лучших весов. Test-сет в обучении и выборе эпохи не
      * участвует — по нему считаются финальные метрики и /daynac eval.
      *
+     * @param groups группа каждого сэмпла (сессия записи или игрок; null — группы нет).
+     *               Если на класс приходится ≥ [MIN_GROUPS_PER_CLASS] групп, разбиение идёт
+     *               по группам: ни одна не попадает сразу в два сета.
+     *
      * @param samples векторы признаков (каждый длиной [inputSize])
      * @param labels  0.0 = легит, 1.0 = чит
      * @param learningRate шаг SGD (оптимально 0.001–0.003)
@@ -225,11 +255,13 @@ class NeuralNetwork(
         maxEpochs: Int = 1000,
         patience: Int = 15,
         l2Lambda: Double = 1e-4,
+        groups: List<String?>? = null,
         onProgress: ((epoch: Int, trainLoss: Double, valLoss: Double?, valAcc: Double?) -> Unit)? = null
     ): TrainResult {
         require(samples.size == labels.size) { "samples и labels разной длины" }
         require(samples.size >= 10) { "Датасет слишком мал: ${samples.size} сэмплов (нужно ≥ 10)" }
         require(samples.all { it.size == inputSize }) { "Все сэмплы должны быть длиной $inputSize" }
+        require(groups == null || groups.size == samples.size) { "groups и samples разной длины" }
         val legitTotal = labels.count { it == 0.0 }
         val cheatTotal = labels.count { it == 1.0 }
         require(legitTotal >= MIN_SAMPLES_PER_CLASS && cheatTotal >= MIN_SAMPLES_PER_CLASS) {
@@ -253,23 +285,15 @@ class NeuralNetwork(
             )
         }
 
-        // 1. Делим 60/20/20 (train/val/test) СТРАТИФИЦИРОВАННО — каждый класс отдельно,
-        // чтобы в val и test гарантированно попали оба класса (см. MIN_SAMPLES_PER_CLASS).
-        // val нужен только early stopping'у, test — только финальной оценке: если
-        // мерить качество на том же сете, по которому выбрана лучшая эпоха, метрики
-        // оптимистично завышены (выбор «подглядел» в этот сет).
+        // 1. Делим 60/20/20 (train/val/test) стратифицированно по классам и, если групп
+        // (сессий/игроков) хватает, ПО ГРУППАМ: окна одного игрока очень похожи, и при
+        // разбиении по окнам модель могла бы «узнавать» человека, а не чит. val нужен только
+        // early stopping'у, test — только финальной оценке. Подробности — в [splitIndices].
         val rng = Random(seed)
-        val trainIdx = ArrayList<Int>(samples.size)
-        val valIdx = ArrayList<Int>()
-        val testIdx = ArrayList<Int>()
-        for (label in listOf(0.0, 1.0)) {
-            val classIdx = samples.indices.filter { labels[it] == label }.shuffled(rng)
-            val testCount = max(1, (classIdx.size * TEST_FRACTION).toInt())
-            val valCount = max(1, (classIdx.size * VAL_FRACTION).toInt())
-            testIdx.addAll(classIdx.take(testCount))
-            valIdx.addAll(classIdx.drop(testCount).take(valCount))
-            trainIdx.addAll(classIdx.drop(testCount + valCount))
-        }
+        val indexSplit = splitIndices(labels, groups, rng)
+        val trainIdx = indexSplit.train
+        val valIdx = indexSplit.validation
+        val testIdx = indexSplit.test
 
         // 2. Инициализация весов заново — чистый старт (He init)
         initWeights(local)
@@ -357,7 +381,8 @@ class NeuralNetwork(
             trainAccuracy = finalTrain.accuracy,
             valAccuracy = finalVal.accuracy,
             testLoss = finalTest.avgLoss,
-            testAccuracy = finalTest.accuracy
+            testAccuracy = finalTest.accuracy,
+            split = indexSplit.summary
         )
         lastTrainResult = result
         return result
@@ -399,9 +424,15 @@ class NeuralNetwork(
             if (totalCheat == 0) 0.0
             else falseNegatives.toDouble() / totalCheat
 
+        /**
+         * 95% доверительный интервал (Уилсон) для FPR. На малом числе legit-окон
+         * точечная оценка вводит в заблуждение: «0 ложных из 50» — это реальный
+         * FPR от 0% до ~7%, а не 0%.
+         */
         val falsePositiveRateInterval: Pair<Double, Double> get() =
             Stats.wilsonInterval(falsePositives, totalLegit)
 
+        /** 95% доверительный интервал (Уилсон) для recall (доли пойманных читов). */
         val recallInterval: Pair<Double, Double> get() =
             Stats.wilsonInterval(truePositives, totalCheat)
     }
@@ -439,6 +470,76 @@ class NeuralNetwork(
             }
             ThresholdMetrics(threshold, tp, fp, tn, fn, totalLegit, totalCheat)
         }
+    }
+
+    private class IndexSplit(
+        val train: List<Int>,
+        val validation: List<Int>,
+        val test: List<Int>,
+        val summary: SplitSummary
+    )
+
+    /**
+     * Делит индексы на train/val/test (60/20/20) отдельно по каждому классу.
+     *
+     * Если у класса ≥ [MIN_GROUPS_PER_CLASS] разных групп, делит ЦЕЛЫМИ ГРУППАМИ:
+     * группы перемешиваются и раздаются в test, затем в val, остальные идут в train
+     * (в каждый сет попадает хотя бы одна группа). Строки без группы (старый формат
+     * датасета) считаются отдельными группами по одному окну.
+     *
+     * Если групп меньше — запасной вариант: случайное разбиение окон, как раньше.
+     * Это зафиксировано в [SplitSummary], чтобы админ видел, что метрики оптимистичны.
+     * Размеры сетов при разбиении по группам приблизительные: они зависят от размеров групп.
+     */
+    private fun splitIndices(labels: List<Double>, groups: List<String?>?, rng: Random): IndexSplit {
+        val train = ArrayList<Int>()
+        val validation = ArrayList<Int>()
+        val test = ArrayList<Int>()
+        val grouped = BooleanArray(2)
+        val groupCounts = IntArray(2)
+
+        for ((c, label) in listOf(0.0, 1.0).withIndex()) {
+            val classIdx = labels.indices.filter { labels[it] == label }
+            val byGroup = LinkedHashMap<String, MutableList<Int>>()
+            for (i in classIdx) {
+                val g = groups?.get(i) ?: continue
+                byGroup.getOrPut(g) { ArrayList() }.add(i)
+            }
+            groupCounts[c] = byGroup.size
+
+            val testTarget = max(1, (classIdx.size * TEST_FRACTION).toInt())
+            val valTarget = max(1, (classIdx.size * VAL_FRACTION).toInt())
+
+            if (byGroup.size >= MIN_GROUPS_PER_CLASS) {
+                grouped[c] = true
+                val units = ArrayList<List<Int>>(byGroup.values)
+                for (i in classIdx) if (groups?.get(i) == null) units.add(listOf(i)) // без группы — по одному окну
+                units.shuffle(rng)
+
+                val classTest = ArrayList<Int>()
+                val classVal = ArrayList<Int>()
+                var next = 0
+                // test: минимум одна группа; берём ещё, пока не набрали цель и остаются ≥ 2 группы (val + train)
+                do { classTest.addAll(units[next]); next++ } while (classTest.size < testTarget && units.size - next > 2)
+                // val: минимум одна группа; в train остаётся ≥ 1 группа
+                do { classVal.addAll(units[next]); next++ } while (classVal.size < valTarget && units.size - next > 1)
+                test.addAll(classTest)
+                validation.addAll(classVal)
+                for (j in next until units.size) train.addAll(units[j])
+            } else {
+                val shuffled = classIdx.shuffled(rng)
+                test.addAll(shuffled.take(testTarget))
+                validation.addAll(shuffled.drop(testTarget).take(valTarget))
+                train.addAll(shuffled.drop(testTarget + valTarget))
+            }
+        }
+
+        val summary = SplitSummary(
+            legitGrouped = grouped[0], cheatGrouped = grouped[1],
+            legitGroups = groupCounts[0], cheatGroups = groupCounts[1],
+            trainSize = train.size, valSize = validation.size, testSize = test.size
+        )
+        return IndexSplit(train, validation, test, summary)
     }
 
     /** He-инициализация (2015) — оптимальна для ReLU; bias нулями. */
