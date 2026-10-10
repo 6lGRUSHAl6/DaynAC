@@ -1,29 +1,37 @@
 name: Release
 
+# Каждый push в main собирает jar и публикует новый релиз:
+#   версия = <version из gradle.properties>.<номер сборки>, например 0.1.1.1, 0.1.1.2 ...
+# Для «большого» обновления поменяй version в gradle.properties (0.1.1 -> 0.1.2 или 0.2.0):
+# нумерация сборок для нового префикса начнётся с 1.
+# Чтобы запушить без релиза, начни сообщение коммита с [skip release]
+# (только в самом начале: упоминание в тексте коммита релиз не отключает).
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # нужно для создания релиза и тега
 
+# Один релиз за раз, иначе два параллельных push получили бы один и тот же номер
 concurrency:
   group: release
   cancel-in-progress: false
 
 env:
-  JAR_NAME: DaynAC
+  JAR_NAME: DaynAC   # имя файла: DaynAC-<версия>.jar
 
 jobs:
   release:
-    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
+    if: ${{ !startsWith(github.event.head_commit.message, '[skip release]') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # нужны все теги, чтобы посчитать следующий номер сборки
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
@@ -31,6 +39,7 @@ jobs:
           distribution: temurin
           java-version: 21
 
+      # В репозитории нет gradlew, поэтому берём ту же версию Gradle, что указана в gradle-wrapper.properties
       - name: Read Gradle version
         id: gradle
         run: |
@@ -49,6 +58,7 @@ jobs:
           last=$(git tag -l "v${base}.*" | sed "s/^v${base}\.//" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
           build=$(( ${last:-0} + 1 ))
           echo "version=${base}.${build}" >> "$GITHUB_OUTPUT"
+          echo "Версия релиза: ${base}.${build}"
 
       - name: Build
         run: gradle build -Pversion=${{ steps.version.outputs.version }}
