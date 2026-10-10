@@ -398,6 +398,12 @@ class NeuralNetwork(
         val falseNegativeRate: Double get() =
             if (totalCheat == 0) 0.0
             else falseNegatives.toDouble() / totalCheat
+
+        val falsePositiveRateInterval: Pair<Double, Double> get() =
+            Stats.wilsonInterval(falsePositives, totalLegit)
+
+        val recallInterval: Pair<Double, Double> get() =
+            Stats.wilsonInterval(truePositives, totalCheat)
     }
 
     /**

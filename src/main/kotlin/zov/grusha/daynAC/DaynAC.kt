@@ -393,28 +393,52 @@ class DaynAC : JavaPlugin(), Listener {
 
                     val first = metrics.first()
                     sender.sendMessage("§7[DaynAC] Оценка модели на test-сете (§f${first.totalLegit} §7legit / §f${first.totalCheat} §7cheat§7, в обучении не участвовал)")
-                    sender.sendMessage("§7Порог  Precision  Recall   F1     FPR     FNR")
+                    sender.sendMessage("§7Порог  Precision  Recall   F1     FPR  [95% ДИ]")
 
                     metrics.forEach { m ->
                         val marker = if (kotlin.math.abs(m.threshold - detectionEngine.reduceThreshold) < 0.001) " §e←reduce" else ""
+                        val (fprLow, fprHigh) = m.falsePositiveRateInterval
                         sender.sendMessage(String.format(
                             Locale.US,
-                            "§f%.2f   %.3f      %.3f    %.3f  §c%.1f%%   §c%.1f%%%s",
+                            "§f%.2f   %.3f      %.3f    %.3f  §c%.1f%% §7[%.1f–%.1f%%]%s",
                             m.threshold, m.precision, m.recall, m.f1,
-                            m.falsePositiveRate * 100, m.falseNegativeRate * 100, marker
+                            m.falsePositiveRate * 100, fprLow * 100, fprHigh * 100, marker
                         ))
                     }
 
-                    val recommended = metrics.filter { it.falsePositiveRate <= 0.01 }
+                    // Рекомендуем порог, только если FPR ≤ 1% подтверждён статистически —
+                    // верхняя граница 95% ДИ, а не точечная оценка. Иначе на малом test-сете
+                    // «0 ошибок из 50» выглядело бы как доказанный FPR 0%.
+                    val targetFpr = 0.01
+                    val recommended = metrics
+                        .filter { it.falsePositiveRateInterval.second <= targetFpr }
                         .maxByOrNull { it.recall }
                     if (recommended != null) {
+                        val (recallLow, recallHigh) = recommended.recallInterval
                         sender.sendMessage(String.format(
                             Locale.US,
-                            "§aРекомендация:§f reduce-threshold = %.2f (FPR=%.1f%%, recall=%.1f%%)",
-                            recommended.threshold, recommended.falsePositiveRate * 100, recommended.recall * 100
+                            "§aРекомендация:§f reduce-threshold = %.2f — FPR %.1f%% (95%% ДИ до %.1f%%), recall %.1f%% [%.1f–%.1f%%]",
+                            recommended.threshold,
+                            recommended.falsePositiveRate * 100, recommended.falsePositiveRateInterval.second * 100,
+                            recommended.recall * 100, recallLow * 100, recallHigh * 100
                         ))
                     } else {
-                        sender.sendMessage("§eНи один порог не даёт FPR ≤ 1%. Модель пока не различает классы — нужно больше данных или пересмотреть признаки.")
+                        val neededLegit = zov.grusha.daynAC.ml.Stats.minSamplesForZeroErrors(targetFpr)
+                        sender.sendMessage(
+                            "§eНи один порог не подтверждает FPR ≤ 1% с 95% уверенностью. " +
+                                    "Legit-окон в test: §f${first.totalLegit}§e; даже при нуле ложных срабатываний нужно ≥ §f${neededLegit}§e."
+                        )
+                        val zeroErrors = metrics.filter { it.falsePositives == 0 }.maxByOrNull { it.recall }
+                        if (zeroErrors != null) {
+                            sender.sendMessage(String.format(
+                                Locale.US,
+                                "§7Без ложных срабатываний: порог %.2f (recall %.1f%%), но реальный FPR может быть до %.1f%% — " +
+                                        "не подтверждено, для автобана нужны новые данные.",
+                                zeroErrors.threshold, zeroErrors.recall * 100, zeroErrors.falsePositiveRateInterval.second * 100
+                            ))
+                        } else {
+                            sender.sendMessage("§eНа каждом пороге есть ложные срабатывания — модель пока плохо различает классы: нужно больше разнообразных данных или пересмотр признаков.")
+                        }
                     }
                 }
                 else -> {
