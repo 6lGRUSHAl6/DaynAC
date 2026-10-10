@@ -60,7 +60,7 @@ class DaynAC : JavaPlugin(), Listener {
 
     /** Сессия записи датасета: метка класса и идентификатор сессии (от `record <ник> legit|cheat` до `off`). */
     private data class RecordingSession(val label: String, val sessionId: String) {
-        /** Сколько векторов (семплов для обучения) записано в этой сессии. */
+        /** Сколько векторов записано в этой сессии. */
         var vectors: Int = 0
     }
 
@@ -179,7 +179,7 @@ class DaynAC : JavaPlugin(), Listener {
                     if (legitCount == 0 || cheatCount == 0) {
                         sender.sendMessage(
                             "Датасет однобок: $legitCount легит / $cheatCount чит. " +
-                                    "Нужны оба класса — соберите и legit, и cheat сэмплы."
+                                    "Нужны оба класса — соберите и legit, и cheat векторы."
                         )
                         return true
                     }
@@ -402,10 +402,10 @@ class DaynAC : JavaPlugin(), Listener {
                             val finished = recordingPlayers.remove(targetPlayer.uniqueId)
                             sender.sendMessage(
                                 "Запись датасета для ${targetPlayer.name} выключена." +
-                                        (if (finished != null) " Записано семплов за сессию: ${finished.vectors}." else "")
+                                        (if (finished != null) " Записано векторов за сессию: ${finished.vectors}." else "")
                             )
                             sendActionBar(targetPlayer, "§7Запись датасета остановлена" +
-                                    (if (finished != null) " §8| §7семплов: §f${finished.vectors}" else ""))
+                                    (if (finished != null) " §8| §7векторов: §f${finished.vectors}" else ""))
                         }
                         else -> {
                             sender.sendMessage("Использование: /daynac record <ник игрока> <legit|cheat|off>")
@@ -560,12 +560,12 @@ class DaynAC : JavaPlugin(), Listener {
                 }
             }
 
-            // Счётчик над хотбаром для записываемого игрока: сколько семплов набито
+            // Счётчик над хотбаром для записываемого игрока: сколько векторов набито
             // в этой сессии и сколько ударов до следующего.
             val untilNext = WINDOW_SIZE - detectionEngine.getHitCount(attacker.uniqueId) % WINDOW_SIZE
             sendActionBar(
                 attacker,
-                "§7Запись §a$label§7: §f${session.vectors} §7семплов §8| §7до следующего: §f$untilNext §7ударов"
+                "§7Запись §a$label§7: §f${session.vectors} §7векторов §8| §7до следующего: §f$untilNext §7ударов"
             )
         }
 
