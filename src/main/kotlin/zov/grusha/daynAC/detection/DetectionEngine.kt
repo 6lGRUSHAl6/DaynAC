@@ -59,6 +59,13 @@ class DetectionEngine(
      */
     val inactivityResetSeconds: Int
 
+    /**
+     * Сколько секунд после сброса по простою помнить подозрительный скор игрока
+     * (0 = не помнить). Пока новое окно ударов не набралось, урон считается по этому
+     * затухающему скору, а не по «чистому листу». Читается из detection.carry-over-seconds.
+     */
+    val carryOverSeconds: Int
+
     /** Автонаказание (кик) включено? false = режим наблюдения: только оповещения и снижение урона. */
     val punishEnabled: Boolean
 
@@ -80,6 +87,7 @@ class DetectionEngine(
         maxRecentPredictions = config.getInt("detection.max-recent-predictions", 10)
         punishConfirmWindows = config.getInt("detection.punish-confirm-windows", 2)
         inactivityResetSeconds = config.getInt("detection.inactivity-reset-seconds", 30)
+        carryOverSeconds = config.getInt("detection.carry-over-seconds", 600)
         punishEnabled = config.getBoolean("detection.punish-enabled", true)
         punishAction = config.getString("detection.punish-action", "kick")?.lowercase() ?: "kick"
         punishReason = config.getString("detection.punish-reason", "KillAura (обнаружено нейросетью DaynAC)")!!
@@ -105,6 +113,7 @@ class DetectionEngine(
         require(cancelThreshold <= punishThreshold) {
             "detection.cancel-threshold ($cancelThreshold) должен быть ≤ punish-threshold ($punishThreshold)"
         }
+        require(carryOverSeconds >= 0) { "detection.carry-over-seconds должен быть ≥ 0 (0 = выключен), получено $carryOverSeconds" }
         require(punishConfirmWindows >= 1) { "detection.punish-confirm-windows должен быть ≥ 1, получено $punishConfirmWindows" }
         require(windowSize >= 1) { "windowSize должен быть ≥ 1, получено $windowSize" }
         require(maxRecentPredictions >= 1) { "detection.max-recent-predictions должен быть ≥ 1, получено $maxRecentPredictions" }
@@ -167,6 +176,18 @@ class DetectionEngine(
 
     private val punishProgress = ConcurrentHashMap<UUID, PunishProgress>()
 
+    /** Скор игрока на момент сброса по простою и время сброса — см. [carryOverSeconds]. */
+    private class CarryOver(val score: Double, val timeMillis: Long)
+
+    private val carryOver = ConcurrentHashMap<UUID, CarryOver>()
+
+    /**
+     * Сколько ударов после контрольной точки независимое окно ещё может «подтвердиться».
+     * Без запаса один вердикт 0.94 ровно в контрольной точке обнулял серию даже у явного
+     * читера, чьи скоры держатся около порога (0.95–1.00).
+     */
+    private val confirmGrace: Int = windowSize / 2
+
     /** Модель обучена и загружена — детекция активна. */
     @Volatile
     var detectionEnabled: Boolean = false
@@ -215,6 +236,20 @@ class DetectionEngine(
      * сторона — движок их не знает.
      */
     fun resetFlags(playerId: UUID) {
+        // Читер не должен получать «чистый лист» после 30 секунд тишины: иначе первые
+        // windowSize ударов каждого нового боя идут без вердикта и без снижения урона.
+        // Запоминаем средний скор перед сбросом; затухает за carryOverSeconds.
+        predictions[playerId]?.let { deque ->
+            val snapshot = synchronized(deque) { deque.toList() }
+            if (snapshot.isNotEmpty()) {
+                val average = snapshot.sumOf { it.probability } / snapshot.size
+                if (carryOverSeconds > 0 && average >= reduceThreshold) {
+                    carryOver[playerId] = CarryOver(average, System.currentTimeMillis())
+                } else {
+                    carryOver.remove(playerId) // последнее окно было чистым — подозрение снято
+                }
+            }
+        }
         predictions.remove(playerId)
         lastHitTimes.remove(playerId)
         punishProgress.remove(playerId) // окно ударов начинается заново — серия подтверждений тоже
@@ -252,6 +287,7 @@ class DetectionEngine(
                     hitCounts.containsKey(uuid) || Bukkit.getPlayer(uuid) != null
         }
         punishProgress.keys.retainAll { uuid -> predictions.containsKey(uuid) }
+        carryOver.entries.removeIf { now - it.value.timeMillis >= carryOverSeconds * 1000L }
     }
 
     /**
@@ -311,7 +347,9 @@ class DetectionEngine(
      *   p ≥ cancelThreshold          → 0.0 (полная отмена)
      */
     fun getDamageMultiplier(attacker: Player): Double {
-        val p = getAveragePrediction(attacker) ?: return 1.0
+        // Активное окно ударов главнее; пока вердиктов нет (новый бой после простоя),
+        // берём затухающий скор с прошлого раза.
+        val p = getAveragePrediction(attacker) ?: carriedScore(attacker.uniqueId) ?: return 1.0
 
         return when {
             p >= cancelThreshold -> 0.0
@@ -321,6 +359,22 @@ class DetectionEngine(
             }
             else -> 1.0
         }
+    }
+
+    /**
+     * Скор с момента сброса по простою, линейно затухающий до 0 за [carryOverSeconds].
+     * null — нечего помнить или всё затухло.
+     */
+    private fun carriedScore(playerId: UUID): Double? {
+        if (carryOverSeconds <= 0) return null
+        val carried = carryOver[playerId] ?: return null
+        val elapsed = System.currentTimeMillis() - carried.timeMillis
+        val lifetime = carryOverSeconds * 1000L
+        if (elapsed >= lifetime) {
+            carryOver.remove(playerId)
+            return null
+        }
+        return carried.score * (1.0 - elapsed.toDouble() / lifetime)
     }
 
     /** Среднее по последним предсказаниям игрока (или null, если их ещё нет). */
@@ -393,7 +447,12 @@ class DetectionEngine(
                 append(String.format(Locale.US, "%.3f", average))
                 append("§7)")
                 if (progress.confirmed > 0) {
-                    append(" §8[окна для наказания: §c${progress.confirmed}§8/$punishConfirmWindows]")
+                    val status = when {
+                        progress.confirmed >= punishConfirmWindows -> "§cнаказание"
+                        progress.verdictsSinceConfirm >= windowSize -> "§7проверка окна сейчас"
+                        else -> "§7следующее окно через ${windowSize - progress.verdictsSinceConfirm} уд."
+                    }
+                    append(" §8[окна для наказания: §c${progress.confirmed}§8/$punishConfirmWindows§8, $status§8]")
                 }
             }
             Bukkit.getOnlinePlayers().filter { it.isOp }.forEach { it.sendMessage(message) }
@@ -418,8 +477,9 @@ class DetectionEngine(
      * предыдущего засчитанного: его окно не имеет общих ударов с предыдущим.
      *
      *  - серии нет: первый вердикт ≥ punishThreshold открывает её (confirmed = 1);
-     *  - серия идёт: считаем вердикты; когда прошло windowSize, проверяем это
-     *    «независимое» окно — ≥ punishThreshold засчитывает его, иначе серия рвётся.
+     *  - серия идёт: считаем вердикты; когда прошло windowSize, окно независимо от
+     *    предыдущего. Первый же вердикт ≥ punishThreshold засчитывает его. Если вердикты
+     *    ниже порога, ждём ещё до [confirmGrace] ударов и только потом рвём серию.
      *    Вердикты между контрольными точками серию не меняют (они перекрываются).
      *
      * Если вердикт не дошёл (ошибка inference, игрок вышел), счётчик отстаёт от числа
@@ -435,11 +495,14 @@ class DetectionEngine(
         } else {
             progress.verdictsSinceConfirm++
             if (progress.verdictsSinceConfirm >= windowSize) {
-                progress.verdictsSinceConfirm = 0
+                // Окно уже независимо от предыдущего засчитанного. Ждём вердикта ≥ порога
+                // до windowSize + confirmGrace ударов; не дождались — окно чистое, серия прервана.
                 if (probability >= punishThreshold) {
                     progress.confirmed++
-                } else {
-                    progress.confirmed = 0 // независимое окно оказалось чистым — серия прервана
+                    progress.verdictsSinceConfirm = 0
+                } else if (progress.verdictsSinceConfirm >= windowSize + confirmGrace) {
+                    progress.confirmed = 0
+                    progress.verdictsSinceConfirm = 0
                 }
             }
         }
@@ -510,6 +573,7 @@ class DetectionEngine(
         hitCounts.remove(player.uniqueId)
         lastHitTimes.remove(player.uniqueId)
         punishProgress.remove(player.uniqueId)
+        carryOver.remove(player.uniqueId)
     }
 
     /**
