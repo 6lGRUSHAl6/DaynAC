@@ -64,19 +64,20 @@ class NeuralNetwork(
     )
 
     /**
-     * Нормализованный validation-сет последнего train() в этом сеансе.
-     * Нужен для /daynac eval — переиспользует ТОТ ЖЕ holdout, на котором
-     * училась модель, чтобы метрики не были смещены новым split'ом.
+     * Нормализованный TEST-сет последнего train() в этом сеансе.
+     * Нужен для /daynac eval. Это отдельный holdout: модель на нём не училась,
+     * и (в отличие от validation-сета) по нему не выбиралась лучшая эпоха
+     * при early stopping, поэтому метрики не завышены подбором под этот сет.
      * Не сохраняется в model.dat: после рестарта сеанса eval недоступен
      * до следующего train().
      */
-    private data class ValidationSet(
+    private data class HoldoutSet(
         val normalizedFeatures: List<DoubleArray>,
         val labels: List<Double>
     )
 
     @Volatile
-    private var lastValidationSet: ValidationSet? = null
+    private var lastTestSet: HoldoutSet? = null
 
     private fun emptyWeights(): Weights = Weights(
         weights = Array(layerSizes.size - 1) { l ->
@@ -107,8 +108,18 @@ class NeuralNetwork(
         private const val MAGIC = 0x44414E41   // "DANA" — маркер файла модели
         private const val FORMAT_VERSION = 2   // v2: + блок метрик обучения в конце файла
 
-        /** Разделение train/validation при обучении. */
+        /**
+         * Разделение при обучении: 60% train / 20% validation / 20% test (по каждому классу).
+         * Validation — только для early stopping, test — только для финальной оценки и /daynac eval.
+         */
         private const val VAL_FRACTION = 0.2
+        private const val TEST_FRACTION = 0.2
+
+        /**
+         * Минимум сэмплов каждого класса: при 5 получается 3 train / 1 val / 1 test.
+         * Меньше — какой-то из сетов остаётся без класса и метрики теряют смысл.
+         */
+        const val MIN_SAMPLES_PER_CLASS = 5
     }
 
     // ------------------------------------------------------------------
@@ -175,7 +186,10 @@ class NeuralNetwork(
         val trainLoss: Double,
         val valLoss: Double,
         val trainAccuracy: Double,
-        val valAccuracy: Double
+        val valAccuracy: Double,
+        /** Метрики на test-сете. null — результат загружен из model.dat (test в файл не пишется). */
+        val testLoss: Double? = null,
+        val testAccuracy: Double? = null
     ) {
         /** Разрыв train/val — грубая метрика переобучения (0.05+ уже подозрительно). */
         val overfitGap: Double get() = trainAccuracy - valAccuracy
@@ -191,8 +205,10 @@ class NeuralNetwork(
         private set
 
     /**
-     * Полный цикл обучения: split 80/20, нормализация по train-части,
-     * SGD по одному сэмплу, early stopping с восстановлением лучших весов.
+     * Полный цикл обучения: стратифицированный split 60/20/20 (train/val/test),
+     * нормализация по train-части, SGD по одному сэмплу, early stopping по val
+     * с восстановлением лучших весов. Test-сет в обучении и выборе эпохи не
+     * участвует — по нему считаются финальные метрики и /daynac eval.
      *
      * @param samples векторы признаков (каждый длиной [inputSize])
      * @param labels  0.0 = легит, 1.0 = чит
@@ -214,12 +230,17 @@ class NeuralNetwork(
         require(samples.size == labels.size) { "samples и labels разной длины" }
         require(samples.size >= 10) { "Датасет слишком мал: ${samples.size} сэмплов (нужно ≥ 10)" }
         require(samples.all { it.size == inputSize }) { "Все сэмплы должны быть длиной $inputSize" }
+        val legitTotal = labels.count { it == 0.0 }
+        val cheatTotal = labels.count { it == 1.0 }
+        require(legitTotal >= MIN_SAMPLES_PER_CLASS && cheatTotal >= MIN_SAMPLES_PER_CLASS) {
+            "Нужно ≥ $MIN_SAMPLES_PER_CLASS сэмплов каждого класса (legit: $legitTotal, cheat: $cheatTotal)"
+        }
 
         mutationLock.withLock {
             // Инвалидируем предыдущий holdout на время обучения: пока идут эпохи,
-            // ни eval, ни /daynac info не должны видеть устаревший val-сет в паре
+            // ни eval, ни /daynac info не должны видеть устаревший test-сет в паре
             // с ещё не обученными весами.
-            lastValidationSet = null
+            lastTestSet = null
 
         // Обучаем ЛОКАЛЬНУЮ копию — боевой снапшот, по которому работает
         // inference, не меняется до конца обучения и публикуется атомарно.
@@ -232,18 +253,22 @@ class NeuralNetwork(
             )
         }
 
-        // 1. Делим 80/20 СТРАТИФИЦИРОВАННО — каждый класс отдельно, чтобы в
-        // val гарантированно попали оба класса. При случайном split мелкого
-        // датасета val мог состоять из одного класса: accuracy 100% на шуме,
-        // early stopping принимает решения на бессмысленной метрике.
+        // 1. Делим 60/20/20 (train/val/test) СТРАТИФИЦИРОВАННО — каждый класс отдельно,
+        // чтобы в val и test гарантированно попали оба класса (см. MIN_SAMPLES_PER_CLASS).
+        // val нужен только early stopping'у, test — только финальной оценке: если
+        // мерить качество на том же сете, по которому выбрана лучшая эпоха, метрики
+        // оптимистично завышены (выбор «подглядел» в этот сет).
         val rng = Random(seed)
         val trainIdx = ArrayList<Int>(samples.size)
         val valIdx = ArrayList<Int>()
+        val testIdx = ArrayList<Int>()
         for (label in listOf(0.0, 1.0)) {
             val classIdx = samples.indices.filter { labels[it] == label }.shuffled(rng)
-            val valCount = max(1, (classIdx.size * VAL_FRACTION).toInt().coerceAtMost(classIdx.size / 2))
-            valIdx.addAll(classIdx.take(valCount))
-            trainIdx.addAll(classIdx.drop(valCount))
+            val testCount = max(1, (classIdx.size * TEST_FRACTION).toInt())
+            val valCount = max(1, (classIdx.size * VAL_FRACTION).toInt())
+            testIdx.addAll(classIdx.take(testCount))
+            valIdx.addAll(classIdx.drop(testCount).take(valCount))
+            trainIdx.addAll(classIdx.drop(testCount + valCount))
         }
 
         // 2. Инициализация весов заново — чистый старт (He init)
@@ -253,8 +278,10 @@ class NeuralNetwork(
         computeNormStats(local, trainIdx.map { samples[it] })
         val trainFeatures = trainIdx.map { normalize(samples[it], local) }
         val valFeatures = valIdx.map { normalize(samples[it], local) }
+        val testFeatures = testIdx.map { normalize(samples[it], local) }
         val trainLabels = trainIdx.map { labels[it] }
         val valLabels = valIdx.map { labels[it] }
+        val testLabels = testIdx.map { labels[it] }
 
         // 4. Цикл обучения
         val valCheckInterval = max(1, min(5, maxEpochs / 50))
@@ -312,12 +339,13 @@ class NeuralNetwork(
         // 6. Финальные метрики
         val finalTrain = evaluateNormalized(local, trainFeatures, trainLabels)
         val finalVal = evaluateNormalized(local, valFeatures, valLabels)
+        val finalTest = evaluateNormalized(local, testFeatures, testLabels)
 
-        // 7. Публикуем валидационный holdout и веса вместе. Порядок важен:
-        // lastValidationSet до snapshot.set, чтобы читатель, увидевший новые
+        // 7. Публикуем test-holdout и веса вместе. Порядок важен:
+        // lastTestSet до snapshot.set, чтобы читатель, увидевший новые
         // веса, гарантированно увидел и новый holdout. Обратный порядок
-        // допустил бы крохотное окно с новым val-сетом и старыми весами.
-            lastValidationSet = ValidationSet(valFeatures, valLabels)
+        // допустил бы крохотное окно с новым test-сетом и старыми весами.
+            lastTestSet = HoldoutSet(testFeatures, testLabels)
             snapshot.set(local)
 
         val result = TrainResult(
@@ -327,7 +355,9 @@ class NeuralNetwork(
             trainLoss = finalTrain.avgLoss,
             valLoss = finalVal.avgLoss,
             trainAccuracy = finalTrain.accuracy,
-            valAccuracy = finalVal.accuracy
+            valAccuracy = finalVal.accuracy,
+            testLoss = finalTest.avgLoss,
+            testAccuracy = finalTest.accuracy
         )
         lastTrainResult = result
         return result
@@ -371,28 +401,29 @@ class NeuralNetwork(
     }
 
     /**
-     * Считает матрицу ошибок на validation-сете последнего train() для каждого
-     * порога из [thresholds]. Forward pass выполняется один раз — вероятности
+     * Считает матрицу ошибок на TEST-сете последнего train() для каждого
+     * порога из [thresholds]. Test-сет не участвовал ни в обучении, ни в выборе
+     * лучшей эпохи. Forward pass выполняется один раз — вероятности
      * не зависят от порога, меняется только решение.
      *
      * @return список метрик (в порядке [thresholds]) или null, если в этом
      *         сеансе ещё не было train() — eval недоступен без holdout'а.
      */
     fun evaluateThresholds(thresholds: DoubleArray): List<ThresholdMetrics>? {
-        val valSet = lastValidationSet ?: return null
+        val testSet = lastTestSet ?: return null
         val state = snapshot.get()
 
         // Один forward pass на весь набор — переиспользуем для всех порогов.
-        val probabilities = valSet.normalizedFeatures.map { forwardOnly(state, it) }
+        val probabilities = testSet.normalizedFeatures.map { forwardOnly(state, it) }
 
-        val totalLegit = valSet.labels.count { it < 0.5 }
-        val totalCheat = valSet.labels.count { it >= 0.5 }
+        val totalLegit = testSet.labels.count { it < 0.5 }
+        val totalCheat = testSet.labels.count { it >= 0.5 }
 
         return thresholds.map { threshold ->
             var tp = 0; var fp = 0; var tn = 0; var fn = 0
             for (i in probabilities.indices) {
                 val predictedCheat = probabilities[i] >= threshold
-                val actualCheat = valSet.labels[i] >= 0.5
+                val actualCheat = testSet.labels[i] >= 0.5
                 when {
                     predictedCheat && actualCheat  -> tp++
                     predictedCheat && !actualCheat -> fp++
@@ -694,7 +725,7 @@ class NeuralNetwork(
 
                 // Публикуем атомарно: либо старая модель, либо полностью загруженная новая.
                 // Под mutationLock — параллельный train не сможет затереть её своим set().
-                lastValidationSet = null
+                lastTestSet = null
                 snapshot.set(loaded)
             }
         }

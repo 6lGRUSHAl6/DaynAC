@@ -162,6 +162,15 @@ class DaynAC : JavaPlugin(), Listener {
                         return true
                     }
 
+                    if (legitCount < NeuralNetwork.MIN_SAMPLES_PER_CLASS || cheatCount < NeuralNetwork.MIN_SAMPLES_PER_CLASS) {
+                        sender.sendMessage(
+                            "Слишком мало данных для разбиения train/val/test: $legitCount легит / $cheatCount чит. " +
+                                    "Нужно ≥ ${NeuralNetwork.MIN_SAMPLES_PER_CLASS} векторов каждого класса " +
+                                    "(желательно сотни)."
+                        )
+                        return true
+                    }
+
                     // Атомарная попытка занять слот обучения — после валидации датасета,
                     // чтобы ранние return выше не оставляли флаг навечно поднятым.
                     if (!training.compareAndSet(false, true)) {
@@ -257,6 +266,9 @@ class DaynAC : JavaPlugin(), Listener {
                                         if (result.earlyStopped) ", early stop)" else ")")
                                 appendLine("§7Train loss/acc: §f${num(result.trainLoss)} / ${pct(result.trainAccuracy)}")
                                 appendLine("§7Val loss/acc:   §f${num(result.valLoss)} / ${pct(result.valAccuracy)}")
+                                result.testLoss?.let { tl ->
+                                    appendLine("§7Test loss/acc:  §f${num(tl)} / ${pct(result.testAccuracy ?: 0.0)}")
+                                }
                                 appendLine(
                                     if (result.overfitGap > 0.05) "§eПереобучение: разрыв train/val ${pct(result.overfitGap)} — соберите больше данных"
                                     else "§aРазрыв train/val: ${pct(result.overfitGap)} — в норме"
@@ -306,6 +318,9 @@ class DaynAC : JavaPlugin(), Listener {
                                         if (trainInfo.earlyStopped) ", early stop)" else ")")
                                 appendLine("[DaynAC] Train loss/acc: ${num(trainInfo.trainLoss)} / ${pct(trainInfo.trainAccuracy)}")
                                 appendLine("[DaynAC] Val loss/acc:   ${num(trainInfo.valLoss)} / ${pct(trainInfo.valAccuracy)}")
+                                trainInfo.testLoss?.let { tl ->
+                                    appendLine("[DaynAC] Test loss/acc:  ${num(tl)} / ${pct(trainInfo.testAccuracy ?: 0.0)}")
+                                }
                                 appendLine("[DaynAC] Разрыв train/val (переобучение): ${pct(trainInfo.overfitGap)}" +
                                         if (trainInfo.overfitGap > 0.05) " §c— выше нормы, соберите больше данных" else "")
                             } else {
@@ -371,12 +386,12 @@ class DaynAC : JavaPlugin(), Listener {
                     val thresholds = doubleArrayOf(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
                     val metrics = neuralNetwork.evaluateThresholds(thresholds)
                     if (metrics == null) {
-                        sender.sendMessage("§c[DaynAC] Validation-сет недоступен. Модель не обучалась в этом сеансе или загружена с диска — запустите /daynac train.")
+                        sender.sendMessage("§c[DaynAC] Test-сет недоступен. Модель не обучалась в этом сеансе или загружена с диска — запустите /daynac train.")
                         return true
                     }
 
                     val first = metrics.first()
-                    sender.sendMessage("§7[DaynAC] Оценка модели на holdout (val: §f${first.totalLegit} §7legit / §f${first.totalCheat} §7cheat)")
+                    sender.sendMessage("§7[DaynAC] Оценка модели на test-сете (§f${first.totalLegit} §7legit / §f${first.totalCheat} §7cheat§7, в обучении не участвовал)")
                     sender.sendMessage("§7Порог  Precision  Recall   F1     FPR     FNR")
 
                     metrics.forEach { m ->
