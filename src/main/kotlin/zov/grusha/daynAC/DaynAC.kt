@@ -42,7 +42,7 @@ class DaynAC : JavaPlugin(), Listener {
 
     private val inputSize = WINDOW_SIZE * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
     private val neuralNetwork = NeuralNetwork(inputSize = inputSize)
-    private val detectionEngine = DetectionEngine(this, neuralNetwork)
+    private val detectionEngine = DetectionEngine(this, neuralNetwork, WINDOW_SIZE)
     private val allInfoGUI = AllInfoGUI(this, detectionEngine, hitTracker)
     private val modelFile = File(dataFolder, "model.dat")
 
@@ -334,7 +334,8 @@ class DaynAC : JavaPlugin(), Listener {
                                 !detectionEngine.punishEnabled -> "§eВЫКЛЮЧЕНО (режим наблюдения)"
                                 detectionEngine.punishAction == "none" -> "§7ничего (только лог)"
                                 else -> "§c${detectionEngine.punishAction}" +
-                                        (if (detectionEngine.punishAction == "ban" && detectionEngine.banWithIp) " + IP" else "")
+                                        (if (detectionEngine.punishAction == "ban" && detectionEngine.banWithIp) " + IP" else "") +
+                                        " §7(подтверждение: ${detectionEngine.punishConfirmWindows} независимых окон подряд)"
                             })
                         }
                     )

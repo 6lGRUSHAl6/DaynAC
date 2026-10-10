@@ -21,12 +21,18 @@ import java.util.concurrent.Executors
  * Защита от ложных срабатываний — двойная:
  *  1. Множитель урона считается по ПРЕДЫДУЩИМ предсказаниям: первый удар всегда
  *     пропускается полностью (нет данных — нет наказания).
- *  2. Автонаказание требует и свежего предсказания ≥ punishThreshold, и среднего
- *     по последним [MAX_RECENT_PREDICTIONS] ударам ≥ punishThreshold.
+ *  2. Автонаказание требует [punishConfirmWindows] НЕЗАВИСИМЫХ окон подряд со
+ *     скором ≥ punishThreshold. Окна считаются на каждый удар и перекрываются
+ *     на windowSize-1 ударов, поэтому «среднее по последним N предсказаниям»
+ *     — это почти один и тот же срез данных, а не N подтверждений. Независимыми
+ *     считаются только окна, между концами которых не меньше windowSize ударов
+ *     (они не имеют общих ударов). См. [updatePunishProgress].
  */
 class DetectionEngine(
     private val plugin: org.bukkit.plugin.java.JavaPlugin,
-    private val network: NeuralNetwork
+    private val network: NeuralNetwork,
+    /** Размер окна ударов (DaynAC.WINDOW_SIZE): через столько ударов окна перестают пересекаться. */
+    private val windowSize: Int
 ) {
 
     /**
@@ -39,6 +45,13 @@ class DetectionEngine(
     val cancelThreshold: Double
     val punishThreshold: Double
     val maxRecentPredictions: Int
+
+    /**
+     * Сколько независимых (непересекающихся) окон подряд должны дать скор ≥ [punishThreshold],
+     * чтобы сработало автонаказание. 1 = достаточно одного окна. Читается из
+     * detection.punish-confirm-windows.
+     */
+    val punishConfirmWindows: Int
 
     /**
      * Простой в секундах, после которого с игрока снимаются флаги и окно ударов
@@ -65,6 +78,7 @@ class DetectionEngine(
         cancelThreshold = config.getDouble("detection.cancel-threshold", 0.90)
         punishThreshold = config.getDouble("detection.punish-threshold", 0.95)
         maxRecentPredictions = config.getInt("detection.max-recent-predictions", 10)
+        punishConfirmWindows = config.getInt("detection.punish-confirm-windows", 2)
         inactivityResetSeconds = config.getInt("detection.inactivity-reset-seconds", 30)
         punishEnabled = config.getBoolean("detection.punish-enabled", true)
         punishAction = config.getString("detection.punish-action", "kick")?.lowercase() ?: "kick"
@@ -91,6 +105,8 @@ class DetectionEngine(
         require(cancelThreshold <= punishThreshold) {
             "detection.cancel-threshold ($cancelThreshold) должен быть ≤ punish-threshold ($punishThreshold)"
         }
+        require(punishConfirmWindows >= 1) { "detection.punish-confirm-windows должен быть ≥ 1, получено $punishConfirmWindows" }
+        require(windowSize >= 1) { "windowSize должен быть ≥ 1, получено $windowSize" }
         require(maxRecentPredictions >= 1) { "detection.max-recent-predictions должен быть ≥ 1, получено $maxRecentPredictions" }
         require(inactivityResetSeconds >= 0) { "detection.inactivity-reset-seconds должен быть ≥ 0 (0 = выключен), получено $inactivityResetSeconds" }
     }
@@ -138,6 +154,18 @@ class DetectionEngine(
      * Заполняется в [recordHit], очищается в [resetFlags] и [punishPlayer].
      */
     private val lastHitTimes = ConcurrentHashMap<UUID, Long>()
+
+    /**
+     * Прогресс подтверждения наказания: сколько независимых окон подряд уже
+     * дали скор ≥ punishThreshold и сколько вердиктов прошло с последнего из них.
+     * Трогается только на главном потоке (handlePrediction).
+     */
+    private class PunishProgress {
+        var confirmed: Int = 0
+        var verdictsSinceConfirm: Int = 0
+    }
+
+    private val punishProgress = ConcurrentHashMap<UUID, PunishProgress>()
 
     /** Модель обучена и загружена — детекция активна. */
     @Volatile
@@ -189,6 +217,7 @@ class DetectionEngine(
     fun resetFlags(playerId: UUID) {
         predictions.remove(playerId)
         lastHitTimes.remove(playerId)
+        punishProgress.remove(playerId) // окно ударов начинается заново — серия подтверждений тоже
     }
 
     /**
@@ -222,6 +251,7 @@ class DetectionEngine(
             scoreHistory.containsKey(uuid) || predictions.containsKey(uuid) ||
                     hitCounts.containsKey(uuid) || Bukkit.getPlayer(uuid) != null
         }
+        punishProgress.keys.retainAll { uuid -> predictions.containsKey(uuid) }
     }
 
     /**
@@ -339,6 +369,7 @@ class DetectionEngine(
      */
     fun handlePrediction(attacker: Player, probability: Double): Boolean {
         val average = getAveragePrediction(attacker) ?: probability
+        val progress = updatePunishProgress(attacker.uniqueId, probability)
 
         // Мгновенное оповещение на каждый необычный удар — без таймеров и кулдаунов:
         // скор этого удара превысил flag-threshold => пишем сразу
@@ -361,14 +392,58 @@ class DetectionEngine(
                 append("§7 (средний: §e")
                 append(String.format(Locale.US, "%.3f", average))
                 append("§7)")
+                if (progress.confirmed > 0) {
+                    append(" §8[окна для наказания: §c${progress.confirmed}§8/$punishConfirmWindows]")
+                }
             }
             Bukkit.getOnlinePlayers().filter { it.isOp }.forEach { it.sendMessage(message) }
             plugin.logger.warning(message.replace("§[0-9a-f]".toRegex(), ""))
         }
 
-        // Автонаказание: отключено конфигом (режим наблюдения) или
-        // мгновенный скор и среднее оба за порогом
-        return punishEnabled && probability >= punishThreshold && average >= punishThreshold
+        // Автонаказание: нужны punishConfirmWindows независимых окон подряд ≥ punishThreshold.
+        // Серия «расходуется» при срабатывании (в том числе в режиме наблюдения и при
+        // punish-action: none) — повторное срабатывание потребует новой полной серии,
+        // а не будет повторяться на каждом ударе.
+        val confirmed = progress.confirmed >= punishConfirmWindows
+        if (confirmed) punishProgress.remove(attacker.uniqueId)
+        return punishEnabled && confirmed
+    }
+
+    /**
+     * Обновляет серию подтверждений для игрока по свежему вердикту.
+     *
+     * Вердикт приходит на КАЖДЫЙ удар, а окно признаков — последние windowSize ударов,
+     * поэтому соседние вердикты почти не независимы. Независимым подтверждением
+     * считаем только вердикт, пришедший ровно через windowSize ударов после
+     * предыдущего засчитанного: его окно не имеет общих ударов с предыдущим.
+     *
+     *  - серии нет: первый вердикт ≥ punishThreshold открывает её (confirmed = 1);
+     *  - серия идёт: считаем вердикты; когда прошло windowSize, проверяем это
+     *    «независимое» окно — ≥ punishThreshold засчитывает его, иначе серия рвётся.
+     *    Вердикты между контрольными точками серию не меняют (они перекрываются).
+     *
+     * Если вердикт не дошёл (ошибка inference, игрок вышел), счётчик отстаёт от числа
+     * ударов, то есть интервал между окнами в ударах только больше — безопасно.
+     */
+    private fun updatePunishProgress(playerId: UUID, probability: Double): PunishProgress {
+        val progress = punishProgress.computeIfAbsent(playerId) { PunishProgress() }
+        if (progress.confirmed == 0) {
+            if (probability >= punishThreshold) {
+                progress.confirmed = 1
+                progress.verdictsSinceConfirm = 0
+            }
+        } else {
+            progress.verdictsSinceConfirm++
+            if (progress.verdictsSinceConfirm >= windowSize) {
+                progress.verdictsSinceConfirm = 0
+                if (probability >= punishThreshold) {
+                    progress.confirmed++
+                } else {
+                    progress.confirmed = 0 // независимое окно оказалось чистым — серия прервана
+                }
+            }
+        }
+        return progress
     }
 
     /** Цвет числа скора в сводке — по тем же диапазонам, что и иконки GUI. */
@@ -434,6 +509,7 @@ class DetectionEngine(
         scoreHistory.remove(player.uniqueId)
         hitCounts.remove(player.uniqueId)
         lastHitTimes.remove(player.uniqueId)
+        punishProgress.remove(player.uniqueId)
     }
 
     /**
