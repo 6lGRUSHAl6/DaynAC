@@ -14,7 +14,7 @@ ___
 ## Как это работает
 
 ```
-удары игрока ──► SnapshotTracker ──► HitData (20 признаков на удар)
+удары игрока ──► SnapshotTracker ──► HitData (21 признаков на удар)
                         │
                         ▼
               FeatureExtractor: окно из 16 ударов

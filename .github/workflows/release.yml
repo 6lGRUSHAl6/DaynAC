@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  JAR_NAME: DaynAC
+
+jobs:
+  release:
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Read Gradle version
+        id: gradle
+        run: |
+          ver=$(sed -n 's#.*gradle-\(.*\)-bin\.zip.*#\1#p' gradle/wrapper/gradle-wrapper.properties)
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.gradle.outputs.version }}
+
+      - name: Compute version
+        id: version
+        run: |
+          base=$(sed -n 's/^version=//p' gradle.properties | tr -d '\r[:space:]')
+          last=$(git tag -l "v${base}.*" | sed "s/^v${base}\.//" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+          build=$(( ${last:-0} + 1 ))
+          echo "version=${base}.${build}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: gradle build -Pversion=${{ steps.version.outputs.version }}
+
+      - name: Prepare jar
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          src="build/libs/${JAR_NAME}-${VERSION}-all.jar"
+          if [ ! -f "$src" ]; then
+            echo "Не найден $src. Содержимое build/libs:"; ls -la build/libs
+            exit 1
+          fi
+          cp "$src" "dist/${JAR_NAME}-${VERSION}.jar"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          short=$(git rev-parse --short=7 "$GITHUB_SHA")
+          {
+            echo "Коммит: [\`$short\`](${{ github.server_url }}/${{ github.repository }}/commit/$GITHUB_SHA)"
+            echo
+            git log -1 --format=%B "$GITHUB_SHA"
+          } > notes.md
+          gh release create "v${VERSION}" "dist/${JAR_NAME}-${VERSION}.jar" \
+            --target "$GITHUB_SHA" \
+            --title "${VERSION}" \
+            --notes-file notes.md
