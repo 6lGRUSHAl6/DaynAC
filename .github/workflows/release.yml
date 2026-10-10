@@ -34,7 +34,7 @@ jobs:
           fetch-depth: 0   # нужны все теги, чтобы посчитать следующий номер сборки
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
@@ -55,8 +55,8 @@ jobs:
         id: version
         run: |
           base=$(sed -n 's/^version=//p' gradle.properties | tr -d '\r[:space:]')
-          last=$(git tag -l "v${base}.*" | sed "s/^v${base}\.//" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
-          build=$(( ${last:-0} + 1 ))
+          last=$(git tag -l "v${base}.*" | sed "s/^v${base}\.//" \vert{} grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+          build=$((${last:-0} + 1 ))
           echo "version=${base}.${build}" >> "$GITHUB_OUTPUT"
           echo "Версия релиза: ${base}.${build}"
 
