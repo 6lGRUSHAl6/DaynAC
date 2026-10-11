@@ -37,6 +37,9 @@ class DatasetManager(
     private companion object {
         /** Колонки метаданных в конце строки векторного CSV (после признаков). */
         val META_COLUMNS = listOf("session_id", "player_hash")
+
+        /** Версия признаков у датасетов, созданных до появления dataset.featver. */
+        const val LEGACY_FEATURE_VERSION = 1
     }
 
     private val legitFile = File(dataFolder, "legit.csv")
@@ -44,6 +47,9 @@ class DatasetManager(
     private val legitVectorFile = File(dataFolder, "legit_vectors.csv")
     private val cheatVectorFile = File(dataFolder, "cheat_vectors.csv")
     private val saltFile = File(dataFolder, "dataset.salt")
+
+    /** Версия определения признаков, на которой записан датасет (см. [FeatureExtractor.FEATURE_VERSION]). */
+    private val featureVersionFile = File(dataFolder, "dataset.featver")
 
     /** Число числовых признаков в одной строке вектора (без метаданных). */
     private val featureCount = windowSize * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
@@ -53,12 +59,49 @@ class DatasetManager(
 
     init {
         if (!dataFolder.exists()) dataFolder.mkdirs()
+        archiveDatasetIfFeatureVersionChanged()
         if (!legitFile.exists()) legitFile.writeText(header() + "\n")
         if (!cheatFile.exists()) cheatFile.writeText(header() + "\n")
         if (!legitVectorFile.exists()) legitVectorFile.writeText(vectorHeader() + "\n") else migrateLegacyVectorFile(legitVectorFile)
         if (!cheatVectorFile.exists()) cheatVectorFile.writeText(vectorHeader() + "\n") else migrateLegacyVectorFile(cheatVectorFile)
         salt = loadOrCreateSalt()
     }
+
+    /**
+     * Датасет хранит уже ВЫЧИСЛЕННЫЕ признаки, а не сырые дельты поворота, поэтому при смене
+     * определения признаков (см. [FeatureExtractor.FEATURE_VERSION]) старые строки пересчитать
+     * нельзя, а смешивать их с новыми — значит учить модель на несопоставимых значениях.
+     *
+     * Если версия в dataset.featver отличается от текущей (нет файла = версия 1, датасет
+     * создан до появления версионирования), файлы с данными переименовываются в
+     * `<имя>.featv<N>.bak` и датасет начинается с чистого листа. Ничего не удаляется.
+     */
+    private fun archiveDatasetIfFeatureVersionChanged() {
+        val current = FeatureExtractor.FEATURE_VERSION
+        val stored = featureVersionFile.takeIf { it.exists() }
+            ?.readText()?.trim()?.toIntOrNull()
+            ?: LEGACY_FEATURE_VERSION
+
+        if (stored != current) {
+            for (file in listOf(legitFile, cheatFile, legitVectorFile, cheatVectorFile)) {
+                if (!file.exists() || !hasDataRows(file)) continue
+                var backup = File(file.parentFile, "${file.name}.featv$stored.bak")
+                if (backup.exists()) backup = File(file.parentFile, "${file.name}.featv$stored.${System.currentTimeMillis()}.bak")
+                Files.move(file.toPath(), backup.toPath())
+                System.err.println(
+                    "[INFO] [${file.name}] версия признаков изменилась ($stored → $current): " +
+                            "старые данные сохранены как ${backup.name}, датасет начат заново."
+                )
+            }
+        }
+        if (stored != current || !featureVersionFile.exists()) {
+            featureVersionFile.writeText(current.toString())
+        }
+    }
+
+    /** Есть ли в CSV хотя бы одна строка кроме заголовка. */
+    private fun hasDataRows(file: File): Boolean =
+        file.useLines { lines -> lines.drop(1).any { it.isNotBlank() } }
 
     private fun vectorHeader(): String =
         FeatureExtractor.csvHeader(windowSize) + "," + META_COLUMNS.joinToString(",")

@@ -10,6 +10,11 @@ import kotlin.math.sqrt
 
 class SnapshotTracker(private val maxSize: Int = 20) {
 
+    private companion object {
+        /** Нечётное число бинов: ноль лежит в центре среднего бина. */
+        const val SIGNED_ENTROPY_BINS = 11
+    }
+
     private data class PlayerHeadState(
         var lastYaw: Float,
         var lastPitch: Float,
@@ -179,16 +184,22 @@ class SnapshotTracker(private val maxSize: Int = 20) {
         return calculateEntropyAbs(history, binCount, maxRange = 10.0) { it.pitchDeltaAbs }
     }
 
-    fun getYawEntropySigned(player: Player, binCount: Int = 10): Double? {
+    /**
+     * Энтропия знакового поворота по yaw. Диапазон бинов [-20°, +20°] — тот же масштаб,
+     * что у [getYawEntropyAbs]. Число бинов нечётное: ноль попадает в центр среднего бина,
+     * а не на границу двух бинов (иначе шум ±0.001° у неподвижного игрока давал бы до 1 бита).
+     */
+    fun getYawEntropySigned(player: Player, binCount: Int = SIGNED_ENTROPY_BINS): Double? {
         val history = historySnapshot[player.uniqueId] ?: return null
         if (history.size < 2) return null
-        return calculateEntropySigned(history, binCount) { it.yawDeltaSigned }
+        return calculateEntropySigned(history, binCount, maxRange = 20.0) { it.yawDeltaSigned }
     }
 
-    fun getPitchEntropySigned(player: Player, binCount: Int = 10): Double? {
+    /** То же для pitch: диапазон [-10°, +10°], как у [getPitchEntropyAbs]. */
+    fun getPitchEntropySigned(player: Player, binCount: Int = SIGNED_ENTROPY_BINS): Double? {
         val history = historySnapshot[player.uniqueId] ?: return null
         if (history.size < 2) return null
-        return calculateEntropySigned(history, binCount) { it.pitchDeltaSigned }
+        return calculateEntropySigned(history, binCount, maxRange = 10.0) { it.pitchDeltaSigned }
     }
 
     private inline fun calculateEntropyAbs(
@@ -212,23 +223,32 @@ class SnapshotTracker(private val maxSize: Int = 20) {
         return entropyFromBins(bins, total)
     }
 
+    /**
+     * Энтропия Шеннона распределения знаковых дельт поворота по [binCount] бинам
+     * в диапазоне [-maxRange, +maxRange]. Значения за границами диапазона попадают
+     * в крайние бины (резкие рывки аимбота кучкуются там — энтропия падает).
+     *
+     * Раньше диапазон был фиксированным ±180° при 10 бинах: почти все реальные
+     * дельты (|d| < 18°) падали в два средних бина, и признак вырождался в «знак поворота».
+     */
     private inline fun calculateEntropySigned(
         history: ArrayDeque<PlayerSnapshot>,
         binCount: Int,
+        maxRange: Double,
         selector: (PlayerSnapshot) -> Float
     ): Double {
-        if (binCount <= 0) return 0.0
+        if (binCount <= 0 || maxRange <= 0.0) return 0.0
         val bins = IntArray(binCount)
-        val binWidth = 360.0 / binCount
+        val binWidth = 2.0 * maxRange / binCount
         var total = 0
 
         for (snapshot in history) {
             val value = selector(snapshot).toDouble()
-            val shifted = value + 180.0
             val binIndex = if (value.isNaN()) {
-                0
+                binCount / 2 // NaN трактуем как 0 — как в calculateEntropyAbs
             } else {
-                (shifted / binWidth).toInt().coerceIn(0, binCount - 1)
+                ((value.coerceIn(-maxRange, maxRange) + maxRange) / binWidth)
+                    .toInt().coerceIn(0, binCount - 1)
             }
             bins[binIndex]++
             total++

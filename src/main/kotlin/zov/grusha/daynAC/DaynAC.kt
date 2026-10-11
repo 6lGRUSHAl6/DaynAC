@@ -110,7 +110,15 @@ class DaynAC : JavaPlugin(), Listener {
                 logger.warning("Не удалось загрузить модель: ${e.message} — детекция отключена.")
             }
         } else {
-            logger.info("Модель не найдена или несовместима (вход $inputSize) — детекция отключена до /daynac train.")
+            if (modelFile.exists()) {
+                // Модель от другой версии признаков/формата: не удаляем, но убираем с дороги,
+                // чтобы её нельзя было принять за актуальную.
+                val old = File(dataFolder, "model.dat.old")
+                if (!old.exists() && modelFile.renameTo(old)) {
+                    logger.warning("model.dat несовместима с текущей версией признаков (v${FeatureExtractor.FEATURE_VERSION}) — переименована в model.dat.old.")
+                }
+            }
+            logger.info("Модель не найдена или несовместима (вход $inputSize, версия признаков ${FeatureExtractor.FEATURE_VERSION}) — детекция отключена до /daynac train.")
         }
     }
 

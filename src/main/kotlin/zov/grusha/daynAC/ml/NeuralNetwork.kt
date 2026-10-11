@@ -106,7 +106,7 @@ class NeuralNetwork(
         private const val SIGMOID_CLAMP = 500.0
         private const val MIN_STD = 1e-8       // защита от деления на 0 в z-score
         private const val MAGIC = 0x44414E41   // "DANA" — маркер файла модели
-        private const val FORMAT_VERSION = 2   // v2: + блок метрик обучения в конце файла
+        private const val FORMAT_VERSION = 3   // v2: + блок метрик обучения; v3: + версия признаков в заголовке
 
         /**
          * Разделение при обучении: 60% train / 20% validation / 20% test (по каждому классу).
@@ -274,118 +274,118 @@ class NeuralNetwork(
             // с ещё не обученными весами.
             lastTestSet = null
 
-        // Обучаем ЛОКАЛЬНУЮ копию — боевой снапшот, по которому работает
-        // inference, не меняется до конца обучения и публикуется атомарно.
-        val local = snapshot.get().let {
-            Weights(
-                weights = it.weights.map { layer -> layer.map { neuron -> neuron.copyOf() }.toTypedArray() }.toTypedArray(),
-                biases = it.biases.map { it.copyOf() }.toTypedArray(),
-                featureMean = it.featureMean.copyOf(),
-                featureStd = it.featureStd.copyOf()
-            )
-        }
-
-        // 1. Делим 60/20/20 (train/val/test) стратифицированно по классам и, если групп
-        // (сессий/игроков) хватает, ПО ГРУППАМ: окна одного игрока очень похожи, и при
-        // разбиении по окнам модель могла бы «узнавать» человека, а не чит. val нужен только
-        // early stopping'у, test — только финальной оценке. Подробности — в [splitIndices].
-        val rng = Random(seed)
-        val indexSplit = splitIndices(labels, groups, rng)
-        val trainIdx = indexSplit.train
-        val valIdx = indexSplit.validation
-        val testIdx = indexSplit.test
-
-        // 2. Инициализация весов заново — чистый старт (He init)
-        initWeights(local)
-
-        // 3. Нормализационные статистики — ТОЛЬКО по train-части (без утечки данных)
-        computeNormStats(local, trainIdx.map { samples[it] })
-        val trainFeatures = trainIdx.map { normalize(samples[it], local) }
-        val valFeatures = valIdx.map { normalize(samples[it], local) }
-        val testFeatures = testIdx.map { normalize(samples[it], local) }
-        val trainLabels = trainIdx.map { labels[it] }
-        val valLabels = valIdx.map { labels[it] }
-        val testLabels = testIdx.map { labels[it] }
-
-        // 4. Цикл обучения
-        val valCheckInterval = max(1, min(5, maxEpochs / 50))
-        var bestValLoss = Double.POSITIVE_INFINITY
-        var bestEpoch = 0
-        var staleCount = 0
-        var earlyStopped = false
-        var bestWeights = copyWeights(local)
-        var bestBiases = copyBiases(local)
-
-        var epoch = 0
-        val epochOrder = ArrayList<Int>(trainFeatures.size)
-        while (epoch < maxEpochs) {
-            // SGD: перемешиваем порядок сэмплов каждую эпоху
-            epochOrder.clear()
-            for (i in trainFeatures.indices) epochOrder.add(i)
-            epochOrder.shuffle(Random(seed + epoch + 1))
-
-            var epochLoss = 0.0
-            for (i in epochOrder) {
-                val prediction = forwardAndBackprop(local, trainFeatures[i], trainLabels[i], learningRate, l2Lambda)
-                epochLoss += bceLoss(prediction, trainLabels[i])
+            // Обучаем ЛОКАЛЬНУЮ копию — боевой снапшот, по которому работает
+            // inference, не меняется до конца обучения и публикуется атомарно.
+            val local = snapshot.get().let {
+                Weights(
+                    weights = it.weights.map { layer -> layer.map { neuron -> neuron.copyOf() }.toTypedArray() }.toTypedArray(),
+                    biases = it.biases.map { it.copyOf() }.toTypedArray(),
+                    featureMean = it.featureMean.copyOf(),
+                    featureStd = it.featureStd.copyOf()
+                )
             }
-            val trainLoss = epochLoss / trainFeatures.size
 
-            // Проверка валидации каждые valCheckInterval эпох
-            if (epoch % valCheckInterval == 0) {
-                val valResult = evaluateNormalized(local, valFeatures, valLabels)
-                onProgress?.invoke(epoch, trainLoss, valResult.avgLoss, valResult.accuracy)
+            // 1. Делим 60/20/20 (train/val/test) стратифицированно по классам и, если групп
+            // (сессий/игроков) хватает, ПО ГРУППАМ: окна одного игрока очень похожи, и при
+            // разбиении по окнам модель могла бы «узнавать» человека, а не чит. val нужен только
+            // early stopping'у, test — только финальной оценке. Подробности — в [splitIndices].
+            val rng = Random(seed)
+            val indexSplit = splitIndices(labels, groups, rng)
+            val trainIdx = indexSplit.train
+            val valIdx = indexSplit.validation
+            val testIdx = indexSplit.test
 
-                if (valResult.avgLoss < bestValLoss) {
-                    bestValLoss = valResult.avgLoss
-                    bestEpoch = epoch
-                    staleCount = 0
-                    bestWeights = copyWeights(local)
-                    bestBiases = copyBiases(local)
-                } else {
-                    staleCount++
-                    if (patience > 0 && staleCount >= patience) {
-                        earlyStopped = true
-                        break
-                    }
+            // 2. Инициализация весов заново — чистый старт (He init)
+            initWeights(local)
+
+            // 3. Нормализационные статистики — ТОЛЬКО по train-части (без утечки данных)
+            computeNormStats(local, trainIdx.map { samples[it] })
+            val trainFeatures = trainIdx.map { normalize(samples[it], local) }
+            val valFeatures = valIdx.map { normalize(samples[it], local) }
+            val testFeatures = testIdx.map { normalize(samples[it], local) }
+            val trainLabels = trainIdx.map { labels[it] }
+            val valLabels = valIdx.map { labels[it] }
+            val testLabels = testIdx.map { labels[it] }
+
+            // 4. Цикл обучения
+            val valCheckInterval = max(1, min(5, maxEpochs / 50))
+            var bestValLoss = Double.POSITIVE_INFINITY
+            var bestEpoch = 0
+            var staleCount = 0
+            var earlyStopped = false
+            var bestWeights = copyWeights(local)
+            var bestBiases = copyBiases(local)
+
+            var epoch = 0
+            val epochOrder = ArrayList<Int>(trainFeatures.size)
+            while (epoch < maxEpochs) {
+                // SGD: перемешиваем порядок сэмплов каждую эпоху
+                epochOrder.clear()
+                for (i in trainFeatures.indices) epochOrder.add(i)
+                epochOrder.shuffle(Random(seed + epoch + 1))
+
+                var epochLoss = 0.0
+                for (i in epochOrder) {
+                    val prediction = forwardAndBackprop(local, trainFeatures[i], trainLabels[i], learningRate, l2Lambda)
+                    epochLoss += bceLoss(prediction, trainLabels[i])
                 }
-            } else {
-                onProgress?.invoke(epoch, trainLoss, null, null)
+                val trainLoss = epochLoss / trainFeatures.size
+
+                // Проверка валидации каждые valCheckInterval эпох
+                if (epoch % valCheckInterval == 0) {
+                    val valResult = evaluateNormalized(local, valFeatures, valLabels)
+                    onProgress?.invoke(epoch, trainLoss, valResult.avgLoss, valResult.accuracy)
+
+                    if (valResult.avgLoss < bestValLoss) {
+                        bestValLoss = valResult.avgLoss
+                        bestEpoch = epoch
+                        staleCount = 0
+                        bestWeights = copyWeights(local)
+                        bestBiases = copyBiases(local)
+                    } else {
+                        staleCount++
+                        if (patience > 0 && staleCount >= patience) {
+                            earlyStopped = true
+                            break
+                        }
+                    }
+                } else {
+                    onProgress?.invoke(epoch, trainLoss, null, null)
+                }
+
+                epoch++
             }
 
-            epoch++
-        }
+            // 5. Восстанавливаем лучшие веса — не последнюю (возможно переобученную) версию
+            local.weights = bestWeights
+            local.biases = bestBiases
 
-        // 5. Восстанавливаем лучшие веса — не последнюю (возможно переобученную) версию
-        local.weights = bestWeights
-        local.biases = bestBiases
+            // 6. Финальные метрики
+            val finalTrain = evaluateNormalized(local, trainFeatures, trainLabels)
+            val finalVal = evaluateNormalized(local, valFeatures, valLabels)
+            val finalTest = evaluateNormalized(local, testFeatures, testLabels)
 
-        // 6. Финальные метрики
-        val finalTrain = evaluateNormalized(local, trainFeatures, trainLabels)
-        val finalVal = evaluateNormalized(local, valFeatures, valLabels)
-        val finalTest = evaluateNormalized(local, testFeatures, testLabels)
-
-        // 7. Публикуем test-holdout и веса вместе. Порядок важен:
-        // lastTestSet до snapshot.set, чтобы читатель, увидевший новые
-        // веса, гарантированно увидел и новый holdout. Обратный порядок
-        // допустил бы крохотное окно с новым test-сетом и старыми весами.
+            // 7. Публикуем test-holdout и веса вместе. Порядок важен:
+            // lastTestSet до snapshot.set, чтобы читатель, увидевший новые
+            // веса, гарантированно увидел и новый holdout. Обратный порядок
+            // допустил бы крохотное окно с новым test-сетом и старыми весами.
             lastTestSet = HoldoutSet(testFeatures, testLabels)
             snapshot.set(local)
 
-        val result = TrainResult(
-            epochsRun = epoch,
-            bestEpoch = bestEpoch,
-            earlyStopped = earlyStopped,
-            trainLoss = finalTrain.avgLoss,
-            valLoss = finalVal.avgLoss,
-            trainAccuracy = finalTrain.accuracy,
-            valAccuracy = finalVal.accuracy,
-            testLoss = finalTest.avgLoss,
-            testAccuracy = finalTest.accuracy,
-            split = indexSplit.summary
-        )
-        lastTrainResult = result
-        return result
+            val result = TrainResult(
+                epochsRun = epoch,
+                bestEpoch = bestEpoch,
+                earlyStopped = earlyStopped,
+                trainLoss = finalTrain.avgLoss,
+                valLoss = finalVal.avgLoss,
+                trainAccuracy = finalTrain.accuracy,
+                valAccuracy = finalVal.accuracy,
+                testLoss = finalTest.avgLoss,
+                testAccuracy = finalTest.accuracy,
+                split = indexSplit.summary
+            )
+            lastTrainResult = result
+            return result
         } // mutationLock.withLock
     }
 
@@ -717,9 +717,10 @@ class NeuralNetwork(
         return try {
             DataInputStream(file.inputStream().buffered()).use { input ->
                 input.readInt() == MAGIC &&
-                    input.readInt() == FORMAT_VERSION &&
-                    input.readInt() == inputSize &&
-                    input.readInt() == layerSizes.size
+                        input.readInt() == FORMAT_VERSION &&
+                        input.readInt() == FeatureExtractor.FEATURE_VERSION &&
+                        input.readInt() == inputSize &&
+                        input.readInt() == layerSizes.size
             }
         } catch (_: Exception) {
             false
@@ -736,6 +737,7 @@ class NeuralNetwork(
             DataOutputStream(tmpFile.outputStream().buffered()).use { output ->
                 output.writeInt(MAGIC)
                 output.writeInt(FORMAT_VERSION)
+                output.writeInt(FeatureExtractor.FEATURE_VERSION)
                 output.writeInt(inputSize)
                 output.writeInt(layerSizes.size)
                 for (size in layerSizes) output.writeInt(size)
@@ -797,6 +799,10 @@ class NeuralNetwork(
             DataInputStream(file.inputStream().buffered()).use { input ->
                 check(input.readInt() == MAGIC) { "Файл модели повреждён (неверный маркер)" }
                 check(input.readInt() == FORMAT_VERSION) { "Неподдерживаемая версия формата модели" }
+                val modelFeatureVersion = input.readInt()
+                check(modelFeatureVersion == FeatureExtractor.FEATURE_VERSION) {
+                    "Модель обучена на версии признаков $modelFeatureVersion, текущая — ${FeatureExtractor.FEATURE_VERSION}. Переобучите: /daynac train"
+                }
                 check(input.readInt() == inputSize) { "Размер входа модели не совпадает с текущим ($inputSize)" }
                 val layerCount = input.readInt()
                 check(layerCount == layerSizes.size) { "Структура слоёв модели не совпадает" }
