@@ -1,4 +1,8 @@
 # DaynAC
+
+### English
+ - [🇬🇧 English version](README.en.md)
+ 
 ___
 > [!CAUTION]
 >
