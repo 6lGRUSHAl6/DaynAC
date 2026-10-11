@@ -55,7 +55,7 @@ jobs:
         id: version
         run: |
           base=$(sed -n 's/^version=//p' gradle.properties | tr -d '\r[:space:]')
-          last=$(git tag -l "v${base}.*" | sed "s/^v${base}\.//" \vert{} grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+          last=$(git tag -l "v${base}.*" | sed "s/^v${base}\.//" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
           build=$((${last:-0} + 1 ))
           echo "version=${base}.${build}" >> "$GITHUB_OUTPUT"
           echo "Версия релиза: ${base}.${build}"
