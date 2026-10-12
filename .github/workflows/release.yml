@@ -60,8 +60,8 @@ jobs:
           echo "version=${base}.${build}" >> "$GITHUB_OUTPUT"
           echo "Версия релиза: ${base}.${build}"
 
-      - name: Build
-        run: gradle build -Pversion=${{ steps.version.outputs.version }}
+      - name: Test and Build
+        run: gradle check build -Pversion=${{ steps.version.outputs.version }}
 
       - name: Prepare jar
         env:
