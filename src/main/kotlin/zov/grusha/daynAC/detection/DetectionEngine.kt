@@ -553,17 +553,30 @@ class DetectionEngine(
             }
             "ban" -> {
                 plugin.logger.warning("[DaynAC] БАН: ${player.name} (средний скор $average, IP-бан: ${if (banWithIp) "да" else "нет"})")
-                if (banWithIp) {
-                    // banPlayerFull = бан профиля + бан по IP адресу (и кик)
-                    player.banPlayerFull(message)
-                } else {
-                    // ban() = бан только по профилю (UUID), без IP; с киком
-                    player.ban(message, null as java.util.Date?, message, true)
+                try {
+                    if (banWithIp) {
+                        // banPlayerFull = бан профиля + бан по IP адресу (и кик)
+                        player.banPlayerFull(message)
+                    } else {
+                        // ban() = бан только по профилю (UUID), без IP; с киком.
+                        // Приведение к Date обязательно: в новых версиях API есть перегрузки
+                        // с Instant/Duration, и голый null стал бы неоднозначным.
+                        player.ban(message, null as java.util.Date?, message, true)
+                    }
+                } catch (e: LinkageError) {
+                    // Метод Bukkit API изменён/удалён в этой версии сервера — бан консольной командой
+                    plugin.logger.warning("[DaynAC] API бана недоступно (${e.javaClass.simpleName}) — использую команду консоли")
+                    runConsoleCommand(if (banWithIp) "ban-ip" else "ban", player.name, punishReason)
                 }
             }
             else -> { // "kick" и любое другое значение, прошедшее require
                 plugin.logger.warning("[DaynAC] Кик: ${player.name} (средний скор $average)")
-                player.kickPlayer(message)
+                try {
+                    player.kickPlayer(message)
+                } catch (e: LinkageError) {
+                    plugin.logger.warning("[DaynAC] API кика недоступно (${e.javaClass.simpleName}) — использую команду консоли")
+                    runConsoleCommand("kick", player.name, punishReason)
+                }
             }
         }
 
@@ -574,6 +587,12 @@ class DetectionEngine(
         lastHitTimes.remove(player.uniqueId)
         punishProgress.remove(player.uniqueId)
         carryOver.remove(player.uniqueId)
+    }
+
+    /** Запасной путь наказания: команда от имени консоли (причина — одной строкой). Только с главного потока. */
+    private fun runConsoleCommand(command: String, target: String, reason: String) {
+        val oneLine = reason.replace('\n', ' ').replace('\r', ' ').trim()
+        Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "$command $target $oneLine")
     }
 
     /**

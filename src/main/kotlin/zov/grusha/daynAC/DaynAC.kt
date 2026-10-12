@@ -17,6 +17,7 @@ import zov.grusha.daynAC.tracking.HitTracker
 import zov.grusha.daynAC.ml.DatasetManager
 import zov.grusha.daynAC.ml.FeatureExtractor
 import zov.grusha.daynAC.ml.NeuralNetwork
+import zov.grusha.daynAC.compat.Compat
 import zov.grusha.daynAC.detection.DetectionEngine
 import zov.grusha.daynAC.gui.AllInfoGUI
 import java.io.File
@@ -237,10 +238,7 @@ class DaynAC : JavaPlugin(), Listener {
                         fun actionBar(text: String) {
                             if (senderPlayer == null || !isEnabled) return
                             Bukkit.getScheduler().runTask(this@DaynAC, Runnable {
-                                senderPlayer.sendActionBar(
-                                    net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer
-                                        .legacySection().deserialize(text)
-                                )
+                                Compat.actionBar(senderPlayer, text)
                             })
                         }
 
@@ -641,10 +639,7 @@ class DaynAC : JavaPlugin(), Listener {
 
     /** Сообщение над хотбаром (legacy-цвета §). Вызывать с главного потока. */
     private fun sendActionBar(player: Player, text: String) {
-        player.sendActionBar(
-            net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer
-                .legacySection().deserialize(text)
-        )
+        Compat.actionBar(player, text)
     }
 
     /** Строка отчёта о том, как датасет был разбит на train/val/test. */

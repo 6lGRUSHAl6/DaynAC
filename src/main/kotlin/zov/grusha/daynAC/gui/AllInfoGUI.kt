@@ -1,7 +1,6 @@
 package zov.grusha.daynAC.gui
 
 import org.bukkit.Bukkit
-import org.bukkit.ChatColor
 import org.bukkit.Material
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
@@ -48,13 +47,19 @@ class AllInfoGUI(
     /** Ключ для хранения UUID подозреваемого в PersistentDataContainer компаса. */
     private val suspectKey = org.bukkit.NamespacedKey(plugin, "suspect")
 
-    private val openGuis = java.util.concurrent.ConcurrentHashMap.newKeySet<UUID>()
+    /**
+     * Админ -> его открытый GUI. Свой инвентарь опознаётся по самому объекту, а не по заголовку:
+     * InventoryView.getTitle() deprecated и от версии к версии API ведёт себя по-разному;
+     * если бы проверка сломалась, клик не отменялся бы и админ мог бы вынуть предметы из меню.
+     */
+    private val openGuis = java.util.concurrent.ConcurrentHashMap<UUID, Inventory>()
 
     /** Собирает и открывает GUI для администратора. */
     fun open(admin: Player) {
         val inventory = Bukkit.createInventory(null, GUI_SIZE, TITLE)
         populate(inventory)
-        openGuis.add(admin.uniqueId)
+        // Регистрируем ДО openInventory: при переоткрытии CloseEvent старого GUI не должен снять новый
+        openGuis[admin.uniqueId] = inventory
         admin.openInventory(inventory)
     }
 
@@ -213,8 +218,8 @@ class AllInfoGUI(
     @EventHandler
     fun onInventoryClick(event: InventoryClickEvent) {
         val player = event.whoClicked as? Player ?: return
-        if (player.uniqueId !in openGuis) return
-        if (event.view.title != TITLE) return
+        val gui = openGuis[player.uniqueId] ?: return
+        if (event.view.topInventory !== gui) return
 
         // Отменяем только взаимодействия с нашим (верхним) инвентарём —
         // иначе админ не может пользоваться собственным инвентарём,
@@ -222,7 +227,7 @@ class AllInfoGUI(
         // MOVE_TO_OTHER_INVENTORY: shift-клик из нижнего инвентаря
         // перекладывает предметы в верхний — тоже блокируем.
         // COLLECT_TO_CURSOR (двойной клик) собирает предметы и из верхнего.
-        val clickTop = event.clickedInventory === event.view.topInventory
+        val clickTop = event.clickedInventory === gui
         if (clickTop ||
             event.action == InventoryAction.MOVE_TO_OTHER_INVENTORY ||
             event.action == InventoryAction.COLLECT_TO_CURSOR
@@ -251,7 +256,8 @@ class AllInfoGUI(
     /** Чистка при закрытии GUI (ESC/кнопка) — иначе UUID зависал в openGuis навсегда. */
     @EventHandler
     fun onClose(event: InventoryCloseEvent) {
-        if (event.view.title == TITLE) {
+        val gui = openGuis[event.player.uniqueId]
+        if (gui != null && gui === event.inventory) {
             openGuis.remove(event.player.uniqueId)
         }
     }

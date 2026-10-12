@@ -49,19 +49,19 @@ predictability of timing and aim), R² of the angle's linear trend
 **Probability-threshold responses** (configurable in `config.yml`):
 
   -----------------------------------------------------------------------
-  Range                               Action
+Range                               Action
   ----------------------------------- -----------------------------------
-  \< flag (0.65)                      full trust
+\< flag (0.65)                      full trust
 
-  ≥ flag (0.65)                       notify admins in chat
+≥ flag (0.65)                       notify admins in chat
 
-  ≥ reduce (0.70)                     gradually reduce damage
+≥ reduce (0.70)                     gradually reduce damage
 
-  ≥ cancel (0.90)                     cancel damage completely
+≥ cancel (0.90)                     cancel damage completely
 
-  ≥ punish (0.95) for                 kick / ban (by UUID; IP ban is
-  `punish-confirm-windows` (2)        optional)
-  consecutive independent windows     
+≥ punish (0.95) for                 kick / ban (by UUID; IP ban is
+`punish-confirm-windows` (2)        optional)
+consecutive independent windows
   -----------------------------------------------------------------------
 
 False-positive safeguards: the damage multiplier is calculated from
@@ -79,9 +79,9 @@ server's main tick is not blocked.
 
 ### Requirements
 
--   **Paper 1.21.11** server (or a newer version of the same major
-    release)
--   Java **21+**
+-   **Paper 1.21.11 or newer** (the same jar; tested on 1.21.11 and 26.1.2)
+-   Java **21+** for 1.21.11 and **25+** for Paper 26.1 and newer (a server
+    requirement; the plugin is built for Java 21 and runs on both)
 
 ### Installing a Prebuilt JAR
 
@@ -106,6 +106,7 @@ To launch a local test server directly from the project:
 
 ``` bash
 ./gradlew runServer      # launches Paper 1.21.11 with the plugin (2 GB RAM)
+./gradlew runServer -PmcVersion=26.1.2   # same, on another Minecraft version
 ```
 
 ------------------------------------------------------------------------

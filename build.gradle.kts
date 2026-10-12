@@ -9,7 +9,24 @@ repositories {
     maven("https://repo.papermc.io/repository/maven-public/")
 }
 
+// Версия Minecraft для `gradle runServer`. На сборку плагина НЕ влияет: плагин всегда собирается
+// против самого старого поддерживаемого API (1.21.11, Java 21), а на более новых серверах
+// (26.1, 26.2, ...) работает тем же jar. Проверка на другой версии:
+//   gradle runServer -PmcVersion=26.1.2
+val testMcVersion = providers.gradleProperty("mcVersion").getOrElse("1.21.11")
+// Paper 26.1+ требует Java 25 на сервере, 1.21.x — Java 21
+val testServerJava = if ((testMcVersion.substringBefore('.').toIntOrNull() ?: 0) >= 26) 25 else 21
+// Launcher считается здесь, на верхнем уровне скрипта: внутри tasks { runServer { ... } }
+// `javaToolchains.launcherFor` не разрешается (Unresolved reference). Это Provider, JDK ищется
+// только при реальном запуске runServer — для обычной сборки JDK 25 не нужна.
+val serverJavaLauncher = extensions.getByType<JavaToolchainService>().launcherFor {
+    languageVersion.set(JavaLanguageVersion.of(testServerJava))
+}
+
 dependencies {
+    // НЕ повышай версию API без необходимости: Paper сохраняет бинарную совместимость «вперёд»,
+    // и jar, собранный против 1.21.11, загружается и на 26.x. Если собрать против 26.x,
+    // плагин перестанет запускаться на 1.21.11.
     compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
     implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
 }
@@ -27,7 +44,8 @@ tasks {
         // Configure the Minecraft version for our task.
         // This is the only required configuration besides applying the plugin.
         // Your plugin's jar (or shadowJar if present) will be used automatically.
-        minecraftVersion("1.21.11")
+        minecraftVersion(testMcVersion)
+        javaLauncher.set(serverJavaLauncher)
         jvmArgs("-Xms2G", "-Xmx2G")
     }
 
