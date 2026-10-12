@@ -550,7 +550,7 @@ class DaynAC : JavaPlugin(), Listener {
 
         recordingPlayers[attacker.uniqueId]?.let { session ->
             val label = session.label
-            datasetManager.writeSample(label, hitData)
+
 
             // Вектор признаков пишем только на каждый WINDOW_SIZE-й удар
             // (stride = windowSize). При записи на каждый удар соседние окна

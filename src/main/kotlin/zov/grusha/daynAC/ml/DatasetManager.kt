@@ -1,6 +1,5 @@
 package zov.grusha.daynAC.ml
 
-import zov.grusha.daynAC.tracking.HitData
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -42,8 +41,6 @@ class DatasetManager(
         const val LEGACY_FEATURE_VERSION = 1
     }
 
-    private val legitFile = File(dataFolder, "legit.csv")
-    private val cheatFile = File(dataFolder, "cheat.csv")
     private val legitVectorFile = File(dataFolder, "legit_vectors.csv")
     private val cheatVectorFile = File(dataFolder, "cheat_vectors.csv")
     private val saltFile = File(dataFolder, "dataset.salt")
@@ -60,8 +57,6 @@ class DatasetManager(
     init {
         if (!dataFolder.exists()) dataFolder.mkdirs()
         archiveDatasetIfFeatureVersionChanged()
-        if (!legitFile.exists()) legitFile.writeText(header() + "\n")
-        if (!cheatFile.exists()) cheatFile.writeText(header() + "\n")
         if (!legitVectorFile.exists()) legitVectorFile.writeText(vectorHeader() + "\n") else migrateLegacyVectorFile(legitVectorFile)
         if (!cheatVectorFile.exists()) cheatVectorFile.writeText(vectorHeader() + "\n") else migrateLegacyVectorFile(cheatVectorFile)
         salt = loadOrCreateSalt()
@@ -83,7 +78,7 @@ class DatasetManager(
             ?: LEGACY_FEATURE_VERSION
 
         if (stored != current) {
-            for (file in listOf(legitFile, cheatFile, legitVectorFile, cheatVectorFile)) {
+            for (file in listOf(legitVectorFile, cheatVectorFile)) {
                 if (!file.exists() || !hasDataRows(file)) continue
                 var backup = File(file.parentFile, "${file.name}.featv$stored.bak")
                 if (backup.exists()) backup = File(file.parentFile, "${file.name}.featv$stored.${System.currentTimeMillis()}.bak")
@@ -105,20 +100,6 @@ class DatasetManager(
 
     private fun vectorHeader(): String =
         FeatureExtractor.csvHeader(windowSize) + "," + META_COLUMNS.joinToString(",")
-
-    private fun header(): String {
-        return listOf(
-            "timestamp", "aimAngle", "distance", "reachDistance", "hitTimeDelta", "hitTimeCV",
-            "yawEntropyAbs", "pitchEntropyAbs", "yawEntropySigned", "pitchEntropySigned",
-            "yawJitterAbs", "pitchJitterAbs", "yawJitterSigned", "pitchJitterSigned",
-            "speedXZ", "rotSmoothYaw", "rotSmoothPitch", "snapFactor",
-            "microAdjustYaw", "microAdjustPitch", "jerkValue", "straightLineRatio"
-        ).joinToString(",")
-    }
-
-    // ------------------------------------------------------------------
-    // Идентификаторы игроков и миграция старого формата
-    // ------------------------------------------------------------------
 
     private fun loadOrCreateSalt(): String {
         if (saltFile.exists()) {
@@ -186,10 +167,6 @@ class DatasetManager(
         )
     }
 
-    // ------------------------------------------------------------------
-    // Парсинг
-    // ------------------------------------------------------------------
-
     /** Результат парсинга отдельной строки CSV. */
     private sealed class ParseResult {
         object Ignored : ParseResult() // Заголовок или пустая строка
@@ -225,45 +202,6 @@ class DatasetManager(
         return ParseResult.Success(vector, sessionId, playerHash)
     }
 
-    // ------------------------------------------------------------------
-    // Запись
-    // ------------------------------------------------------------------
-
-    fun writeSample(label: String, hit: HitData) {
-        val targetFile = when (label) {
-            "legit" -> legitFile
-            "cheat" -> cheatFile
-            else -> return // неизвестная метка — не пишем никуда
-        }
-
-        val row = listOf(
-            hit.timestamp,
-            hit.aimAngle,
-            hit.distance,
-            hit.reachDistance,
-            hit.hitTimeDelta,
-            hit.hitTimeCV,
-            hit.yawEntropyAbs,
-            hit.pitchEntropyAbs,
-            hit.yawEntropySigned,
-            hit.pitchEntropySigned,
-            hit.yawJitterAbs,
-            hit.pitchJitterAbs,
-            hit.yawJitterSigned,
-            hit.pitchJitterSigned,
-            hit.speedXZ,
-            hit.rotSmoothYaw,
-            hit.rotSmoothPitch,
-            hit.snapFactor,
-            hit.microAdjustYaw,
-            hit.microAdjustPitch,
-            hit.jerkValue,
-            hit.straightLineRatio
-        ).joinToString(",") { it?.toString() ?: "" }
-
-        targetFile.appendText(row + "\n")
-    }
-
     /**
      * Пишет вектор признаков окна ударов (windowSize * 21 + 7 значений) и две колонки
      * метаданных: [sessionId] (сессия записи) и [playerHash] (см. [playerHash]).
@@ -283,10 +221,6 @@ class DatasetManager(
         fun clean(id: String) = id.replace(Regex("[,\\r\\n]"), "_")
         targetFile.appendText(vector.toCsvRow() + "," + clean(sessionId) + "," + clean(playerHash) + "\n")
     }
-
-    // ------------------------------------------------------------------
-    // Чтение
-    // ------------------------------------------------------------------
 
     /**
      * Читает все векторные сэмплы (legit_vectors.csv + cheat_vectors.csv) для обучения,
