@@ -24,11 +24,13 @@ val serverJavaLauncher = extensions.getByType<JavaToolchainService>().launcherFo
 }
 
 dependencies {
-    // НЕ повышай версию API без необходимости: Paper сохраняет бинарную совместимость «вперёд»,
-    // и jar, собранный против 1.21.11, загружается и на 26.x. Если собрать против 26.x,
-    // плагин перестанет запускаться на 1.21.11.
     compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
     implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8")
+
+    //тесты
+    testImplementation(kotlin("test-junit5"))
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 kotlin {
@@ -38,6 +40,10 @@ kotlin {
 tasks {
     build {
         dependsOn(shadowJar)
+    }
+
+    test {
+        useJUnitPlatform()
     }
 
     runServer {
