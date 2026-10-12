@@ -1,286 +1,301 @@
 # DaynAC
 
-------------------------------------------------------------------------
+ * [🇷🇺 Русский](README.md)
 
-> \[!CAUTION\]
->
+> [!CAUTION]
 > ## Warning
->
-> The project is currently in early alpha testing.
+> The project is in early alpha.
 
-**A neural-network anti-cheat for Minecraft PvP servers.** Detects
-external aim assistance (AimBot / KillAura) through behavioral hit
-patterns --- without speed-hack checks, packet sniffers, or other
-conventional techniques. The model is trained on datasets that you
-collect yourself on your server.
+**A neural-network anti-cheat for Minecraft PvP servers.** Detects external aim assistance (AimBot / KillAura) through behavioral hit patterns, without speed-hack checks, packet sniffers, or other conventional techniques. The model is trained on datasets that you collect yourself on your server.
 
-The target use case is **1.9+ no-cooldown PvP**, where legitimately high
-CPS is not evidence of cheating: the distinction between legitimate play
-and cheating is based not on click speed, but on aiming geometry and
-timing.
+The target use case is **1.9+ no-cooldown PvP**, where legitimately high CPS is not evidence of cheating: the distinction between legitimate play and cheating is based not on click speed, but on aiming geometry and timing.
 
-------------------------------------------------------------------------
+## Contents
 
-## How It Works
+- [How it works](#how-it-works)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Commands](#commands)
+- [Collecting a dataset](#collecting-a-dataset)
+- [Training and evaluating the model](#training-and-evaluating-the-model)
+- [How decisions are made](#how-decisions-are-made)
+- [Configuration](#configuration)
+- [Plugin files](#plugin-files)
+- [Architecture](#architecture)
+- [Known limitations](#known-limitations)
+- [Development](#development)
 
-    player hits ──► SnapshotTracker ──► HitData (21 features per hit)
-                         │
-                         ▼
-                  FeatureExtractor: window of 16 hits
-                  16×21 + 7 aggregates = 343 features
-                         │
-                         ▼
-                  NeuralNetwork (343 → 128 → 64 → 32 → 1)
-                  pure Kotlin, no ML libraries
-                         │
-                         ▼
-                  cheat probability (0..1) ──► server response
+---
 
-**Features for each hit:** aim angle, distance, interval between hits
-and its variation, rotation entropy (abs/signed, yaw/pitch), jitter, XZ
-velocity, rotation smoothness, snap factor (sudden final adjustment of
-the aim), micro-corrections, jerk, rotation linearity.
+## How it works
 
-**Window aggregates:** mean angle, coefficients of variation,
-angle-distribution entropy, lag-1 autocorrelations (mechanical
-predictability of timing and aim), R² of the angle's linear trend
-(monotonic final adjustment of the aim).
+```
+player hits ──► SnapshotTracker ──► HitData (21 features per hit)
+                       │
+                       ▼
+             FeatureExtractor: window of 16 hits
+             16×21 + 7 aggregates = 343 features
+                       │
+                       ▼
+             NeuralNetwork (343 → 128 → 64 → 32 → 1)
+             pure Kotlin, no ML libraries
+                       │
+                       ▼
+             cheat probability (0..1) ──► server response
+```
 
-**Probability-threshold responses** (configurable in `config.yml`):
+**Features for each hit:** aim angle, distance, interval between hits and its variation, rotation entropy (abs/signed, yaw/pitch), jitter, XZ velocity, rotation smoothness, snap factor (sudden final adjustment of the aim), micro-corrections, jerk, rotation linearity, reach.
 
-  -----------------------------------------------------------------------
-Range                               Action
-  ----------------------------------- -----------------------------------
-\< flag (0.65)                      full trust
+**Window aggregates:** mean angle, coefficients of variation, angle-distribution entropy, lag-1 autocorrelations (mechanical predictability of timing and aim), R² of the angle's linear trend (monotonic final adjustment of the aim).
 
-≥ flag (0.65)                       notify admins in chat
+CPS is deliberately not used as a feature: in no-cooldown PvP, legitimate players click fast and steadily. Mechanical regularity is captured by the autocorrelation of hit intervals, not by their absolute speed.
 
-≥ reduce (0.70)                     gradually reduce damage
+Only `ENTITY_ATTACK` hits between players are recorded. Hits cancelled by other plugins and sword sweep attacks never enter the history.
 
-≥ cancel (0.90)                     cancel damage completely
-
-≥ punish (0.95) for                 kick / ban (by UUID; IP ban is
-`punish-confirm-windows` (2)        optional)
-consecutive independent windows
-  -----------------------------------------------------------------------
-
-False-positive safeguards: the damage multiplier is calculated from
-**previous** predictions (the first hit always deals full damage).
-Automatic punishment requires the threshold to be exceeded in several
-**independent** (non-overlapping) windows in a row --- two by default,
-or approximately 32 hits. Windows are recalculated on every hit and
-overlap by 15 out of 16 hits, so "the average of the last N predictions"
-does not count as confirmation. Inference runs asynchronously --- the
-server's main tick is not blocked.
-
-------------------------------------------------------------------------
+---
 
 ## Installation
 
 ### Requirements
 
--   **Paper 1.21.11 or newer** (the same jar; tested on 1.21.11 and 26.1.2)
--   Java **21+** for 1.21.11 and **25+** for Paper 26.1 and newer (a server
-    requirement; the plugin is built for Java 21 and runs on both)
+- **Paper 1.21.11 or newer** (the same jar; tested on 1.21.11 and up to 26.3)
+- Java **21+** for 1.21.11 and **25+** for Paper 26.1 and newer (a server requirement; the plugin is built for Java 21 and runs on both)
 
-### Installing a Prebuilt JAR
+### Prebuilt JAR
 
-1.  Copy `DaynAC-<version>-all.jar` (the `shadowJar` artifact) into the
-    server's `plugins/` folder.
-2.  Start the server --- the plugin will create `plugins/DaynAC/` with
-    `config.yml`.
-3.  Configure the thresholds for your server (see the table above) and
-    restart.
+1. Download `DaynAC-<version>-all.jar` from [Releases](../../releases) (every push to `main` publishes a new build), or build it yourself (see below).
+2. Copy the jar into the server's `plugins/` folder.
+3. Start the server. The plugin creates `plugins/DaynAC/` with `config.yml`.
+4. Adjust the thresholds for your server and restart.
 
-**Detection is disabled until the model has been trained** --- until you
-collect a dataset and run `/daynac train`, the plugin works only as a
-data collector.
+**Detection stays disabled until a model has been trained.** Until you collect a dataset and run `/daynac train`, the plugin works only as a data collector.
 
-### Building from Source
+### Building from source
 
-``` bash
+```bash
 ./gradlew build          # resulting JAR: build/libs/DaynAC-<version>-all.jar
 ```
 
 To launch a local test server directly from the project:
 
-``` bash
-./gradlew runServer      # launches Paper 1.21.11 with the plugin (2 GB RAM)
-./gradlew runServer -PmcVersion=26.1.2   # same, on another Minecraft version
+```bash
+./gradlew runServer                       # Paper 1.21.11 with the plugin (2 GB RAM)
+./gradlew runServer -PmcVersion=26.1.2    # same, on another Minecraft version
 ```
 
-------------------------------------------------------------------------
+---
 
-## Usage
+## Quick start
 
-All commands require the `daynac.admin` permission (granted to ops by
-default).
+1. Record **several legit sessions** and **several cheat sessions** (see [Collecting a dataset](#collecting-a-dataset)).
+2. Run `/daynac train`.
+3. Run `/daynac eval` and look at the false-positive rate on your data.
+4. Start with alerts only (see the note on damage modification in [Known limitations](#known-limitations)) and watch `/daynac allinfo`.
+5. Enable kick first, and ban only once you trust the model.
 
-### Collecting a Dataset
+---
 
-1.  Ask a trusted player (or connect a second account) to participate in
-    a PvP duel.
+## Commands
 
-2.  Enable recording:
+All commands require the `daynac.admin` permission (granted to ops by default).
 
-        /daynac record <player> legit    # player plays legitimately
-        /daynac record <player> cheat    # player uses cheats
-        /daynac record <player> off      # stop recording
+| Command | What it does |
+|---|---|
+| `/daynac record <player> <legit\|cheat\|off>` | Record dataset samples for a player |
+| `/daynac train` | Train the model on the collected dataset |
+| `/daynac eval` | Test-set metrics across a range of thresholds |
+| `/daynac info` | Dataset, sessions, model state, thresholds |
+| `/daynac ver [player]` | Without a name: plugin status; with a name: the player's scores and hit count |
+| `/daynac allinfo` | Player-monitoring GUI |
+| `/daynac debug` | Toggle per-hit logging to operators |
+| `/daynac reload` | Reload `config.yml` (threshold changes need a restart) |
 
-3.  A feature vector is recorded every 16 hits (non-overlapping windows)
-    in `plugins/DaynAC/legit_vectors.csv` and `cheat_vectors.csv`.
-    Players in recording mode are not checked by detection --- they are
-    exempt while data is being collected.
+---
 
-    Two metadata columns are appended to each vector: `session_id` (one
-    recording session, from `record <player> legit|cheat` until `off`)
-    and `player_hash` (a pseudonym for the player: SHA-256 of the UUID
-    with the salt from `dataset.salt`; the UUID itself is not written to
-    the CSV). These columns are not used for training; they are used to
-    split the dataset. Files in the old format are upgraded
-    automatically, with a `*.bak` backup created first; old rows remain
-    ungrouped. Do not lose or publish `dataset.salt`: without it, hashes
-    for new recordings will not match the old ones.
+## Collecting a dataset
 
-For a high-quality model, you need **both classes**, preferably with
-comparable numbers of examples in each (hundreds of vectors per class).
-A variety of situations (distances, movement, different targets) matters
-more than sheer quantity. Record **several separate sessions** for each
-class (preferably with different players): at least 3 sessions per class
-are needed for a reliable evaluation.
+1. Ask a trusted player (or connect a second account) to take part in a PvP duel.
+2. Enable recording:
 
-### Training
+   ```
+   /daynac record <player> legit    # player plays legitimately
+   /daynac record <player> cheat    # player uses cheats
+   /daynac record <player> off      # stop recording
+   ```
 
-    /daynac train
+3. A feature vector is recorded every 16 hits (non-overlapping windows) in `plugins/DaynAC/legit_vectors.csv` and `cheat_vectors.csv`. Players in recording mode are not checked by detection: they are exempt while data is being collected.
 
--   Splits the dataset 60/20/20 into train/validation/test sets
-    (stratified by class) and normalizes features using the training
-    portion only. If there are ≥ 3 sessions per class, it splits by
-    **whole sessions** (`training.split-by: session`, or `player` to
-    split by player), so windows from the same player do not appear in
-    both training and testing. If there are fewer sessions, the split is
-    random by window, and the plugin warns that the metrics are likely
-    inflated.
--   Trains with early stopping based on validation loss and restores the
-    best weights. The test set is not used for training or epoch
-    selection --- it is used to calculate final metrics and for
-    `/daynac eval`.
--   At least 5 vectors per class are required (in practice, hundreds are
-    recommended).
--   Progress is shown in real time: a live progress bar in the action
-    bar (for the player) and progress updates in chat every 10% of the
-    epochs.
--   On completion: a report with train/validation metrics and the gap
-    (overfitting), the model is saved to `model.dat`, and detection is
-    enabled automatically.
+Two metadata columns are appended to each vector:
 
-The training result indicates dataset quality: a large gap between train
-and validation accuracy means the data is insufficient or too uniform.
+- `session_id`: one recording, from `record <player> legit|cheat` until `off`;
+- `player_hash`: a pseudonym for the player, the SHA-256 of the UUID with the salt from `dataset.salt`. The UUID itself is never written to the CSV.
 
-### Monitoring
+These columns are not used for training; they are used to split the dataset. Files in the old format are upgraded automatically, with a `*.bak` backup created first; old rows remain ungrouped. Do not lose or publish `dataset.salt`: without it, hashes for new recordings will not match the old ones.
 
--   `/daynac ver <player>` --- the player's latest and average score,
-    and hit count.
--   `/daynac allinfo` --- GUI (54-slot chest): all observed players,
-    scores, verdicts, and recent-hit trends. Left-click the compass to
-    teleport into spectator mode. Punished players automatically
-    disappear from the list --- case closed.
--   `/daynac info` --- dataset statistics, model status, and current
-    thresholds.
--   `/daynac eval` --- metrics on the test set across a range of
-    thresholds (precision / recall / F1 / FPR), with a 95% Wilson
-    confidence interval. A threshold is recommended only if the upper
-    bound of FPR is ≤ 1%: even with zero errors, this requires ≥ 381
-    legitimate windows in the test set (approximately 1,900 legitimate
-    vectors in the full dataset).
--   `/daynac debug` --- toggle logging of every hit to operators' chat.
--   `/daynac reload` --- reload `config.yml` (thresholds take effect
-    after a restart).
+**Tips for good data:**
 
-### Example Chat Alert
+- you need **both classes** in comparable numbers (hundreds of vectors per class);
+- variety matters more than quantity: different distances, movement, targets, cheat settings;
+- record **at least 3 separate sessions per class**, preferably with different players; otherwise a proper group-based split is impossible;
+- include "hard" legit players (high DPI, low sensitivity, fast aim): they are where the model most often makes mistakes.
 
-    [DaynAC] Steve: unusual hit 0.871 > threshold 0.65 — recent hits: 0.31 0.44 0.61 0.87 (average: 0.54)
+**Feature versioning.** If you change what any feature means, bump `FeatureExtractor.FEATURE_VERSION`. On startup the plugin compares it with `dataset.featver`: incompatible datasets are renamed to `<name>.featv<N>.bak` (nothing is deleted), and an incompatible model is renamed to `model.dat.old`.
 
-------------------------------------------------------------------------
+---
 
-## Architecture
+## Training and evaluating the model
 
-    src/main/kotlin/zov/grusha/daynAC/
-    ├── DaynAC.kt              # entry point: events, commands, dataset recording
-    ├── tracking/
-    │   ├── CombatMath.kt      # geometry: aim angle, distance
-    │   ├── HitData.kt         # feature snapshot for a single hit
-    │   ├── HitTracker.kt      # sliding window of hit history
-    │   ├── PlayerSnapshot.kt  # rotation/velocity deltas per tick
-    │   └── SnapshotTracker.kt # per-tick player snapshots, rolling metrics
-    ├── ml/
-    │   ├── FeatureExtractor.kt# hit window → 343-feature vector
-    │   ├── DatasetManager.kt  # legitimate/cheat CSV datasets
-    │   └── NeuralNetwork.kt   # MLP + backprop, lock-free inference
-    ├── detection/
-    │   └── DetectionEngine.kt # asynchronous inference, thresholds, punishments
-    └── gui/
-        └── AllInfoGUI.kt      # player monitoring GUI
+```
+/daynac train
+```
 
-Key engineering decisions:
+- Splits the dataset 60/20/20 into train/validation/test (stratified by class) and normalizes features using the training portion only.
+- If there are ≥ 3 groups per class, it splits by **whole groups** (`training.split-by: session` or `player`), so windows from the same player never end up in both training and testing. With fewer groups, the split is random by window, and the plugin warns that the metrics are likely inflated.
+- Trains with early stopping on validation loss and restores the best weights. The test set is not used for training or epoch selection.
+- At least 5 vectors per class are required (in practice, hundreds are recommended).
+- Progress is shown in real time: a live progress bar in the action bar (for the player) and progress updates in chat every 10% of the epochs.
+- On completion: a report with train/validation/test metrics and the train/validation gap (overfitting); the model is saved to `model.dat` and detection is enabled automatically.
 
--   **Dependency-free neural network** --- MLP 343→128→64→32→1
-    implemented in pure Kotlin (BCE + SGD + He initialization + L2 +
-    gradient clipping). No PyTorch runtime is bundled in production, and
-    Python is not required.
--   **Lock-free inference** --- weights live in an immutable snapshot
-    behind an `AtomicReference`: `predict()` does not acquire locks, and
-    retraining on a live server does not block detection even for a
-    second.
--   **Atomic model publishing** --- `train`/`loadFrom` are serialized
-    with a mutex, and the model file is written via tmp+rename so a
-    server crash does not corrupt `model.dat`.
--   **Data-leakage protection** --- non-overlapping windows when
-    recording the dataset, stratified splitting, and normalization using
-    the training portion only.
--   **No telemetry** --- everything stays local: datasets, model, and
-    logs.
+A large gap between train and validation accuracy means the data is insufficient or too uniform.
+
+```
+/daynac eval
+```
+
+Shows precision, recall, F1 and FPR on the test set for a range of thresholds, with 95% Wilson confidence intervals. A threshold is recommended only if the **upper bound** of the FPR is ≤ 1%. Even with zero errors, this requires ≥ 381 legit windows in the test set (roughly 1,900 legit vectors in the whole dataset). Until you have that much data, the plugin will tell you plainly that a low FPR is not statistically confirmed.
+
+> `eval` only works in the same server run in which training happened: the test set is not stored in `model.dat`.
+
+---
+
+## How decisions are made
+
+A cheat probability is computed on **every** hit from the last 16 hits, so neighboring scores are almost identical (windows overlap by 15 of 16 hits).
+
+| What | Rule |
+|---|---|
+| Admin alert | the current hit's score ≥ `flag-threshold` (0.65) |
+| Damage reduction | the average of the last `max-recent-predictions` (10) predictions ≥ `reduce-threshold` (0.70): the multiplier falls smoothly from ≈0.83 to ≈0.67 |
+| Damage cancel | the same average ≥ `cancel-threshold` (0.90) |
+| Kick / ban | score ≥ `punish-threshold` (0.95) in `punish-confirm-windows` (2) **independent** windows in a row |
+
+False-positive safeguards:
+
+- the damage multiplier is calculated from **previous** predictions, so a player with no history always deals full damage on the first hit;
+- a window counts as independent only if it arrives at least 16 hits after the previously counted one (no hits in common). By default, punishment therefore needs roughly 32 consecutive hits at ≥ 0.95. An independent window gets up to 8 extra hits (half a window) to reach the threshold; if it is still below, the streak is broken;
+- after a punishment the streak is consumed: a repeat requires a fresh full streak;
+- inference runs asynchronously, so the server's main tick is never blocked.
+
+**Inactivity reset.** If a player has not hit anyone for longer than `inactivity-reset-seconds`, their flags are cleared: active predictions and the hit window are discarded, and the next 16 hits fill a new window. So that a cheater does not get a clean slate after 30 seconds of silence, the plugin remembers their average score (if it was ≥ `reduce-threshold`) for another `carry-over-seconds`: the score decays linearly to zero, and until a new window is filled, damage is calculated from it.
+
+The log is not cleared by the reset: the player stays in `/daynac allinfo` with "Recent hits" and their all-time maximum, and the card shows progress of the new window (`Hits: n/16`) and the verdict "Flags cleared after inactivity". The reset affects only online players; flags of players who have left are kept until TTL cleanup (1 hour), giving admins time to review them.
+
+### Example chat alert
+
+```
+[DaynAC] Steve: unusual hit 0.871 > threshold 0.65 — recent hits: 0.31 0.44 0.61 0.87 (average: 0.54)
+```
+
+---
 
 ## Configuration
 
 `plugins/DaynAC/config.yml`:
 
-``` yaml
-hit-logging: false          # log every hit
+```yaml
+hit-logging: false           # log every hit
 
 detection:
-  flag-threshold: 0.65      # threshold for admin alerts
-  reduce-threshold: 0.70    # start reducing damage
-  cancel-threshold: 0.90    # cancel damage completely
-  punish-threshold: 0.95    # automatic kick/ban
-  punish-confirm-windows: 2 # number of consecutive independent windows (16 hits each) that must be >= punish-threshold
-  punish-enabled: true      # false = monitoring mode (alerts only)
-  punish-action: kick       # none | kick | ban
-  ban-with-ip: false        # ban: also ban by IP (NAT networks may affect innocent players — UUID-only bans by default)
+  flag-threshold: 0.65       # threshold for admin alerts
+  reduce-threshold: 0.70     # start reducing damage
+  cancel-threshold: 0.90     # cancel damage completely
+  punish-threshold: 0.95     # automatic kick/ban threshold
+  punish-confirm-windows: 2  # consecutive independent windows (16 hits each) that must be >= punish-threshold
+  punish-enabled: true       # false = no kick/ban (alerts and damage reduction keep working)
+  punish-action: kick        # none | kick | ban
+  ban-with-ip: false         # ban: also ban by IP (NAT networks may affect innocent players)
   punish-reason: "KillAura (detected by DaynAC neural network)"
   max-recent-predictions: 10 # averaging window for damage and punishment
-  inactivity-reset-seconds: 30 # inactivity: after this long without hits, flags are cleared and the window starts over (0 = disabled)
+  inactivity-reset-seconds: 30  # after this long without hits, flags are cleared (0 = disabled)
+  carry-over-seconds: 600    # how long to remember the score after an inactivity reset (0 = don't)
+
+training:
+  split-by: session          # session | player: what to split train/val/test by
 ```
 
-Threshold ordering is validated at startup:
-`flag ≤ reduce < cancel ≤ punish`.
+Threshold ordering is validated at startup: `flag ≤ reduce < cancel ≤ punish`. Thresholds are read once when the plugin starts, so after `/daynac reload` a restart is needed for threshold changes to take effect.
 
-The inactivity reset (`inactivity-reset-seconds`) is checked once per
-second: if a player has not hit anyone for longer than the configured
-time, their flags are cleared --- active predictions are cleared, damage
-is restored to full, and the hit window starts over. The next 16 hits
-fill a new window, and only then will a new prediction be produced.
+---
 
-The log is not cleared in the process --- the player remains in
-`/daynac allinfo` with "Recent Hits" and their all-time maximum. The
-card shows progress for the new window (`Hits: n/16`) and the verdict
-"Flags cleared after inactivity".
+## Plugin files
 
-The reset affects only online players --- flags for players who have
-left are retained until TTL cleanup (1 hour), giving admins time to
-review them.
+Everything is stored locally in `plugins/DaynAC/`. There is no telemetry.
 
-------------------------------------------------------------------------
+| File | Purpose |
+|---|---|
+| `config.yml` | settings |
+| `legit_vectors.csv`, `cheat_vectors.csv` | the dataset (vectors + `session_id`, `player_hash`) |
+| `dataset.salt` | salt for `player_hash`; do not lose or publish it |
+| `dataset.featver` | the feature version the dataset was collected with |
+| `model.dat` | the trained model |
+| `*.bak`, `model.dat.old` | backups made on a format or feature-version change |
+
+---
+
+## Architecture
+
+```
+src/main/kotlin/zov/grusha/daynAC/
+├── DaynAC.kt              # entry point: events, commands, dataset recording
+├── compat/
+│   └── Compat.kt          # Paper version compatibility (action bar)
+├── tracking/
+│   ├── CombatMath.kt      # geometry: aim angle, distance, reach
+│   ├── HitData.kt         # feature snapshot for a single hit
+│   ├── HitTracker.kt      # sliding window of hit history
+│   ├── PlayerSnapshot.kt  # rotation/velocity deltas per tick
+│   └── SnapshotTracker.kt # per-tick player snapshots, rolling metrics
+├── ml/
+│   ├── FeatureExtractor.kt# hit window → 343-feature vector
+│   ├── DatasetManager.kt  # CSV datasets, sessions, feature version
+│   ├── NeuralNetwork.kt   # MLP + backprop, lock-free inference
+│   └── Stats.kt           # confidence intervals for /daynac eval
+├── detection/
+│   └── DetectionEngine.kt # asynchronous inference, thresholds, punishments
+└── gui/
+    └── AllInfoGUI.kt      # player monitoring GUI
+```
+
+Key engineering decisions:
+
+- **Dependency-free neural network.** MLP 343→128→64→32→1 in pure Kotlin (BCE + SGD + He initialization + L2 + gradient clipping). Neither PyTorch nor Python is needed.
+- **Lock-free inference.** Weights live in an immutable snapshot behind an `AtomicReference`: `predict()` takes no locks, and retraining on a live server does not block detection.
+- **Atomic model publishing.** `train` and `loadFrom` are serialized with a mutex, and the model file is written via tmp+rename, so a server crash cannot corrupt `model.dat`.
+- **Data-leakage protection.** Non-overlapping windows when recording, session/player-based splitting, class stratification, and normalization from the training portion only.
+- **Feature versioning.** Old datasets and models are never silently mixed with new ones.
+
+---
+
+## Known limitations
+
+- Only **landed** hits are analyzed. Misses and arm swings are not considered.
+- **Ping is not accounted for.** The aim angle is computed against the victim's current server-side position, without latency compensation.
+- No pretrained model is shipped: the model is only as good as your dataset.
+- Output probabilities are not calibrated: 0.70 does not necessarily mean "70% cheater". Rely on `/daynac eval`, not on absolute numbers.
+- `punish-enabled: false` disables only kick/ban. Damage reduction and cancellation stay active; there is no separate switch yet.
+
+---
+
+## Development
+
+```bash
+./gradlew test       # ML module unit tests
+./gradlew build      # tests + shadowJar
+```
+
+Releases are published by GitHub Actions: every push to `main` builds a jar and creates a release versioned `<version from gradle.properties>.<build number>`. To push without a release, start the commit message with `[skip release]`.
+
+---
 
 ## License
 
