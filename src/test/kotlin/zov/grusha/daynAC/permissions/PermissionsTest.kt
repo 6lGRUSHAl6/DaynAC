@@ -21,11 +21,17 @@ class PermissionsTest {
         Permissions.EXEMPT, Permissions.EXEMPT_MANAGE
     )
 
-    /** Права, перечисленные в children у daynac.admin. */
+    /**
+     * Права, перечисленные в children у daynac.admin.
+     *
+     * Регулярка использует [\w.]+ (а не \w+), потому что имя может содержать
+     * вторую точку: daynac.exempt.manage. Без этого тест молча пропустил бы
+     * такое право при проверке «admin покрывает всё».
+     */
     private fun adminChildren(): Set<String> {
         val block = pluginYml.substringAfter("\n  ${Permissions.ADMIN}:")
             .substringBefore("\n  ${Permissions.VIEW}:")
-        return Regex("""^\s+(daynac\.\w+):\s*true""", RegexOption.MULTILINE)
+        return Regex("""^\s+(daynac\.[\w.]+):\s*true""", RegexOption.MULTILINE)
             .findAll(block).map { it.groupValues[1] }.toSet()
     }
 
@@ -37,21 +43,21 @@ class PermissionsTest {
         }
     }
 
+    /**
+     * daynac.admin выдаётся OP-ам по умолчанию и включает все права, КРОМЕ
+     * daynac.exempt: иначе OP не проверялся бы детекцией и на нём нельзя было
+     * бы протестировать поведение фильтра. Временные исключения
+     * (daynac.exempt.manage) в admin входят — это не иммунитет, а управление.
+     */
     @Test
-    fun `admin includes every permission except exempt and exempt manage`() {
-        val expected = allPermissions.toSet() - Permissions.ADMIN -
-                Permissions.EXEMPT - Permissions.EXEMPT_MANAGE
+    fun `admin includes every permission except exempt`() {
+        val expected = allPermissions.toSet() - Permissions.ADMIN - Permissions.EXEMPT
         assertEquals(expected, adminChildren())
     }
 
     @Test
     fun `exempt is never granted by admin`() {
         assertFalse(Permissions.EXEMPT in adminChildren())
-    }
-
-    @Test
-    fun `exempt manage is never granted by admin`() {
-        assertFalse(Permissions.EXEMPT_MANAGE in adminChildren())
     }
 
     @Test

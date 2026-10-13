@@ -12,7 +12,7 @@ commands:
 
 permissions:
   daynac.admin:
-    description: Полный доступ к DaynAC, кроме daynac.exempt
+    description: Полный доступ к DaynAC
     default: op
     children:
       daynac.view: true
@@ -21,6 +21,7 @@ permissions:
       daynac.record: true
       daynac.train: true
       daynac.config: true
+      daynac.exempt.manage: true
   daynac.view:
     description: Просмотр - /daynac ver, info, allinfo
     default: false
@@ -40,7 +41,7 @@ permissions:
     description: /daynac reload и debug (меняет config.yml)
     default: false
   daynac.exempt:
-    description: Иммунитет к детекции (не входит в daynac.admin)
+    description: Иммунитет к детекции
     default: false
   daynac.exempt.manage:
     description: Выдача и снятие временных исключений (/daynac exempt)
