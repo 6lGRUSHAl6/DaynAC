@@ -110,6 +110,8 @@ Each command requires its own permission (see [Permissions](#permissions)); `day
 | `/daynac ver [player]` | Without a name: plugin status; with a name: the player's scores and hit count | `daynac.view` |
 | `/daynac allinfo` | Player-monitoring GUI (teleporting from it needs `daynac.spectate`) | `daynac.view` |
 | `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` | `daynac.config` |
+| `/daynac clearflags <player>` | Manually reset a player's flags and current window | `daynac.config` |
+| `/daynac exempt <player> [time\|off]` | Grant a temporary exemption from detection (`30s`, `5m`, `2h`, `1d`); without time — permanent; `off` — remove | `daynac.exempt.manage` |
 | `/daynac reload` | Reload `config.yml` (threshold changes need a restart) | `daynac.config` |
 
 ---
@@ -125,7 +127,8 @@ Permissions are checked per subcommand, so access can be granted in parts (for e
 | `daynac.spectate` | teleport to a player from `/daynac allinfo` in spectator mode |
 | `daynac.record` | `/daynac record` |
 | `daynac.train` | `/daynac train`, `eval` |
-| `daynac.config` | `/daynac reload`, `debug` |
+| `daynac.config` | `/daynac reload`, `debug`, `clearflags` |
+| `daynac.exempt.manage` | `/daynac exempt` (grant and revoke temporary exemptions) |
 | `daynac.exempt` | permanent exemption from detection; **not** part of `daynac.admin` |
 
 Things to know:
@@ -133,6 +136,8 @@ Things to know:
 - An empty or unknown subcommand requires `daynac.view`, so outsiders cannot list the commands.
 - **Grant `daynac.record` only to the people who collect the dataset.** The `legit`/`cheat` label is set by hand by whoever records: a mistaken or deliberately wrong label will poison the model on the next `/daynac train`. While a player is being recorded, detection does not check them.
 - `daynac.exempt` is deliberately separate from `daynac.admin`: otherwise a stolen admin account would be immune to the anti-cheat, and admins could not test the plugin on themselves. Grant it explicitly, and only to people you trust.
+- `daynac.exempt.manage` is part of `daynac.admin`: an operator can grant temporary exemptions to other players. By itself it does not provide immunity — the exemption must be activated via `/daynac exempt`.
+- Temporary exemptions are stored in `exemptions.yml` and expire automatically; permanent immunity (`daynac.exempt`) does not expire.
 - `daynac.spectate` is re-checked on every click in the GUI, and `daynac.view` while it is open: a revoked permission takes effect immediately.
 
 LuckPerms example:
@@ -224,6 +229,8 @@ False-positive safeguards:
 
 The log is not cleared by the reset: the player stays in `/daynac allinfo` with "Recent hits" and their all-time maximum, and the card shows progress of the new window (`Hits: n/16`) and the verdict "Flags cleared after inactivity". The reset affects only online players; flags of players who have left are kept until TTL cleanup (1 hour), giving admins time to review them.
 
+**Manual reset.** The command `/daynac clearflags <player>` clears flags and resets the window immediately, without waiting for inactivity. Unlike the inactivity reset, the manual reset **does not** preserve the carry-over score: damage goes back to full from the first hit. The log and hit counter are also not cleared.
+
 ### Example chat alert
 
 ```
@@ -272,6 +279,7 @@ Everything is stored locally in `plugins/DaynAC/`. There is no telemetry.
 | `dataset.salt` | salt for `player_hash`; do not lose or publish it |
 | `dataset.featver` | the feature version the dataset was collected with |
 | `model.dat` | the trained model |
+| `exemptions.yml` | temporary exemptions from detection (UUID + expiration time) |
 | `*.bak`, `model.dat.old` | backups made on a format or feature-version change |
 
 ---
@@ -285,6 +293,8 @@ src/main/kotlin/zov/grusha/daynAC/
 │   └── Compat.kt          # Paper version compatibility (action bar)
 ├── permissions/
 │   └── Permissions.kt     # plugin permissions and the subcommand → permission table
+├── exemptions/
+│   └── ExemptionManager.kt# temporary player exemptions from detection
 ├── tracking/
 │   ├── CombatMath.kt      # geometry: aim angle, distance, reach
 │   ├── HitData.kt         # feature snapshot for a single hit
