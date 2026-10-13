@@ -20,6 +20,7 @@ import zov.grusha.daynAC.ml.NeuralNetwork
 import zov.grusha.daynAC.compat.Compat
 import zov.grusha.daynAC.detection.DetectionEngine
 import zov.grusha.daynAC.gui.AllInfoGUI
+import zov.grusha.daynAC.permissions.Permissions
 import java.io.File
 import kotlin.concurrent.thread
 
@@ -130,6 +131,13 @@ class DaynAC : JavaPlugin(), Listener {
 
     override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<out String>): Boolean {
         if (command.name.equals("daynac", ignoreCase = true)) {
+            // Право проверяется по подкомандам. Пустая или неизвестная подкоманда требует
+            // как минимум daynac.view, чтобы посторонние не получали список команд.
+            val required = args.firstOrNull()?.let { Permissions.SUBCOMMANDS[it] } ?: Permissions.VIEW
+            if (!sender.hasPermission(required)) {
+                sender.sendMessage("§c[DaynAC] Недостаточно прав ($required).")
+                return true
+            }
             when {
                 args.isNotEmpty() && args[0] == "ver" -> {
                     if (args.size < 2) {
@@ -504,12 +512,16 @@ class DaynAC : JavaPlugin(), Listener {
         if (command.name.equals("daynac", ignoreCase = true)) {
             when (args.size) {
                 1 -> {
-                    return listOf("ver", "record", "train", "info", "debug", "allinfo", "reload", "eval")
+                    return Permissions.SUBCOMMANDS
+                        .filterValues { sender.hasPermission(it) }
+                        .keys
                         .filter { it.startsWith(args[0], ignoreCase = true) }
                         .toMutableList()
                 }
                 2 -> {
-                    if (args[0].equals("ver", ignoreCase = true) || args[0].equals("record", ignoreCase = true)) {
+                    val sub = args[0].lowercase()
+                    val perm = Permissions.SUBCOMMANDS[sub]
+                    if ((sub == "ver" || sub == "record") && perm != null && sender.hasPermission(perm)) {
                         return Bukkit.getOnlinePlayers()
                             .map { it.name }
                             .filter { it.startsWith(args[1], ignoreCase = true) }
@@ -517,7 +529,7 @@ class DaynAC : JavaPlugin(), Listener {
                     }
                 }
                 3 -> {
-                    if (args[0].equals("record", ignoreCase = true)) {
+                    if (args[0].equals("record", ignoreCase = true) && sender.hasPermission(Permissions.RECORD)) {
                         return listOf("legit", "cheat", "off")
                             .filter { it.startsWith(args[2], ignoreCase = true) }
                             .toMutableList()
@@ -575,9 +587,12 @@ class DaynAC : JavaPlugin(), Listener {
             )
         }
 
-        // Детекция: асинхронный inference. Записывающего игрока не проверяем —
-        // иммунитет на время сбора данных, чтобы не наказывать за те же удары.
-        if (detectionEngine.detectionEnabled && !recordingPlayers.containsKey(attacker.uniqueId)) {
+        // Детекция: асинхронный inference. Не проверяем записывающего игрока (иммунитет на
+        // время сбора данных, чтобы не наказывать за те же удары) и обладателей daynac.exempt.
+        if (detectionEngine.detectionEnabled &&
+            !recordingPlayers.containsKey(attacker.uniqueId) &&
+            !attacker.hasPermission(Permissions.EXEMPT)
+        ) {
             // Множитель по ПРЕДЫДУЩИМ предсказаниям — первый удар всегда полный
             val multiplier = detectionEngine.getDamageMultiplier(attacker)
             if (multiplier <= 0.0) {
@@ -600,7 +615,7 @@ class DaynAC : JavaPlugin(), Listener {
         // Подробное логгирование каждого удара — включается/выключается через /daynac debug
         if (hitLogging) {
             val message = "[LOG] ${attacker.name} hit ${victim.name} (count=$currentHits) $hitData"
-            Bukkit.getOnlinePlayers().filter { it.isOp }.forEach { it.sendMessage(message) }
+            Bukkit.getOnlinePlayers().filter { it.hasPermission(Permissions.ALERTS) }.forEach { it.sendMessage(message) }
             logger.info(message)
         }
     }

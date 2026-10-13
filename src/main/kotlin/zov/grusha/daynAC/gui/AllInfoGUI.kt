@@ -14,6 +14,7 @@ import org.bukkit.inventory.meta.CompassMeta
 import org.bukkit.persistence.PersistentDataType
 import org.bukkit.plugin.Plugin
 import zov.grusha.daynAC.DaynAC
+import zov.grusha.daynAC.permissions.Permissions
 import zov.grusha.daynAC.detection.DetectionEngine
 import zov.grusha.daynAC.tracking.HitTracker
 import java.util.UUID
@@ -228,6 +229,12 @@ class AllInfoGUI(
         // перекладывает предметы в верхний — тоже блокируем.
         // COLLECT_TO_CURSOR (двойной клик) собирает предметы и из верхнего.
         val clickTop = event.clickedInventory === gui
+        if (!player.hasPermission(Permissions.VIEW)) {
+            // Право могли отозвать, пока GUI был открыт: меню закрываем, предметы не отдаём
+            event.isCancelled = true
+            player.closeInventory()
+            return
+        }
         if (clickTop ||
             event.action == InventoryAction.MOVE_TO_OTHER_INVENTORY ||
             event.action == InventoryAction.COLLECT_TO_CURSOR
@@ -239,6 +246,10 @@ class AllInfoGUI(
         if (event.currentItem == null || event.currentItem!!.type != Material.COMPASS) return
         val meta = event.currentItem!!.itemMeta ?: return
         val uuidString = meta.persistentDataContainer.get(suspectKey, PersistentDataType.STRING) ?: return
+        if (!player.hasPermission(Permissions.SPECTATE)) {
+            player.sendMessage("§c[DaynAC] Недостаточно прав (${Permissions.SPECTATE}).")
+            return
+        }
         val target = Bukkit.getPlayer(UUID.fromString(uuidString)) ?: run {
             player.sendMessage("§c[DaynAC] Игрок не в сети — телепорт невозможен.")
             return

@@ -2,6 +2,7 @@ package zov.grusha.daynAC.detection
 
 import org.bukkit.Bukkit
 import org.bukkit.entity.Player
+import zov.grusha.daynAC.permissions.Permissions
 import zov.grusha.daynAC.ml.FeatureExtractor
 import zov.grusha.daynAC.ml.NeuralNetwork
 import java.util.ArrayDeque
@@ -455,7 +456,7 @@ class DetectionEngine(
                     append(" §8[окна для наказания: §c${progress.confirmed}§8/$punishConfirmWindows§8, $status§8]")
                 }
             }
-            Bukkit.getOnlinePlayers().filter { it.isOp }.forEach { it.sendMessage(message) }
+            Bukkit.getOnlinePlayers().filter { it.hasPermission(Permissions.ALERTS) }.forEach { it.sendMessage(message) }
             plugin.logger.warning(message.replace("§[0-9a-f]".toRegex(), ""))
         }
 

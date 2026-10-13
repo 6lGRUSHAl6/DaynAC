@@ -8,11 +8,38 @@ load: POSTWORLD
 commands:
   daynac:
     description: Daynac anticheat command
-    usage: /daynac <ver|record|train|info|debug|allinfo|reload>
-    permission: daynac.admin
-    permission-message: 'У вас нет прав на использование DaynAC.'
+    usage: /daynac <ver|record|train|info|debug|allinfo|eval|reload>
+    # Права проверяются по подкомандам в коде (см. Permissions.kt)
 
 permissions:
   daynac.admin:
-    description: Полный доступ к DaynAC (запись датасета, обучение, детекция)
+    description: Полный доступ к DaynAC, кроме daynac.exempt
     default: op
+    children:
+      daynac.view: true
+      daynac.alerts: true
+      daynac.spectate: true
+      daynac.record: true
+      daynac.train: true
+      daynac.config: true
+  daynac.view:
+    description: Просмотр - /daynac ver, info, allinfo
+    default: false
+  daynac.alerts:
+    description: Получать оповещения о подозрительных ударах и лог ударов
+    default: false
+  daynac.spectate:
+    description: Телепорт к игроку из /daynac allinfo в режиме наблюдателя
+    default: false
+  daynac.record:
+    description: Запись датасета (на время записи игрок не проверяется детекцией)
+    default: false
+  daynac.train:
+    description: Обучение и оценка модели - /daynac train, eval
+    default: false
+  daynac.config:
+    description: /daynac reload и debug (меняет config.yml)
+    default: false
+  daynac.exempt:
+    description: Иммунитет к детекции (не входит в daynac.admin)
+    default: false

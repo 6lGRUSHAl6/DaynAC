@@ -1,6 +1,6 @@
 # DaynAC
 
- * [🇷🇺 Русский](README.md)
+* [🇷🇺 Русский](README.md)
 
 > [!CAUTION]
 > ## Warning
@@ -16,6 +16,7 @@ The target use case is **1.9+ no-cooldown PvP**, where legitimately high CPS is 
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Commands](#commands)
+- [Permissions](#permissions)
 - [Collecting a dataset](#collecting-a-dataset)
 - [Training and evaluating the model](#training-and-evaluating-the-model)
 - [How decisions are made](#how-decisions-are-made)
@@ -67,6 +68,7 @@ Only `ENTITY_ATTACK` hits between players are recorded. Hits cancelled by other 
 2. Copy the jar into the server's `plugins/` folder.
 3. Start the server. The plugin creates `plugins/DaynAC/` with `config.yml`.
 4. Adjust the thresholds for your server and restart.
+5. Grant permissions to your staff (see [Permissions](#permissions)): ops only need `daynac.admin`, everyone else gets what they need from the list.
 
 **Detection stays disabled until a model has been trained.** Until you collect a dataset and run `/daynac train`, the plugin works only as a data collector.
 
@@ -97,18 +99,50 @@ To launch a local test server directly from the project:
 
 ## Commands
 
-All commands require the `daynac.admin` permission (granted to ops by default).
+Each command requires its own permission (see [Permissions](#permissions)); `daynac.admin` (ops by default) has all of them.
 
-| Command | What it does |
+| Command | What it does | Permission |
+|---|---|---|
+| `/daynac record <player> <legit\|cheat\|off>` | Record dataset samples for a player | `daynac.record` |
+| `/daynac train` | Train the model on the collected dataset | `daynac.train` |
+| `/daynac eval` | Test-set metrics across a range of thresholds | `daynac.train` |
+| `/daynac info` | Dataset, sessions, model state, thresholds | `daynac.view` |
+| `/daynac ver [player]` | Without a name: plugin status; with a name: the player's scores and hit count | `daynac.view` |
+| `/daynac allinfo` | Player-monitoring GUI (teleporting from it needs `daynac.spectate`) | `daynac.view` |
+| `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` | `daynac.config` |
+| `/daynac reload` | Reload `config.yml` (threshold changes need a restart) | `daynac.config` |
+
+---
+
+## Permissions
+
+Permissions are checked per subcommand, so access can be granted in parts (for example via LuckPerms). `daynac.admin` (ops by default) includes all permissions below **except** `daynac.exempt`.
+
+| Permission | Grants |
 |---|---|
-| `/daynac record <player> <legit\|cheat\|off>` | Record dataset samples for a player |
-| `/daynac train` | Train the model on the collected dataset |
-| `/daynac eval` | Test-set metrics across a range of thresholds |
-| `/daynac info` | Dataset, sessions, model state, thresholds |
-| `/daynac ver [player]` | Without a name: plugin status; with a name: the player's scores and hit count |
-| `/daynac allinfo` | Player-monitoring GUI |
-| `/daynac debug` | Toggle per-hit logging to operators |
-| `/daynac reload` | Reload `config.yml` (threshold changes need a restart) |
+| `daynac.view` | `/daynac ver`, `info`, `allinfo` (read-only) |
+| `daynac.alerts` | suspicious-hit alerts and the per-hit log (`/daynac debug`) in chat |
+| `daynac.spectate` | teleport to a player from `/daynac allinfo` in spectator mode |
+| `daynac.record` | `/daynac record` |
+| `daynac.train` | `/daynac train`, `eval` |
+| `daynac.config` | `/daynac reload`, `debug` |
+| `daynac.exempt` | permanent exemption from detection; **not** part of `daynac.admin` |
+
+Things to know:
+
+- An empty or unknown subcommand requires `daynac.view`, so outsiders cannot list the commands.
+- **Grant `daynac.record` only to the people who collect the dataset.** The `legit`/`cheat` label is set by hand by whoever records: a mistaken or deliberately wrong label will poison the model on the next `/daynac train`. While a player is being recorded, detection does not check them.
+- `daynac.exempt` is deliberately separate from `daynac.admin`: otherwise a stolen admin account would be immune to the anti-cheat, and admins could not test the plugin on themselves. Grant it explicitly, and only to people you trust.
+- `daynac.spectate` is re-checked on every click in the GUI, and `daynac.view` while it is open: a revoked permission takes effect immediately.
+
+LuckPerms example:
+
+```
+/lp group moderator permission set daynac.view true
+/lp group moderator permission set daynac.alerts true
+/lp group senior-mod permission set daynac.spectate true
+/lp group dataset-team permission set daynac.record true
+```
 
 ---
 
@@ -123,7 +157,7 @@ All commands require the `daynac.admin` permission (granted to ops by default).
    /daynac record <player> off      # stop recording
    ```
 
-3. A feature vector is recorded every 16 hits (non-overlapping windows) in `plugins/DaynAC/legit_vectors.csv` and `cheat_vectors.csv`. Players in recording mode are not checked by detection: they are exempt while data is being collected.
+3. A feature vector is recorded every 16 hits (non-overlapping windows) in `plugins/DaynAC/legit_vectors.csv` and `cheat_vectors.csv`. Players in recording mode are not checked by detection: they are exempt while data is being collected (permanent exemption is granted by `daynac.exempt`).
 
 Two metadata columns are appended to each vector:
 
@@ -174,7 +208,7 @@ A cheat probability is computed on **every** hit from the last 16 hits, so neigh
 
 | What | Rule |
 |---|---|
-| Admin alert | the current hit's score ≥ `flag-threshold` (0.65) |
+| Alert (players with `daynac.alerts`) | the current hit's score ≥ `flag-threshold` (0.65) |
 | Damage reduction | the average of the last `max-recent-predictions` (10) predictions ≥ `reduce-threshold` (0.70): the multiplier falls smoothly from ≈0.83 to ≈0.67 |
 | Damage cancel | the same average ≥ `cancel-threshold` (0.90) |
 | Kick / ban | score ≥ `punish-threshold` (0.95) in `punish-confirm-windows` (2) **independent** windows in a row |
@@ -249,6 +283,8 @@ src/main/kotlin/zov/grusha/daynAC/
 ├── DaynAC.kt              # entry point: events, commands, dataset recording
 ├── compat/
 │   └── Compat.kt          # Paper version compatibility (action bar)
+├── permissions/
+│   └── Permissions.kt     # plugin permissions and the subcommand → permission table
 ├── tracking/
 │   ├── CombatMath.kt      # geometry: aim angle, distance, reach
 │   ├── HitData.kt         # feature snapshot for a single hit
@@ -289,9 +325,11 @@ Key engineering decisions:
 ## Development
 
 ```bash
-./gradlew test       # ML module unit tests
+./gradlew test       # ML module and permissions unit tests
 ./gradlew build      # tests + shadowJar
 ```
+
+`PermissionsTest` checks `Permissions.kt` against `plugin.yml`: when adding a permission, update both files.
 
 Releases are published by GitHub Actions: every push to `main` builds a jar and creates a release versioned `<version from gradle.properties>.<build number>`. To push without a release, start the commit message with `[skip release]`.
 
