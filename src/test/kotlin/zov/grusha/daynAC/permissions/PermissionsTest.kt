@@ -17,7 +17,8 @@ class PermissionsTest {
 
     private val allPermissions = listOf(
         Permissions.ADMIN, Permissions.VIEW, Permissions.ALERTS, Permissions.SPECTATE,
-        Permissions.RECORD, Permissions.TRAIN, Permissions.CONFIG, Permissions.EXEMPT
+        Permissions.RECORD, Permissions.TRAIN, Permissions.CONFIG,
+        Permissions.EXEMPT, Permissions.EXEMPT_MANAGE
     )
 
     /** Права, перечисленные в children у daynac.admin. */
@@ -37,14 +38,20 @@ class PermissionsTest {
     }
 
     @Test
-    fun `admin includes every permission except exempt`() {
-        val expected = allPermissions.toSet() - Permissions.ADMIN - Permissions.EXEMPT
+    fun `admin includes every permission except exempt and exempt manage`() {
+        val expected = allPermissions.toSet() - Permissions.ADMIN -
+                Permissions.EXEMPT - Permissions.EXEMPT_MANAGE
         assertEquals(expected, adminChildren())
     }
 
     @Test
     fun `exempt is never granted by admin`() {
         assertFalse(Permissions.EXEMPT in adminChildren())
+    }
+
+    @Test
+    fun `exempt manage is never granted by admin`() {
+        assertFalse(Permissions.EXEMPT_MANAGE in adminChildren())
     }
 
     @Test
@@ -60,5 +67,11 @@ class PermissionsTest {
         assertEquals(Permissions.TRAIN, Permissions.SUBCOMMANDS["train"])
         assertEquals(Permissions.TRAIN, Permissions.SUBCOMMANDS["eval"])
         assertFalse(Permissions.SUBCOMMANDS["record"] == Permissions.VIEW)
+    }
+
+    @Test
+    fun `clearflags and exempt subcommands are wired to expected permissions`() {
+        assertEquals(Permissions.CONFIG, Permissions.SUBCOMMANDS["clearflags"])
+        assertEquals(Permissions.EXEMPT_MANAGE, Permissions.SUBCOMMANDS["exempt"])
     }
 }

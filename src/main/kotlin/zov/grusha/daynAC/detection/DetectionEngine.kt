@@ -597,6 +597,57 @@ class DetectionEngine(
     }
 
     /**
+     * Снимает с игрока флаги: активные предсказания стираются, поэтому урон
+     * снова проходит целиком, а автонаказание не срабатывает, пока игрок не
+     * наберёт окно ударов заново ([FeatureExtractor.extract] до этого возвращает
+     * null — предсказаний нет).
+     *
+     * @param keepCarryOver поведение при сбросе по простою:
+     *   - true (default, вызов из [DaynAC.resetIfIdle]): если последнее окно было
+     *     подозрительным (средний скор ≥ reduceThreshold), его скор запоминается
+     *     в [carryOver] и линейно затухает за [carryOverSeconds]. Читер не получает
+     *     «чистый лист» после 30 секунд тишины — первый удар нового боя всё ещё
+     *     может пройти со сниженным уроном.
+     *   - false (ручная команда /daynac clearflags): админ явно решил снять
+     *     подозрение, carry-over стирается безусловно — урон снова полный
+     *     с первого удара.
+     *
+     * Журнал ([scoreHistory]) и счётчик ударов ([hitCounts]) СОЗНАТЕЛЬНО остаются:
+     * это витрина админа в /daynac allinfo — игрок не исчезает из списка, а его
+     * «Последние удары» и «Макс» переживают сброс. В карточке такой игрок
+     * показан как «Флаги сняты после простоя».
+     *
+     * Окно ударов (HitTracker) и тайминги (SnapshotTracker) чистит вызывающая
+     * сторона — движок их не знает.
+     */
+    fun resetFlags(playerId: UUID, keepCarryOver: Boolean = true) {
+        if (keepCarryOver) {
+            // Читер не должен получать «чистый лист» после 30 секунд тишины: иначе первые
+            // windowSize ударов каждого нового боя идут без вердикта и без снижения урона.
+            // Запоминаем средний скор перед сбросом; затухает за carryOverSeconds.
+            predictions[playerId]?.let { deque ->
+                val snapshot = synchronized(deque) { deque.toList() }
+                if (snapshot.isNotEmpty()) {
+                    val average = snapshot.sumOf { it.probability } / snapshot.size
+                    if (carryOverSeconds > 0 && average >= reduceThreshold) {
+                        carryOver[playerId] = CarryOver(average, System.currentTimeMillis())
+                    } else {
+                        carryOver.remove(playerId) // последнее окно было чистым — подозрение снято
+                    }
+                }
+            }
+        } else {
+            // Ручной сброс (/daynac clearflags): чистим carry-over безусловно, даже
+            // если активных предсказаний уже нет — запись могла остаться от прошлого
+            // сброса по простою и продолжила бы снижать урон в новом бою.
+            carryOver.remove(playerId)
+        }
+        predictions.remove(playerId)
+        lastHitTimes.remove(playerId)
+        punishProgress.remove(playerId) // окно ударов начинается заново — серия подтверждений тоже
+    }
+
+    /**
      * Выход игрока: предсказания СОХРАНЯЕМ (GUI показывает и оффлайн-игроков,
      * как в daynac.md — статус «● Не в сети»).
      */

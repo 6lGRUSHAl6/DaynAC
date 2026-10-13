@@ -19,9 +19,13 @@ import zov.grusha.daynAC.ml.FeatureExtractor
 import zov.grusha.daynAC.ml.NeuralNetwork
 import zov.grusha.daynAC.compat.Compat
 import zov.grusha.daynAC.detection.DetectionEngine
+import zov.grusha.daynAC.exemptions.ExemptionManager
 import zov.grusha.daynAC.gui.AllInfoGUI
 import zov.grusha.daynAC.permissions.Permissions
 import java.io.File
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import kotlin.concurrent.thread
 
 class DaynAC : JavaPlugin(), Listener {
@@ -33,6 +37,9 @@ class DaynAC : JavaPlugin(), Listener {
          * и заголовок векторных CSV в DatasetManager. Менять только здесь.
          */
         const val WINDOW_SIZE = 16
+
+        /** Формат даты для сообщений о временных исключениях. */
+        private val EXEMPT_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     }
 
     private val hitCounter = mutableMapOf<Pair<UUID, UUID>, Int>()
@@ -41,6 +48,9 @@ class DaynAC : JavaPlugin(), Listener {
     private val featureExtractor = FeatureExtractor(windowSize = WINDOW_SIZE)
 
     private val datasetManager = DatasetManager(dataFolder, windowSize = WINDOW_SIZE)
+
+    /** Временные исключения из детекции (стримеры, тестеры). Не путать с правом daynac.exempt. */
+    private val exemptionManager = ExemptionManager(dataFolder)
 
     private val inputSize = WINDOW_SIZE * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
     private val neuralNetwork = NeuralNetwork(inputSize = inputSize)
@@ -57,7 +67,6 @@ class DaynAC : JavaPlugin(), Listener {
     @Volatile
     private var hitLogging: Boolean = false
 
-    // ИЗМЕНЕНИЕ: Теперь храним статус записи для каждого игрока отдельно (по UUID)
     private val recordingPlayers = mutableMapOf<UUID, RecordingSession>()
 
     /** Сессия записи датасета: метка класса и идентификатор сессии (от `record <ник> legit|cheat` до `off`). */
@@ -68,7 +77,7 @@ class DaynAC : JavaPlugin(), Listener {
 
     /** Идентификатор сессии: время начала + случайный суффикс, например `20261010-174225-3fa9`. */
     private fun newSessionId(): String {
-        val time = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
+        val time = java.time.LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
         val suffix = String.format("%04x", java.util.concurrent.ThreadLocalRandom.current().nextInt(0x10000))
         return "$time-$suffix"
     }
@@ -91,6 +100,12 @@ class DaynAC : JavaPlugin(), Listener {
         Bukkit.getScheduler().runTaskTimer(this, Runnable {
             detectionEngine.pruneStaleTracking()
         }, 15L * 60L * 20L, 15L * 60L * 20L) // 15 минут в тиках
+
+        // Чистка просроченных исключений. Ленивая проверка в isExempt() тоже есть,
+        // но периодическая — чтобы файл exemptions.yml не хранил мёртвые записи.
+        Bukkit.getScheduler().runTaskTimer(this, Runnable {
+            exemptionManager.cleanupExpired()
+        }, 5L * 60L * 20L, 5L * 60L * 20L) // 5 минут
 
         // Сброс после простоя: игрок не бьёт никого дольше
         // detection.inactivity-reset-seconds — флаги снимаются, окно ударов
@@ -351,6 +366,7 @@ class DaynAC : JavaPlugin(), Listener {
                                     "(для разбиения по сессиям нужно ≥ ${NeuralNetwork.MIN_GROUPS_PER_CLASS} на класс)")
                             appendLine("[DaynAC] Модель: " + (if (detectionEngine.detectionEnabled) "активна" else "не обучена") +
                                     ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)")
+                            appendLine("[DaynAC] Временных исключений: ${exemptionManager.size()}")
                             if (trainInfo != null) {
                                 fun num(v: Double) = String.format(Locale.US, "%.4f", v)
                                 fun pct(v: Double) = String.format(Locale.US, "%.1f%%", v * 100)
@@ -494,8 +510,76 @@ class DaynAC : JavaPlugin(), Listener {
                         }
                     }
                 }
+                args.isNotEmpty() && args[0] == "clearflags" -> {
+                    if (args.size < 2) {
+                        sender.sendMessage("Использование: /daynac clearflags <ник игрока>")
+                        sender.sendMessage("§7Снимает активные флаги и текущее окно игрока, включая carry-over.")
+                        return true
+                    }
+                    val targetId = resolvePlayerId(args[1])
+                    if (targetId == null) {
+                        sender.sendMessage("§cИгрок §f${args[1]}§c не найден (никогда не заходил на сервер).")
+                        return true
+                    }
+                    val targetName = Bukkit.getPlayer(targetId)?.name
+                        ?: Bukkit.getOfflinePlayer(targetId).name
+                        ?: args[1]
+
+                    detectionEngine.resetFlags(targetId, keepCarryOver = false)
+                    hitTracker.removePlayer(targetId)
+                    snapshotTracker.resetHitTiming(targetId)
+
+                    sender.sendMessage("§a[DaynAC] Флаги и окно игрока §f$targetName§a сброшены.")
+                    logger.info("[DaynAC] ${sender.name} сбросил флаги игрока $targetName")
+                }
+                args.isNotEmpty() && args[0] == "exempt" -> {
+                    if (args.size < 2) {
+                        sender.sendMessage("Использование: /daynac exempt <ник> [время: 30s|30m|30h|30d|off]")
+                        sender.sendMessage("§7Без времени — бессрочно. §foff§7 — снять исключение.")
+                        return true
+                    }
+                    val targetId = resolvePlayerId(args[1])
+                    if (targetId == null) {
+                        sender.sendMessage("§cИгрок §f${args[1]}§c не найден (никогда не заходил на сервер).")
+                        return true
+                    }
+                    val targetName = Bukkit.getPlayer(targetId)?.name
+                        ?: Bukkit.getOfflinePlayer(targetId).name
+                        ?: args[1]
+
+                    // /daynac exempt <ник>  — бессрочное исключение
+                    if (args.size == 2) {
+                        exemptionManager.exempt(targetId, 0L)
+                        sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a добавлен в исключения §fбессрочно§a.")
+                        logger.info("[DaynAC] ${sender.name} выдал бессрочное исключение игроку $targetName")
+                        return true
+                    }
+
+                    val arg = args[2].lowercase()
+                    if (arg == "off" || arg == "remove") {
+                        if (exemptionManager.unexempt(targetId)) {
+                            sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a удалён из исключений.")
+                            logger.info("[DaynAC] ${sender.name} снял исключение с игрока $targetName")
+                        } else {
+                            sender.sendMessage("§e[DaynAC] Игрок §f$targetName§e не в списке исключений.")
+                        }
+                        return true
+                    }
+
+                    val duration = parseDuration(arg)
+                    if (duration == null) {
+                        sender.sendMessage("§c[DaynAC] Неверный формат времени: §f$arg§c. Примеры: 30s, 5m, 2h, 1d.")
+                        return true
+                    }
+                    val expiry = exemptionManager.exempt(targetId, duration)
+                    val until = Instant.ofEpochMilli(expiry)
+                        .atZone(ZoneId.systemDefault())
+                        .format(EXEMPT_DATE_FORMAT)
+                    sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a в исключениях до §f$until§a.")
+                    logger.info("[DaynAC] ${sender.name} выдал исключение игроку $targetName до $until")
+                }
                 else -> {
-                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|eval|reload>")
+                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|eval|clearflags|exempt|reload>")
                 }
             }
             return true
@@ -521,7 +605,9 @@ class DaynAC : JavaPlugin(), Listener {
                 2 -> {
                     val sub = args[0].lowercase()
                     val perm = Permissions.SUBCOMMANDS[sub]
-                    if ((sub == "ver" || sub == "record") && perm != null && sender.hasPermission(perm)) {
+                    // Подсказки ников: online для всех, кто оперирует игроком по имени.
+                    if (sub in setOf("ver", "record", "clearflags", "exempt") &&
+                        perm != null && sender.hasPermission(perm)) {
                         return Bukkit.getOnlinePlayers()
                             .map { it.name }
                             .filter { it.startsWith(args[1], ignoreCase = true) }
@@ -531,6 +617,11 @@ class DaynAC : JavaPlugin(), Listener {
                 3 -> {
                     if (args[0].equals("record", ignoreCase = true) && sender.hasPermission(Permissions.RECORD)) {
                         return listOf("legit", "cheat", "off")
+                            .filter { it.startsWith(args[2], ignoreCase = true) }
+                            .toMutableList()
+                    }
+                    if (args[0].equals("exempt", ignoreCase = true) && sender.hasPermission(Permissions.EXEMPT_MANAGE)) {
+                        return listOf("30s", "5m", "30m", "1h", "6h", "24h", "off")
                             .filter { it.startsWith(args[2], ignoreCase = true) }
                             .toMutableList()
                     }
@@ -563,7 +654,6 @@ class DaynAC : JavaPlugin(), Listener {
         recordingPlayers[attacker.uniqueId]?.let { session ->
             val label = session.label
 
-
             // Вектор признаков пишем только на каждый WINDOW_SIZE-й удар
             // (stride = windowSize). При записи на каждый удар соседние окна
             // совпадают на 15/16 признаков, и случайный train/val split в
@@ -588,10 +678,12 @@ class DaynAC : JavaPlugin(), Listener {
         }
 
         // Детекция: асинхронный inference. Не проверяем записывающего игрока (иммунитет на
-        // время сбора данных, чтобы не наказывать за те же удары) и обладателей daynac.exempt.
+        // время сбора данных, чтобы не наказывать за те же удары), обладателей daynac.exempt
+        // и тех, кому выдали временное исключение через /daynac exempt.
         if (detectionEngine.detectionEnabled &&
             !recordingPlayers.containsKey(attacker.uniqueId) &&
-            !attacker.hasPermission(Permissions.EXEMPT)
+            !attacker.hasPermission(Permissions.EXEMPT) &&
+            !exemptionManager.isExempt(attacker.uniqueId)
         ) {
             // Множитель по ПРЕДЫДУЩИМ предсказаниям — первый удар всегда полный
             val multiplier = detectionEngine.getDamageMultiplier(attacker)
@@ -646,10 +738,44 @@ class DaynAC : JavaPlugin(), Listener {
      */
     private fun resetIfIdle(playerId: UUID): Boolean {
         if (!detectionEngine.isIdle(playerId)) return false
+        // keepCarryOver = true (default): сброс по простою помнит скор,
+        // чтобы читер не получил чистый лист после 30 секунд тишины.
         detectionEngine.resetFlags(playerId)
         hitTracker.removePlayer(playerId)
         snapshotTracker.resetHitTiming(playerId)
         return true
+    }
+
+    /**
+     * Резолв UUID по нику: сначала онлайн-игрок, потом оффлайн-кэш Paper.
+     * Возвращает null, если игрок никогда не заходил на сервер (или кэш пуст
+     * после рестарта — в этом случае админ должен дождаться входа игрока).
+     */
+    private fun resolvePlayerId(name: String): UUID? {
+        Bukkit.getPlayerExact(name)?.let { return it.uniqueId }
+        return Bukkit.getOfflinePlayerIfCached(name)?.uniqueId
+    }
+
+    /**
+     * Парсит "30s" / "5m" / "2h" / "1d" в миллисекунды.
+     * Возвращает null при неверном формате, нулевом значении или переполнении.
+     */
+    private fun parseDuration(text: String): Long? {
+        val match = Regex("^(\\d+)([smhd])$", RegexOption.IGNORE_CASE).matchEntire(text) ?: return null
+        val value = match.groupValues[1].toLongOrNull() ?: return null
+        if (value <= 0) return null
+        val multiplier = when (match.groupValues[2].lowercase()) {
+            "s" -> 1_000L
+            "m" -> 60_000L
+            "h" -> 3_600_000L
+            "d" -> 86_400_000L
+            else -> return null
+        }
+        return try {
+            Math.multiplyExact(value, multiplier)
+        } catch (_: ArithmeticException) {
+            null
+        }
     }
 
     /** Сообщение над хотбаром (legacy-цвета §). Вызывать с главного потока. */
@@ -671,9 +797,5 @@ class DaynAC : JavaPlugin(), Listener {
                     "нужно ≥ ${NeuralNetwork.MIN_GROUPS_PER_CLASS} на класс). Окна одного игрока могут быть и в train, " +
                     "и в test — метрики завышены. §7($sizes)"
         }
-    }
-
-    private fun formatDouble(value: Double?, format: String = "%.4f"): String {
-        return value?.let { String.format(Locale.US, format, it) } ?: "N/A"
     }
 }

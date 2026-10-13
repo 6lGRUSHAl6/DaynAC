@@ -8,8 +8,7 @@ load: POSTWORLD
 commands:
   daynac:
     description: Daynac anticheat command
-    usage: /daynac <ver|record|train|info|debug|allinfo|eval|reload>
-    # Права проверяются по подкомандам в коде (см. Permissions.kt)
+    usage: /daynac <ver|record|train|info|debug|allinfo|eval|clearflags|exempt|reload>
 
 permissions:
   daynac.admin:
@@ -42,4 +41,7 @@ permissions:
     default: false
   daynac.exempt:
     description: Иммунитет к детекции (не входит в daynac.admin)
+    default: false
+  daynac.exempt.manage:
+    description: Выдача и снятие временных исключений (/daynac exempt)
     default: false
