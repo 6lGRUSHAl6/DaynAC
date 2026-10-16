@@ -61,7 +61,7 @@ jobs:
           echo "Версия релиза: ${base}.${build}"
 
       - name: Test and Build
-        run: gradle check build -Pversion=${{ steps.version.outputs.version }}
+        run: gradle check build -Pversion=${{ steps.version.outputs.version }} --no-configuration-cache
 
       - name: Prepare jar
         env:
