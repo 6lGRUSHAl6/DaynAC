@@ -13,20 +13,45 @@ class SnapshotTracker(private val maxSize: Int = 20) {
     private companion object {
         /** Нечётное число бинов: ноль лежит в центре среднего бина. */
         const val SIGNED_ENTROPY_BINS = 11
+
+        /** Сколько последних интервалов между ударами хранится для getHitTimeCV. */
+        const val HIT_DELTA_WINDOW = 10
+
+        /**
+         * Пауза (мс), после которой серия ударов считается прерванной и история
+         * интервалов обнуляется. Удары одной сессии PvP идут часто; разрыв в
+         * несколько секунд означает новый бой, где старая статистика CV/автокор-
+         * реляции таймингов уже нерелевантна.
+         */
+        const val HIT_DELTA_RESET_MS = 2000L
     }
 
-    private data class PlayerHeadState(
+    /**
+     * Состояние игрока по поворотам, движению и таймингам ударов.
+     *
+     * Обычный класс, а не data class: поля мутабельны, а [hitDeltas] — изменяемая
+     * коллекция. Сгенерированные data class equals/hashCode зависели бы от
+     * текущего содержимого буфера, что делало бы сравнение состояний
+     * некорректным (и нигде не нужным).
+     */
+    private class PlayerHeadState(
         var lastYaw: Float,
         var lastPitch: Float,
         var lastX: Double,
-        var lastZ: Double,
-        var lastYawDeltaAbs: Float = 0f,
-        var lastPitchDeltaAbs: Float = 0f,
-        var lastHitTime: Long? = null,
-        val hitDeltas: LongArray = LongArray(10),
-        var hitDeltasCount: Int = 0,
-        var hitDeltasIndex: Int = 0
-    )
+        var lastZ: Double
+    ) {
+        var lastYawDeltaAbs: Float = 0f
+        var lastPitchDeltaAbs: Float = 0f
+        var lastHitTime: Long? = null
+
+        /**
+         * Интервалы между последними ударами в хронологическом порядке
+         * (старые → новые). Размер ограничен [HIT_DELTA_WINDOW]; при переполнении
+         * самый старый интервал вытесняется. Обнуляется после паузы длиннее
+         * [HIT_DELTA_RESET_MS] и при [resetHitTiming].
+         */
+        val hitDeltas: ArrayDeque<Long> = ArrayDeque(HIT_DELTA_WINDOW)
+    }
 
     private val playerStates = ConcurrentHashMap<UUID, PlayerHeadState>()
     private val historySnapshot = ConcurrentHashMap<UUID, ArrayDeque<PlayerSnapshot>>()
@@ -61,15 +86,14 @@ class SnapshotTracker(private val maxSize: Int = 20) {
         state.lastHitTime = now
 
         if (delta != null) {
-            if (delta < 2000L) {
-                state.hitDeltas[state.hitDeltasIndex] = delta
-                state.hitDeltasIndex = (state.hitDeltasIndex + 1) % state.hitDeltas.size
-                if (state.hitDeltasCount < state.hitDeltas.size) {
-                    state.hitDeltasCount++
+            if (delta < HIT_DELTA_RESET_MS) {
+                if (state.hitDeltas.size >= HIT_DELTA_WINDOW) {
+                    state.hitDeltas.removeFirst()
                 }
+                state.hitDeltas.addLast(delta)
             } else {
-                state.hitDeltasCount = 0
-                state.hitDeltasIndex = 0
+                // Долгая пауза — начинаем новую серию ударов с чистого листа.
+                state.hitDeltas.clear()
             }
         }
 
@@ -89,20 +113,19 @@ class SnapshotTracker(private val maxSize: Int = 20) {
 
     fun getHitTimeCV(player: Player): Double? {
         val state = playerStates[player.uniqueId] ?: return null
-        val n = state.hitDeltasCount
+        val deltas = state.hitDeltas
+        val n = deltas.size
         if (n < 2) return null
 
-        var sum = 0.0
-        for (i in 0 until n) {
-            sum += state.hitDeltas[i]
-        }
-
-        val mean = sum / n
+        // ArrayDeque хранит интервалы в порядке добавления — итерация идёт
+        // в хронологическом порядке, а сумма/дисперсия от порядка не зависят,
+        // но для будущих признаков (lag-1 автокорреляция тайминга) порядок важен.
+        val mean = deltas.sum().toDouble() / n
         if (mean <= 0.0) return null
 
         var varianceSum = 0.0
-        for (i in 0 until n) {
-            val diff = state.hitDeltas[i] - mean
+        for (d in deltas) {
+            val diff = d - mean
             varianceSum += diff * diff
         }
 
@@ -472,8 +495,7 @@ class SnapshotTracker(private val maxSize: Int = 20) {
     fun resetHitTiming(playerId: UUID) {
         val state = playerStates[playerId] ?: return
         state.lastHitTime = null
-        state.hitDeltasCount = 0
-        state.hitDeltasIndex = 0
+        state.hitDeltas.clear()
     }
 
     fun getSpeedXZ(player: Player): Float? {
