@@ -2,29 +2,34 @@ package zov.grusha.daynAC.gui
 
 import org.bukkit.Bukkit
 import org.bukkit.Material
+import org.bukkit.NamespacedKey
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
 import org.bukkit.event.Listener
+import org.bukkit.event.inventory.InventoryAction
 import org.bukkit.event.inventory.InventoryClickEvent
 import org.bukkit.event.inventory.InventoryCloseEvent
-import org.bukkit.event.inventory.InventoryAction
+import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.inventory.Inventory
 import org.bukkit.inventory.ItemStack
 import org.bukkit.inventory.meta.CompassMeta
 import org.bukkit.persistence.PersistentDataType
 import org.bukkit.plugin.Plugin
 import zov.grusha.daynAC.DaynAC
-import zov.grusha.daynAC.permissions.Permissions
 import zov.grusha.daynAC.detection.DetectionEngine
+import zov.grusha.daynAC.permissions.Permissions
 import zov.grusha.daynAC.tracking.HitTracker
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * GUI со списком всех наблюдаемых игроков и их скоров детекции.
  * Раздел 13 daynac.md: сундук-инвентарь, каждый игрок — компас,
  * ЛКМ по компасу — телепорт в режиме наблюдателя.
  *
- * Компас в ведущую руку не даёт — игрок сразу видит, куда телепортируется.
+ * Разбит на страницы по [PLAYERS_PER_PAGE]: 5 рядов под карточки, 6-й — под навигацию.
+ * Список детерминированно отсортирован (см. [collectCards]), поэтому страницы
+ * стабильны между переоткрытиями, а не «пересобираются в случайном порядке».
  */
 class AllInfoGUI(
     private val plugin: Plugin,
@@ -34,7 +39,14 @@ class AllInfoGUI(
 
     companion object {
         private const val TITLE = "§8DaynAC — наблюдаемые игроки"
-        private const val GUI_SIZE = 54 // 6 рядов, максимум 54 игрока на страницу
+        private const val GUI_SIZE = 54
+
+        /** 5 рядов (45 слотов) под карточки; 6-й ряд — под навигацию. */
+        private const val PLAYERS_PER_PAGE = 45
+
+        private const val NAV_PREV_SLOT = 45
+        private const val NAV_INFO_SLOT = 49
+        private const val NAV_NEXT_SLOT = 53
 
         /** Иконка по величине скора — как в daynac.md. */
         fun scoreIcon(score: Double): String = when {
@@ -45,107 +57,221 @@ class AllInfoGUI(
         }
     }
 
-    /** Ключ для хранения UUID подозреваемого в PersistentDataContainer компаса. */
-    private val suspectKey = org.bukkit.NamespacedKey(plugin, "suspect")
+    /** UUID подозреваемого на компасе-карточке. */
+    private val suspectKey = NamespacedKey(plugin, "suspect")
+
+    /** Метка навигационной кнопки: "prev"/"next". Отсутствует у неактивной. */
+    private val navKey = NamespacedKey(plugin, "nav")
 
     /**
-     * Админ -> его открытый GUI. Свой инвентарь опознаётся по самому объекту, а не по заголовку:
-     * InventoryView.getTitle() deprecated и от версии к версии API ведёт себя по-разному;
-     * если бы проверка сломалась, клик не отменялся бы и админ мог бы вынуть предметы из меню.
+     * Админ → его открытый GUI. Инвентарь опознаётся по объекту, а не по заголовку:
+     * `InventoryView.getTitle()` deprecated и от версии к версии ведёт себя по-разному;
+     * если бы проверка сломалась, клик не отменялся бы и админ мог бы вынуть предметы
+     * из меню.
      */
-    private val openGuis = java.util.concurrent.ConcurrentHashMap<UUID, Inventory>()
+    private val openGuis = ConcurrentHashMap<UUID, Inventory>()
+
+    /**
+     * Админ → текущая страница. Живёт дольше GUI: переоткрытие возвращает на ту же
+     * страницу (удобно, когда админ разбирает длинный список и случайно закрыл меню).
+     * Чистится только при выходе игрока с сервера — тогда состояние неактуально.
+     */
+    private val openPages = ConcurrentHashMap<UUID, Int>()
 
     /** Собирает и открывает GUI для администратора. */
-    fun open(admin: Player) {
+    fun open(admin: Player): Inventory {
         val inventory = Bukkit.createInventory(null, GUI_SIZE, TITLE)
-        populate(inventory)
-        // Регистрируем ДО openInventory: при переоткрытии CloseEvent старого GUI не должен снять новый
         openGuis[admin.uniqueId] = inventory
+        populate(admin, inventory, openPages[admin.uniqueId] ?: 0)
         admin.openInventory(inventory)
+        return inventory
     }
 
-    private fun populate(inventory: Inventory) {
-        // Все, кто хоть раз ударил: с предсказаниями и без (пока меньше 16 ударов —
-        // предсказаний нет, но игрок уже наблюдается и это видно в GUI)
-        val trackedIds = engine.getTrackedPlayerIds() + engine.hitCounts.keys
+    // ------------------------------------------------------------------ populate
 
-        for (uuid in trackedIds) {
-            // Журнал скоров, а не активное окно: после сброса по простою флаги
-            // сняты, но «Последние удары» игрока остаются для разбора.
-            val history = engine.getScoreHistory(uuid)
-            val hitCount = engine.getHitCount(uuid)
-            val name = Bukkit.getOfflinePlayer(uuid).name ?: uuid.toString().take(8)
+    /**
+     * Снимок всего, что нужно и для отрисовки, и для сортировки.
+     * Собирается один раз за рендер — engine.getScoreHistory не дёргается
+     * повторно из разных мест.
+     */
+    private data class Card(
+        val uuid: UUID,
+        val name: String,
+        val online: Boolean,
+        val history: List<Double>,
+        val hitCount: Int,
+        val windowFill: Int
+    ) {
+        val maxScore: Double get() = history.maxOrNull() ?: 0.0
+    }
 
-            if (history.isEmpty()) {
-                // Предсказаний у игрока ещё не было. Прогресс берём из самого окна,
-                // а не из счётчика ударов: счётчик суммарный, и после сброса по
-                // простою окно могло обнулиться — «5/16» вводило бы в заблуждение.
-                val watch = ItemStack(Material.CLOCK)
-                val meta = watch.itemMeta
-                val windowFill = hitTracker.getWindowFill(uuid)
-                meta.setDisplayName("§e$name " + (if (isOnline(uuid)) "§a● В сети" else "§c● Не в сети"))
-
-                val lore = mutableListOf("§7Ударов: §f$windowFill§7/§f${DaynAC.WINDOW_SIZE}")
-                if (windowFill < DaynAC.WINDOW_SIZE) {
-                    lore.add("§7Предсказаний ещё нет — окно")
-                    lore.add("§7признаков не заполнено (нужно ${DaynAC.WINDOW_SIZE} ударов).")
-                } else {
-                    // Окно полное, а предсказаний нет: анализ этого игрока не ведётся
-                    // вовсе — он в режиме записи датасета, либо детекция выключена.
-                    lore.add("§7Предсказаний нет — анализ не ведётся:")
-                    lore.add("§7игрок в режиме записи или детекция выключена.")
-                }
-                lore.add("§7Пинг: ${pingValue(uuid)}")
-
-                meta.lore = lore
-                watch.itemMeta = meta
-                if (inventory.firstEmpty() == -1) break
-                inventory.setItem(inventory.firstEmpty(), watch)
-                continue
-            }
-
-            // Активные флаги: по ним считаются урон и наказание. После сброса по
-            // простою они пусты, хотя журнал ударов сохранён — карточка это покажет.
-            val active = engine.getRecentPredictions(uuid)
-            val flagsCleared = active.isEmpty()
-            val average = active.average() // NaN при снятых флагах — тогда в лоре прочерк
-
-            val compass = ItemStack(Material.COMPASS)
-            val meta = compass.itemMeta as CompassMeta
-
-            meta.setDisplayName("§c$name " + (if (isOnline(uuid)) "§a● В сети" else "§c● Не в сети"))
-            meta.lore = buildLore(
-                maxScore = history.max(),
-                average = average,
-                history = history,
-                hitCount = hitCount,
+    /**
+     * Все карточки в детерминированном порядке:
+     *   1) онлайн выше оффлайн — админ работает с теми, кого видит;
+     *   2) внутри — по убыванию максимального скора (самые подозрительные сверху);
+     *   3) при равенстве — по имени.
+     *
+     * Tie-break обязателен: без него `HashMap`-порядок `getTrackedPlayerIds()`
+     * давал бы «перемешанные» страницы при каждом переоткрытии — пагинация без
+     * стабильной сортировки бессмысленна. `sortedWith` в Kotlin стабильна.
+     */
+    private fun collectCards(): List<Card> {
+        val ids = engine.getTrackedPlayerIds() + engine.hitCounts.keys
+        return ids.asSequence().map { uuid ->
+            Card(
                 uuid = uuid,
-                flagsCleared = flagsCleared,
+                name = Bukkit.getOfflinePlayer(uuid).name ?: uuid.toString().take(8),
+                online = Bukkit.getPlayer(uuid) != null,
+                history = engine.getScoreHistory(uuid),
+                hitCount = engine.getHitCount(uuid),
                 windowFill = hitTracker.getWindowFill(uuid)
             )
-            meta.persistentDataContainer.set(suspectKey, PersistentDataType.STRING, uuid.toString())
-            compass.itemMeta = meta
-
-            if (inventory.firstEmpty() == -1) break // GUI полон
-            inventory.setItem(inventory.firstEmpty(), compass)
-        }
-
-        // GUI пуст — объясняем почему
-        if (inventory.isEmpty) {
-            val filler = ItemStack(Material.GRAY_STAINED_GLASS_PANE)
-            val meta = filler.itemMeta
-            meta.setDisplayName("§7Нет данных")
-            meta.lore = listOf(
-                "§7Ни один игрок ещё не ударил другого",
-                "§7игрока с момента запуска сервера.",
-                "§8• модель не обучена (/daynac train)?",
-                "§8• не было PvP-ударов",
-                "§8• все ударившие — в режиме записи"
-            )
-            filler.itemMeta = meta
-            for (slot in 0 until GUI_SIZE) inventory.setItem(slot, filler)
-        }
+        }.sortedWith(
+            compareByDescending<Card> { it.online }
+                .thenByDescending { it.maxScore }
+                .thenBy { it.name.lowercase() }
+        ).toList()
     }
+
+    /**
+     * Рисует страницу [requestedPage] в [inventory]. Индекс зажимается в допустимый
+     * диапазон (список мог укоротиться: игрока забанили, TTL вычистил записи) и
+     * сохраняется в [openPages] — следующий клик «вперёд/назад» считается от
+     * фактически показанной страницы, а не от запрошенной.
+     */
+    private fun populate(admin: Player, inventory: Inventory, requestedPage: Int) {
+        inventory.clear()
+
+        val cards = collectCards()
+        if (cards.isEmpty()) {
+            fillEmptyState(inventory)
+            openPages[admin.uniqueId] = 0
+            return
+        }
+
+        val pages = (cards.size + PLAYERS_PER_PAGE - 1) / PLAYERS_PER_PAGE
+        val page = requestedPage.coerceIn(0, pages - 1)
+        openPages[admin.uniqueId] = page
+
+        val from = page * PLAYERS_PER_PAGE
+        val to = minOf(from + PLAYERS_PER_PAGE, cards.size)
+        for (i in from until to) {
+            inventory.setItem(i - from, cardToItem(cards[i]))
+        }
+
+        // Кнопок нет на единственной странице: незачем занимать ряд под неработающие стрелки.
+        if (pages > 1) renderNavigation(inventory, page, pages, cards.size)
+    }
+
+    private fun cardToItem(card: Card): ItemStack =
+        if (card.history.isEmpty()) watchItem(card) else compassItem(card)
+
+    /** Игрок наблюдаем, но предсказаний ещё нет — окно признаков не заполнено. */
+    private fun watchItem(card: Card): ItemStack {
+        val item = ItemStack(Material.CLOCK)
+        val meta = item.itemMeta
+        meta.setDisplayName("§e${card.name} " + onlineTag(card.online))
+
+        val lore = mutableListOf("§7Ударов: §f${card.windowFill}§7/§f${DaynAC.WINDOW_SIZE}")
+        if (card.windowFill < DaynAC.WINDOW_SIZE) {
+            lore.add("§7Предсказаний ещё нет — окно")
+            lore.add("§7признаков не заполнено (нужно ${DaynAC.WINDOW_SIZE} ударов).")
+        } else {
+            // Окно полное, а предсказаний нет: анализ этого игрока не ведётся вовсе —
+            // он в режиме записи датасета, либо детекция выключена.
+            lore.add("§7Предсказаний нет — анализ не ведётся:")
+            lore.add("§7игрок в режиме записи или детекция выключена.")
+        }
+        lore.add("§7Пинг: ${pingValue(card.uuid)}")
+
+        meta.lore = lore
+        item.itemMeta = meta
+        return item
+    }
+
+    /** Полноценная карточка с историей ударов и кликабельным телепортом. */
+    private fun compassItem(card: Card): ItemStack {
+        // Активные флаги: по ним считаются урон и наказание. После сброса по простою
+        // они пусты, хотя журнал сохранён — карточка это покажет.
+        val active = engine.getRecentPredictions(card.uuid)
+        val flagsCleared = active.isEmpty()
+        val average = active.average() // NaN при снятых флагах — тогда в лоре прочерк
+
+        val item = ItemStack(Material.COMPASS)
+        val meta = item.itemMeta as CompassMeta
+        meta.setDisplayName("§c${card.name} " + onlineTag(card.online))
+        meta.lore = buildLore(
+            maxScore = card.maxScore,
+            average = average,
+            history = card.history,
+            hitCount = card.hitCount,
+            uuid = card.uuid,
+            flagsCleared = flagsCleared,
+            windowFill = card.windowFill
+        )
+        meta.persistentDataContainer.set(suspectKey, PersistentDataType.STRING, card.uuid.toString())
+        item.itemMeta = meta
+        return item
+    }
+
+    private fun onlineTag(online: Boolean): String =
+        if (online) "§a● В сети" else "§c● Не в сети"
+
+    private fun renderNavigation(inventory: Inventory, page: Int, pages: Int, total: Int) {
+        val hasPrev = page > 0
+        val hasNext = page < pages - 1
+
+        inventory.setItem(NAV_PREV_SLOT, navItem(
+            label = if (hasPrev) "§a← Предыдущая" else "§7← Предыдущая",
+            nav = if (hasPrev) "prev" else null,
+            lore = if (hasPrev) listOf("§7Страница $page из $pages")
+            else listOf("§7Вы в начале списка")
+        ))
+        inventory.setItem(NAV_INFO_SLOT, navItem(
+            label = "§fСтраница §e${page + 1}§f/§e$pages",
+            nav = null,
+            lore = listOf("§7Игроков в списке: §f$total")
+        ))
+        inventory.setItem(NAV_NEXT_SLOT, navItem(
+            label = if (hasNext) "§aСледующая →" else "§7Следующая →",
+            nav = if (hasNext) "next" else null,
+            lore = if (hasNext) listOf("§7Страница ${page + 2} из $pages")
+            else listOf("§7Вы в конце списка")
+        ))
+    }
+
+    /**
+     * Навигационная кнопка. [nav] = null означает «неактивна»: PDC-метка не пишется,
+     * обработчик клика её игнорирует — визуально серая и без реакции. Именно поэтому
+     * реакция идёт по метке, а не по слоту: кнопка неотличима от декоративной стрелки
+     * для случайного предмета в том же слоте, если layout когда-нибудь поменяется.
+     */
+    private fun navItem(label: String, nav: String?, lore: List<String>): ItemStack {
+        val item = ItemStack(Material.ARROW)
+        val meta = item.itemMeta
+        meta.setDisplayName(label)
+        meta.lore = lore
+        if (nav != null) meta.persistentDataContainer.set(navKey, PersistentDataType.STRING, nav)
+        item.itemMeta = meta
+        return item
+    }
+
+    private fun fillEmptyState(inventory: Inventory) {
+        val filler = ItemStack(Material.GRAY_STAINED_GLASS_PANE)
+        val meta = filler.itemMeta
+        meta.setDisplayName("§7Нет данных")
+        meta.lore = listOf(
+            "§7Ни один игрок ещё не ударил другого",
+            "§7игрока с момента запуска сервера.",
+            "§8• модель не обучена (/daynac train)?",
+            "§8• не было PvP-ударов",
+            "§8• все ударившие — в режиме записи"
+        )
+        filler.itemMeta = meta
+        for (slot in 0 until GUI_SIZE) inventory.setItem(slot, filler)
+    }
+
+    // ------------------------------------------------------------------ lore
 
     private fun buildLore(
         maxScore: Double,
@@ -168,9 +294,6 @@ class AllInfoGUI(
         }
         lore.add("")
         if (flagsCleared) {
-            // Флаги снял сброс по простою: показываем прогресс нового окна и
-            // объясняем, почему предсказаний нет, — иначе карточка выглядит
-            // как «данных нет» без причины.
             lore.add("Ударов: §f$windowFill§7/§f${DaynAC.WINDOW_SIZE} §7(окно набирается заново)")
             lore.add("§7Предсказаний нет — после сброса флагов")
             lore.add("§7окно признаков ещё не заполнено.")
@@ -193,21 +316,11 @@ class AllInfoGUI(
         else -> "§aСкорее всего легит"
     }
 
-    private fun isOnline(uuid: UUID): Boolean = Bukkit.getPlayer(uuid) != null
-
-    /**
-     * Готовое к вставке в лор значение пинга. Возвращает уже окрашенную строку
-     * («§a45»), поэтому вызывающие не думают о цвете.
-     *
-     * У оффлайн-игрока соединения нет и Bukkit пинг не отдаёт — показываем прочерк,
-     * а не 0: ноль читался бы как «идеальный пинг» у игрока, которого нет на сервере.
-     */
     private fun pingValue(uuid: UUID): String {
         val ping = Bukkit.getPlayer(uuid)?.ping ?: return "§8— §7(не в сети)"
         return "${pingColor(ping)}$ping§7 мс"
     }
 
-    /** Цвет пинга: зелёный — норма, жёлтый — заметная задержка, красный — лаги. */
     private fun pingColor(ping: Int): String = when {
         ping < 100 -> "§a"
         ping < 200 -> "§e"
@@ -216,18 +329,18 @@ class AllInfoGUI(
 
     private fun fmt(v: Double): String = String.format(java.util.Locale.US, "%.3f", v)
 
+    // ------------------------------------------------------------------ events
+
     @EventHandler
     fun onInventoryClick(event: InventoryClickEvent) {
         val player = event.whoClicked as? Player ?: return
         val gui = openGuis[player.uniqueId] ?: return
         if (event.view.topInventory !== gui) return
 
-        // Отменяем только взаимодействия с нашим (верхним) инвентарём —
-        // иначе админ не может пользоваться собственным инвентарём,
-        // пока GUI открыт.
-        // MOVE_TO_OTHER_INVENTORY: shift-клик из нижнего инвентаря
-        // перекладывает предметы в верхний — тоже блокируем.
-        // COLLECT_TO_CURSOR (двойной клик) собирает предметы и из верхнего.
+        // Отменяем только взаимодействия с нашим (верхним) инвентарём — иначе админ
+        // не может пользоваться собственным инвентарём, пока GUI открыт.
+        // MOVE_TO_OTHER_INVENTORY (shift-клик) перекладывает в верхний инвентарь —
+        // тоже блокируем. COLLECT_TO_CURSOR (двойной клик) собирает и из верхнего.
         val clickTop = event.clickedInventory === gui
         if (!player.hasPermission(Permissions.VIEW)) {
             // Право могли отозвать, пока GUI был открыт: меню закрываем, предметы не отдаём
@@ -243,9 +356,27 @@ class AllInfoGUI(
         }
 
         if (!clickTop) return // клики по своему инвентарю — не наши
-        if (event.currentItem == null || event.currentItem!!.type != Material.COMPASS) return
-        val meta = event.currentItem!!.itemMeta ?: return
-        val uuidString = meta.persistentDataContainer.get(suspectKey, PersistentDataType.STRING) ?: return
+        val item = event.currentItem ?: return
+        val meta = item.itemMeta ?: return
+        val pdc = meta.persistentDataContainer
+
+        // Навигация. Реагируем на PDC-метку: неактивная кнопка её не несёт, и клик
+        // по ней просто проваливается дальше (не совпадёт ни с compass, ни с suspectKey).
+        pdc.get(navKey, PersistentDataType.STRING)?.let { nav ->
+            val current = openPages[player.uniqueId] ?: 0
+            val target = when (nav) {
+                "prev" -> current - 1
+                "next" -> current + 1
+                else -> return
+            }
+            // Re-render in-place: без close/open GUI не мерцает и не теряет фокус,
+            // populate сам зажмёт target в допустимый диапазон.
+            populate(player, gui, target)
+            return
+        }
+
+        if (item.type != Material.COMPASS) return
+        val uuidString = pdc.get(suspectKey, PersistentDataType.STRING) ?: return
         if (!player.hasPermission(Permissions.SPECTATE)) {
             player.sendMessage("§c[DaynAC] Недостаточно прав (${Permissions.SPECTATE}).")
             return
@@ -264,7 +395,7 @@ class AllInfoGUI(
         player.sendMessage("§7[DaynAC] Наблюдение за §c${target.name}§7. Выйти из наблюдателя: /gamemode survival")
     }
 
-    /** Чистка при закрытии GUI (ESC/кнопка) — иначе UUID зависал в openGuis навсегда. */
+    /** Чистка при закрытии GUI. Страницу не трогаем — переоткрытие вернёт админа туда же. */
     @EventHandler
     fun onClose(event: InventoryCloseEvent) {
         val gui = openGuis[event.player.uniqueId]
@@ -273,9 +404,10 @@ class AllInfoGUI(
         }
     }
 
-    /** Очистка при выходе админа с открытым GUI. */
+    /** Полная очистка при выходе админа — состояние страницы больше не нужно. */
     @EventHandler
-    fun onQuit(event: org.bukkit.event.player.PlayerQuitEvent) {
+    fun onQuit(event: PlayerQuitEvent) {
         openGuis.remove(event.player.uniqueId)
+        openPages.remove(event.player.uniqueId)
     }
 }

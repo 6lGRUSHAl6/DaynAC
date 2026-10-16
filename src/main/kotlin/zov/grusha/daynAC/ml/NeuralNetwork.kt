@@ -589,8 +589,6 @@ class NeuralNetwork(
                 a[j] = if (isLast) sigmoid(sum) else relu(sum)
             }
             activations[l + 1] = a
-            // z храним в отдельном локальном массиве только для текущего слоя —
-            // для backward нужна только информация «активен ли ReLU», она выводится из a[j] > 0
         }
 
         val output = activations[layerCount]!![0]

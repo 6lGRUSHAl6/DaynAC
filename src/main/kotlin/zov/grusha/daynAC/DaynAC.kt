@@ -71,6 +71,8 @@ class DaynAC : JavaPlugin(), Listener {
 
     /** Сессия записи датасета: метка класса и идентификатор сессии (от `record <ник> legit|cheat` до `off`). */
     private data class RecordingSession(val label: String, val sessionId: String) {
+        /** Сколько ударов сделано с начала этой сессии (счётчик окна внутри сессии, не суммарный). */
+        var hits: Int = 0
         /** Сколько векторов записано в этой сессии. */
         var vectors: Int = 0
     }
@@ -653,13 +655,20 @@ class DaynAC : JavaPlugin(), Listener {
 
         recordingPlayers[attacker.uniqueId]?.let { session ->
             val label = session.label
+            session.hits++
+            val untilNext = WINDOW_SIZE - session.hits % WINDOW_SIZE
 
-            // Вектор признаков пишем только на каждый WINDOW_SIZE-й удар
+            // Вектор признаков пишем только на каждый WINDOW_SIZE-й удар СЕССИИ
             // (stride = windowSize). При записи на каждый удар соседние окна
             // совпадают на 15/16 признаков, и случайный train/val split в
             // обучении кладёт почти-дубликаты в обе выборки — val-метрики
             // фиктивны, early stopping ломается.
-            if (detectionEngine.getHitCount(attacker.uniqueId) % WINDOW_SIZE == 0) {
+            //
+            // Счётчик локальный для сессии: если админ начал запись на игроке,
+            // который уже набил N ударов в общем трекере, первое окно всё равно
+            // наберётся ровно за WINDOW_SIZE ударов записи, а не «добёром» до
+            // кратности суммарного счётчика.
+            if (session.hits % WINDOW_SIZE == 0) {
                 featureExtractor.extract(hitTracker.getHistory(attacker))?.let { vector ->
                     datasetManager.writeVectorSample(
                         label, vector, session.sessionId, datasetManager.playerHash(attacker.uniqueId)
@@ -668,9 +677,6 @@ class DaynAC : JavaPlugin(), Listener {
                 }
             }
 
-            // Счётчик над хотбаром для записываемого игрока: сколько векторов набито
-            // в этой сессии и сколько ударов до следующего.
-            val untilNext = WINDOW_SIZE - detectionEngine.getHitCount(attacker.uniqueId) % WINDOW_SIZE
             sendActionBar(
                 attacker,
                 "§7Запись §a$label§7: §f${session.vectors} §7векторов §8| §7до следующего: §f$untilNext §7ударов"
