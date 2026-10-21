@@ -36,3 +36,7 @@ run/
 .csv
 .dat
 /run-*/
+
+# they are useful for more conveniently viewing "git diff" and "git status" without affecting the main repository
+diff.txt
+status.txt

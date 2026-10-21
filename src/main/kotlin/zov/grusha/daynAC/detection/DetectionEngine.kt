@@ -33,7 +33,21 @@ class DetectionEngine(
     private val plugin: org.bukkit.plugin.java.JavaPlugin,
     private val network: NeuralNetwork,
     /** Размер окна ударов (DaynAC.WINDOW_SIZE): через столько ударов окна перестают пересекаться. */
-    private val windowSize: Int
+    private val windowSize: Int,
+    /**
+     * Источник текущего времени (мс). В production — [System.currentTimeMillis];
+     * в тестах подменяется, чтобы проверять простой, затухание carry-over и TTL
+     * без Thread.sleep.
+     */
+    private val clock: () -> Long = { System.currentTimeMillis() },
+    /**
+     * Пул для тяжёлого predict. Тестовый шов: в тестах подставляется прямой
+     * исполнитель, чтобы вердикт считался синхронно в вызывающем потоке.
+     * В production — два daemon-потока, как и раньше.
+     */
+    private val inferencePool: ExecutorService = Executors.newFixedThreadPool(2) { runnable ->
+        Thread(runnable, "DaynAC-Inference").apply { isDaemon = true }
+    }
 ) {
 
     /**
@@ -136,10 +150,6 @@ class DetectionEngine(
      */
     private val maxScoreHistory = 100
 
-    private val inferencePool: ExecutorService = Executors.newFixedThreadPool(2) { runnable ->
-        Thread(runnable, "DaynAC-Inference").apply { isDaemon = true }
-    }
-
     /**
      * АКТИВНЫЕ предсказания по игрокам — то, чем движок реально руководствуется:
      * множитель урона, оповещения, автонаказание. Сбрасываются по простою
@@ -205,7 +215,7 @@ class DetectionEngine(
     /** Регистрирует удар игрока (вызывается на главном потоке при каждом ударе). */
     fun recordHit(player: Player) {
         hitCounts.merge(player.uniqueId, 1, Int::plus)
-        lastHitTimes[player.uniqueId] = System.currentTimeMillis()
+        lastHitTimes[player.uniqueId] = clock()
     }
 
     /** Сколько ударов у игрока и хватает ли их для анализа (окно 16). */
@@ -219,7 +229,7 @@ class DetectionEngine(
     fun isIdle(playerId: UUID): Boolean {
         if (inactivityResetSeconds <= 0) return false
         val lastHit = lastHitTimes[playerId] ?: return false
-        return System.currentTimeMillis() - lastHit > inactivityResetSeconds * 1000L
+        return clock() - lastHit > inactivityResetSeconds * 1000L
     }
 
     /**
@@ -245,7 +255,7 @@ class DetectionEngine(
             if (snapshot.isNotEmpty()) {
                 val average = snapshot.sumOf { it.probability } / snapshot.size
                 if (carryOverSeconds > 0 && average >= reduceThreshold) {
-                    carryOver[playerId] = CarryOver(average, System.currentTimeMillis())
+                    carryOver[playerId] = CarryOver(average, clock())
                 } else {
                     carryOver.remove(playerId) // последнее окно было чистым — подозрение снято
                 }
@@ -264,7 +274,7 @@ class DetectionEngine(
      * от того, открывает ли кто-то GUI.
      */
     fun pruneStaleTracking() {
-        val now = System.currentTimeMillis()
+        val now = clock()
         predictions.entries.removeIf { (_, deque) ->
             val lastTs = synchronized(deque) { deque.lastOrNull()?.timestamp }
             lastTs == null || now - lastTs > trackedTtlMs
@@ -323,7 +333,7 @@ class DetectionEngine(
     }
 
     private fun recordVerdict(attacker: Player, probability: Double) {
-        val verdict = PlayerVerdict(probability, System.currentTimeMillis())
+        val verdict = PlayerVerdict(probability, clock())
 
         val deque = predictions.computeIfAbsent(attacker.uniqueId) { ArrayDeque() }
         synchronized(deque) {
@@ -369,7 +379,7 @@ class DetectionEngine(
     private fun carriedScore(playerId: UUID): Double? {
         if (carryOverSeconds <= 0) return null
         val carried = carryOver[playerId] ?: return null
-        val elapsed = System.currentTimeMillis() - carried.timeMillis
+        val elapsed = clock() - carried.timeMillis
         val lifetime = carryOverSeconds * 1000L
         if (elapsed >= lifetime) {
             carryOver.remove(playerId)
@@ -630,7 +640,7 @@ class DetectionEngine(
                 if (snapshot.isNotEmpty()) {
                     val average = snapshot.sumOf { it.probability } / snapshot.size
                     if (carryOverSeconds > 0 && average >= reduceThreshold) {
-                        carryOver[playerId] = CarryOver(average, System.currentTimeMillis())
+                        carryOver[playerId] = CarryOver(average, clock())
                     } else {
                         carryOver.remove(playerId) // последнее окно было чистым — подозрение снято
                     }

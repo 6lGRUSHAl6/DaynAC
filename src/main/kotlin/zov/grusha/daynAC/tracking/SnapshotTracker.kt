@@ -8,7 +8,15 @@ import kotlin.math.abs
 import kotlin.math.log2
 import kotlin.math.sqrt
 
-class SnapshotTracker(private val maxSize: Int = 20) {
+class SnapshotTracker(
+    private val maxSize: Int = 20,
+    /**
+     * Источник текущего времени (мс). В production — [System.currentTimeMillis];
+     * в тестах подменяется, чтобы проверять интервалы между ударами и сброс
+     * серии после паузы без Thread.sleep.
+     */
+    private val clock: () -> Long = { System.currentTimeMillis() }
+) {
 
     private companion object {
         /** Нечётное число бинов: ноль лежит в центре среднего бина. */
@@ -70,7 +78,7 @@ class SnapshotTracker(private val maxSize: Int = 20) {
      */
     fun registerHitWithAngle(player: Player, currentAimAngle: Double?): Pair<Long?, Double?> {
         val uuid = player.uniqueId
-        val now = System.currentTimeMillis()
+        val now = clock()
         val loc = player.location
 
         val state = playerStates.computeIfAbsent(uuid) {
@@ -516,7 +524,7 @@ class SnapshotTracker(private val maxSize: Int = 20) {
         } else null
 
         return HitData(
-            timestamp = System.currentTimeMillis(),
+            timestamp = clock(),
             aimAngle = aimAngle,
             distance = distance,
             reachDistance = reachDistance,

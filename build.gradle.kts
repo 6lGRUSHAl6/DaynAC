@@ -31,6 +31,15 @@ dependencies {
     testImplementation(kotlin("test-junit5"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.4") // Явно указываем версию
+    // paper-api объявлен compileOnly и в тестовый classpath не попадает: без этого тесты
+    // не видят org.bukkit.* (Location, Player, YamlConfiguration, ItemStack...).
+    testImplementation("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    // Моки Bukkit-объектов (Player, JavaPlugin) и статики Bukkit.getScheduler/getOnlinePlayers.
+    // Mockito 5 использует inline mockmaker по умолчанию, поэтому мокает и final-классы Kotlin.
+    testImplementation("org.mockito:mockito-core:5.18.0")
+    testImplementation("org.mockito.kotlin:mockito-kotlin:5.4.0")
+    // Полноценный mock-сервер: нужен только GUI-тестам (реестр Material, ItemMeta, PDC, инвентари).
+    testImplementation("org.mockbukkit.mockbukkit:mockbukkit-v1.21:4.116.3")
 }
 
 kotlin {
