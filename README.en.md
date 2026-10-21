@@ -1,17 +1,23 @@
 # DaynAC
 
-* [🇷🇺 Русский](README.md)
+[![Build](https://github.com/6lGRUSHAl6/DaynAC/actions/workflows/release.yml/badge.svg)](https://github.com/6lGRUSHAl6/DaynAC/actions/workflows/release.yml)
+[![Version](https://img.shields.io/github/v/release/6lGRUSHAl6/DaynAC)](https://github.com/6lGRUSHAl6/DaynAC/releases)
+[![License](https://img.shields.io/github/license/6lGRUSHAl6/DaynAC)](LICENSE)
+![Platform](https://img.shields.io/badge/Paper-1.21.11%2B-blue)
+![Language](https://img.shields.io/badge/Kotlin-JVM-7F52FF?logo=kotlin&logoColor=white)
+
+* [Русский](README.md)
 
 > [!CAUTION]
-> ## Warning
-> The project is in early alpha.
+> **Early alpha.** Behavior, settings and file formats may change from release to release - check the release notes and run `/daynac eval` before touching thresholds.
 
-**A neural-network anti-cheat for Minecraft PvP servers.** Detects external aim assistance (AimBot / KillAura) through behavioral hit patterns, without speed-hack checks, packet sniffers, or other conventional techniques. The model is trained on datasets that you collect yourself on your server.
+**A neural-network anti-cheat for Minecraft PvP servers.** Detects external aim assistance (AimBot / KillAura) through behavioral hit patterns - no speed-hack checks, packet sniffers, or other conventional techniques. The model is trained on datasets that you collect yourself on your server.
 
 The target use case is **1.9+ no-cooldown PvP**, where legitimately high CPS is not evidence of cheating: the distinction between legitimate play and cheating is based not on click speed, but on aiming geometry and timing.
 
 ## Contents
 
+- [Highlights](#highlights)
 - [How it works](#how-it-works)
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -25,24 +31,43 @@ The target use case is **1.9+ no-cooldown PvP**, where legitimately high CPS is 
 - [Architecture](#architecture)
 - [Known limitations](#known-limitations)
 - [Development](#development)
+- [License](#license)
+
+---
+
+## Highlights
+
+- **A model tailored to your server.** No shipped signatures: the network learns from data you recorded yourself - both the legit and the cheat sessions are played by your people.
+- **Behavior, not clicks.** 343 features per window of 16 hits: aiming geometry, rotation entropy, timing predictability. Details in [How it works](#how-it-works).
+- **Zero ML dependencies.** The MLP 343→128→64→32→1 is written in pure Kotlin: neither Python nor PyTorch is needed on the server.
+- **The main tick stays free.** Inference runs in separate daemon threads; model weights are an immutable snapshot behind an `AtomicReference`, so retraining on a live server never blocks detection.
+- **Everything stays local.** The dataset, model and config live in `plugins/DaynAC/`; there is no telemetry; player UUIDs never end up in CSV files - SHA-256 pseudonyms with a salt are used instead.
+- **Honest metrics.** Wilson confidence intervals in `/daynac eval`, session-based splitting against data leakage, and explicit warnings while there is not enough data yet.
+
+### Comparison of approaches
+
+| | **DaynAC** | Classic CPS checks | Packet anticheats |
+|---|---|---|---|
+| What it analyzes | the geometry and timing of every hit | click frequency per window | packet anomalies against client signatures |
+| Required input | your dataset (hundreds of vectors per class) | nothing | an up-to-date protocol parser for every client release |
+| Blind spot | deaf until the dataset exists | in 1.9+ PvP legitimate players click just as fast | every new client version is a new arms race |
 
 ---
 
 ## How it works
 
-```
-player hits ──► SnapshotTracker ──► HitData (21 features per hit)
-                       │
-                       ▼
-             FeatureExtractor: window of 16 hits
-             16×21 + 7 aggregates = 343 features
-                       │
-                       ▼
-             NeuralNetwork (343 → 128 → 64 → 32 → 1)
-             pure Kotlin, no ML libraries
-                       │
-                       ▼
-             cheat probability (0..1) ──► server response
+```mermaid
+flowchart TB
+    hit["Player hit<br/>ENTITY_ATTACK, both are players"] --> track["SnapshotTracker<br/>per-tick rotation and velocity snapshots"]
+    track --> hitdata["HitData<br/>21 features per hit"]
+    hitdata --> feat["FeatureExtractor<br/>window of 16 hits<br/>16 × 21 + 7 aggregates = 343 features"]
+    feat --> nn["NeuralNetwork<br/>343 → 128 → 64 → 32 → 1<br/>pure Kotlin"]
+    nn --> score["Cheat probability 0…1<br/>on every hit"]
+    score --> rule{"Thresholds"}
+    rule -->|"score ≥ 0.65"| alert["Admin alert"]
+    rule -->|"average ≥ 0.70"| reduce["Damage reduction<br/>multiplier ≈ 0.83 → 0.67"]
+    rule -->|"average ≥ 0.90"| cancel["Damage cancel"]
+    rule -->|"≥ 0.95 in 2 independent windows"| punish["Kick / ban"]
 ```
 
 **Features for each hit:** aim angle, distance, interval between hits and its variation, rotation entropy (abs/signed, yaw/pitch), jitter, XZ velocity, rotation smoothness, snap factor (sudden final adjustment of the aim), micro-corrections, jerk, rotation linearity, reach.
@@ -51,7 +76,8 @@ player hits ──► SnapshotTracker ──► HitData (21 features per hit)
 
 CPS is deliberately not used as a feature: in no-cooldown PvP, legitimate players click fast and steadily. Mechanical regularity is captured by the autocorrelation of hit intervals, not by their absolute speed.
 
-Only `ENTITY_ATTACK` hits between players are recorded. Hits cancelled by other plugins and sword sweep attacks never enter the history.
+> [!NOTE]
+> Only **landed** `ENTITY_ATTACK` hits between players are recorded. Hits cancelled by other plugins and sword sweep attacks never enter the history.
 
 ---
 
@@ -59,30 +85,35 @@ Only `ENTITY_ATTACK` hits between players are recorded. Hits cancelled by other 
 
 ### Requirements
 
-- **Paper 1.21.11 or newer** (the same jar; tested on 1.21.11 and up to 26.3)
-- Java **21+** for 1.21.11 and **25+** for Paper 26.1 and newer (a server requirement; the plugin is built for Java 21 and runs on both)
+| Requirement | Value |
+|---|---|
+| Server | **Paper 1.21.11 or newer** (the same jar; tested on 1.21.11 and up to 26.3) |
+| Java | **21+** for 1.21.11 and **25+** for Paper 26.1+ (a server requirement; the plugin is built for Java 21 and runs on both) |
 
 ### Prebuilt JAR
 
-1. Download `DaynAC-<version>-all.jar` from [Releases](../../releases) (every push to `main` publishes a new build), or build it yourself (see below).
+1. Download `DaynAC-<version>-all.jar` from [Releases](https://github.com/6lGRUSHAl6/DaynAC/releases) (every push to `main` publishes a new build), or build it yourself (see below).
 2. Copy the jar into the server's `plugins/` folder.
 3. Start the server. The plugin creates `plugins/DaynAC/` with `config.yml`.
 4. Adjust the thresholds for your server and restart.
 5. Grant permissions to your staff (see [Permissions](#permissions)): ops only need `daynac.admin`, everyone else gets what they need from the list.
 
-**Detection stays disabled until a model has been trained.** Until you collect a dataset and run `/daynac train`, the plugin works only as a data collector.
+> [!IMPORTANT]
+> **Detection stays disabled until a model has been trained.** Until you collect a dataset and run `/daynac train`, the plugin works only as a data collector.
 
 ### Building from source
 
+You need Gradle **9.7** (the version from `gradle/wrapper/gradle-wrapper.properties`; there are no wrapper scripts in the repository - CI installs Gradle itself):
+
 ```bash
-./gradlew build          # resulting JAR: build/libs/DaynAC-<version>-all.jar
+gradle build               # resulting JAR: build/libs/DaynAC-<version>-all.jar
 ```
 
 To launch a local test server directly from the project:
 
 ```bash
-./gradlew runServer                       # Paper 1.21.11 with the plugin (2 GB RAM)
-./gradlew runServer -PmcVersion=26.1.2    # same, on another Minecraft version
+gradle runServer                       # Paper 1.21.11 with the plugin (2 GB RAM)
+gradle runServer -PmcVersion=26.1.2    # same, on another Minecraft version
 ```
 
 ---
@@ -111,7 +142,7 @@ Each command requires its own permission (see [Permissions](#permissions)); `day
 | `/daynac allinfo` | Player-monitoring GUI (teleporting from it needs `daynac.spectate`) | `daynac.view` |
 | `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` | `daynac.config` |
 | `/daynac clearflags <player>` | Manually reset a player's flags and current window | `daynac.config` |
-| `/daynac exempt <player> [time\|off]` | Grant a temporary exemption from detection (`30s`, `5m`, `2h`, `1d`); without time — permanent; `off` — remove | `daynac.exempt.manage` |
+| `/daynac exempt <player> [time\|off]` | Grant a temporary exemption from detection (`30s`, `5m`, `2h`, `1d`); without time - permanent; `off` - remove | `daynac.exempt.manage` |
 | `/daynac reload` | Reload `config.yml` (threshold changes need a restart) | `daynac.config` |
 
 ---
@@ -131,15 +162,6 @@ Permissions are checked per subcommand, so access can be granted in parts (for e
 | `daynac.exempt.manage` | `/daynac exempt` (grant and revoke temporary exemptions) |
 | `daynac.exempt` | permanent exemption from detection; **not** part of `daynac.admin` |
 
-Things to know:
-
-- An empty or unknown subcommand requires `daynac.view`, so outsiders cannot list the commands.
-- **Grant `daynac.record` only to the people who collect the dataset.** The `legit`/`cheat` label is set by hand by whoever records: a mistaken or deliberately wrong label will poison the model on the next `/daynac train`. While a player is being recorded, detection does not check them.
-- `daynac.exempt` is deliberately separate from `daynac.admin`: otherwise a stolen admin account would be immune to the anti-cheat, and admins could not test the plugin on themselves. Grant it explicitly, and only to people you trust.
-- `daynac.exempt.manage` is part of `daynac.admin`: an operator can grant temporary exemptions to other players. By itself it does not provide immunity — the exemption must be activated via `/daynac exempt`.
-- Temporary exemptions are stored in `exemptions.yml` and expire automatically; permanent immunity (`daynac.exempt`) does not expire.
-- `daynac.spectate` is re-checked on every click in the GUI, and `daynac.view` while it is open: a revoked permission takes effect immediately.
-
 LuckPerms example:
 
 ```
@@ -148,6 +170,18 @@ LuckPerms example:
 /lp group senior-mod permission set daynac.spectate true
 /lp group dataset-team permission set daynac.record true
 ```
+
+<details>
+<summary><b>Things to know about permissions</b></summary>
+
+- An empty or unknown subcommand requires `daynac.view`, so outsiders cannot list the commands.
+- **Grant `daynac.record` only to the people who collect the dataset.** The `legit`/`cheat` label is set by hand by whoever records: a mistaken or deliberately wrong label will poison the model on the next `/daynac train`. While a player is being recorded, detection does not check them.
+- `daynac.exempt` is deliberately separate from `daynac.admin`: otherwise a stolen admin account would be immune to the anti-cheat, and admins could not test the plugin on themselves. Grant it explicitly, and only to people you trust.
+- `daynac.exempt.manage` is part of `daynac.admin`: an operator can grant temporary exemptions to other players. By itself it does not provide immunity - the exemption must be activated via `/daynac exempt`.
+- Temporary exemptions are stored in `exemptions.yml` and expire automatically; permanent immunity (`daynac.exempt`) does not expire.
+- `daynac.spectate` is re-checked on every click in the GUI, and `daynac.view` while it is open: a revoked permission takes effect immediately.
+
+</details>
 
 ---
 
@@ -171,12 +205,13 @@ Two metadata columns are appended to each vector:
 
 These columns are not used for training; they are used to split the dataset. Files in the old format are upgraded automatically, with a `*.bak` backup created first; old rows remain ungrouped. Do not lose or publish `dataset.salt`: without it, hashes for new recordings will not match the old ones.
 
-**Tips for good data:**
-
-- you need **both classes** in comparable numbers (hundreds of vectors per class);
-- variety matters more than quantity: different distances, movement, targets, cheat settings;
-- record **at least 3 separate sessions per class**, preferably with different players; otherwise a proper group-based split is impossible;
-- include "hard" legit players (high DPI, low sensitivity, fast aim): they are where the model most often makes mistakes.
+> [!TIP]
+> **Data quality is what it all comes down to:**
+>
+> - you need **both classes** in comparable numbers (hundreds of vectors per class);
+> - variety matters more than quantity: different distances, movement, targets, cheat settings;
+> - record **at least 3 separate sessions per class**, preferably with different players; otherwise a proper group-based split is impossible;
+> - include "hard" legit players (high DPI, low sensitivity, fast aim): they are where the model most often makes mistakes.
 
 **Feature versioning.** If you change what any feature means, bump `FeatureExtractor.FEATURE_VERSION`. On startup the plugin compares it with `dataset.featver`: incompatible datasets are renamed to `<name>.featv<N>.bak` (nothing is deleted), and an incompatible model is renamed to `model.dat.old`.
 
@@ -184,9 +219,7 @@ These columns are not used for training; they are used to split the dataset. Fil
 
 ## Training and evaluating the model
 
-```
-/daynac train
-```
+### `/daynac train`
 
 - Splits the dataset 60/20/20 into train/validation/test (stratified by class) and normalizes features using the training portion only.
 - If there are ≥ 3 groups per class, it splits by **whole groups** (`training.split-by: session` or `player`), so windows from the same player never end up in both training and testing. With fewer groups, the split is random by window, and the plugin warns that the metrics are likely inflated.
@@ -197,12 +230,11 @@ These columns are not used for training; they are used to split the dataset. Fil
 
 A large gap between train and validation accuracy means the data is insufficient or too uniform.
 
-```
-/daynac eval
-```
+### `/daynac eval`
 
 Shows precision, recall, F1 and FPR on the test set for a range of thresholds, with 95% Wilson confidence intervals. A threshold is recommended only if the **upper bound** of the FPR is ≤ 1%. Even with zero errors, this requires ≥ 381 legit windows in the test set (roughly 1,900 legit vectors in the whole dataset). Until you have that much data, the plugin will tell you plainly that a low FPR is not statistically confirmed.
 
+> [!IMPORTANT]
 > `eval` only works in the same server run in which training happened: the test set is not stored in `model.dat`.
 
 ---
@@ -234,7 +266,7 @@ The log is not cleared by the reset: the player stays in `/daynac allinfo` with 
 ### Example chat alert
 
 ```
-[DaynAC] Steve: unusual hit 0.871 > threshold 0.65 — recent hits: 0.31 0.44 0.61 0.87 (average: 0.54)
+[DaynAC] Steve: unusual hit 0.871 > threshold 0.65 - recent hits: 0.31 0.44 0.61 0.87 (average: 0.54)
 ```
 
 ---
@@ -264,7 +296,8 @@ training:
   split-by: session          # session | player: what to split train/val/test by
 ```
 
-Threshold ordering is validated at startup: `flag ≤ reduce < cancel ≤ punish`. Thresholds are read once when the plugin starts, so after `/daynac reload` a restart is needed for threshold changes to take effect.
+> [!IMPORTANT]
+> Threshold ordering is validated at startup: `flag ≤ reduce < cancel ≤ punish`. Thresholds are read once when the plugin starts, so after `/daynac reload` a restart is needed for threshold changes to take effect.
 
 ---
 
@@ -286,7 +319,10 @@ Everything is stored locally in `plugins/DaynAC/`. There is no telemetry.
 
 ## Architecture
 
-```
+<details>
+<summary><b>Source layout and key engineering decisions</b></summary>
+
+```text
 src/main/kotlin/zov/grusha/daynAC/
 ├── DaynAC.kt              # entry point: events, commands, dataset recording
 ├── compat/
@@ -320,6 +356,8 @@ Key engineering decisions:
 - **Data-leakage protection.** Non-overlapping windows when recording, session/player-based splitting, class stratification, and normalization from the training portion only.
 - **Feature versioning.** Old datasets and models are never silently mixed with new ones.
 
+</details>
+
 ---
 
 ## Known limitations
@@ -335,11 +373,13 @@ Key engineering decisions:
 ## Development
 
 ```bash
-./gradlew test       # ML module and permissions unit tests
-./gradlew build      # tests + shadowJar
+gradle test          # unit tests (detection, tracking, ML module, permissions; ~200 tests)
+gradle build         # tests + shadowJar
 ```
 
 `PermissionsTest` checks `Permissions.kt` against `plugin.yml`: when adding a permission, update both files.
+
+Found a bug, a false positive, or have an idea - open an [Issue](https://github.com/6lGRUSHAl6/DaynAC/issues).
 
 Releases are published by GitHub Actions: every push to `main` builds a jar and creates a release versioned `<version from gradle.properties>.<build number>`. To push without a release, start the commit message with `[skip release]`.
 
