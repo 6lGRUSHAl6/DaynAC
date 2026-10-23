@@ -204,7 +204,8 @@ class DetectionEngine(
     /**
      * Состояние кулдауна оповещений игрока: когда ушло последнее сообщение и что
      * накопилось с тех пор (сколько необычных ударов подавлено, их результат).
-     * Трогается только на главном потоке (handlePrediction, resetFlags).
+     * Трогается только на главном потоке (handlePrediction, resetFlags →
+     * flushPendingAlert).
      */
     private class AlertState {
         var lastAlertTimeMillis: Long = 0L // 0 = ещё не оповещали
@@ -433,18 +434,22 @@ class DetectionEngine(
      */
     fun handlePrediction(attacker: Player, probability: Double): Boolean {
         val average = getAveragePrediction(attacker) ?: probability
+        val confirmedBefore = punishProgress[attacker.uniqueId]?.confirmed ?: 0
         val progress = updatePunishProgress(attacker.uniqueId, probability)
+        // Засчитано новое независимое окно ≤ punishThreshold — событие важнее кулдауна:
+        // админ должен увидеть «окна 2/2 — наказание» до кика, а не после него.
+        val seriesGrew = progress.confirmed > confirmedBefore
 
         // Оповещение об ударе ≥ flag-threshold, но не чаще alert-cooldown-seconds на
         // игрока: вердикты приходят на каждый удар (окна перекрываются), и без кулдауна
         // подозрительный игрок сыпал бы по несколько сообщений в секунду в чат админов
         // и консоль. Первый удар кулдаун-окна оповещается мгновенно; остальные за окно
-        // не теряются — идут агрегатом в следующее сообщение. На детекцию кулдаун не
-        // влияет: punish-progress обновлён выше, наказание работает как раньше.
+        // не теряются — идут агрегатом в следующее сообщение. Рост серии (seriesGrew)
+        // проходит мимо кулдауна. На детекцию кулдаун не влияет: punish-progress
+        // обновлён выше, наказание работает как раньше.
         if (probability >= flagThreshold) {
-            buildAlert(attacker, probability, average, progress)?.let { message ->
-                Bukkit.getOnlinePlayers().filter { it.hasPermission(Permissions.ALERTS) }.forEach { it.sendMessage(message) }
-                plugin.logger.warning(message.replace(colorCodes, ""))
+            buildAlert(attacker, probability, average, progress, seriesGrew)?.let { message ->
+                sendAlert(message)
             }
         }
 
@@ -461,6 +466,9 @@ class DetectionEngine(
      * Кулдаун оповещений: первый удар ≥ flag-threshold за кулдаун-интервал
      * отправляется немедленно, остальные за интервал подавляются, запоминаются
      * (количество и максимальный скор) и агрегируются в следующее сообщение.
+     * Рост серии подтверждений ([seriesGrew]) проходит мимо кулдауна и заодно
+     * выпускает накопленный агрегат.
+     *
      * Возвращает null, если удар попал под кулдаун: текст не отправлен, но сама
      * детекция уже сработала — punish-progress в handlePrediction обновлён.
      */
@@ -469,6 +477,7 @@ class DetectionEngine(
         probability: Double,
         average: Double,
         progress: PunishProgress,
+        seriesGrew: Boolean,
     ): String? {
         if (alertCooldownSeconds <= 0) {
             // Кулдаун выключен: сообщение на каждый удар, как и раньше.
@@ -476,7 +485,12 @@ class DetectionEngine(
         }
         val state = alertStates.computeIfAbsent(attacker.uniqueId) { AlertState() }
         val now = clock()
-        if (now - state.lastAlertTimeMillis < alertCooldownSeconds * 1000L) {
+        // lastAlertTimeMillis == 0L — «оповещений ещё не было», это НЕ кулдаун.
+        // Явная проверка нужна, чтобы на часах, отсчитывающих время от малого
+        // значения (тестовый шов clock), первое оповещение не подавилось.
+        val cooldownPassed = state.lastAlertTimeMillis == 0L ||
+                now - state.lastAlertTimeMillis >= alertCooldownSeconds * 1000L
+        if (!cooldownPassed && !seriesGrew) {
             state.suppressedEvents++
             state.suppressedMaxScore = maxOf(state.suppressedMaxScore, probability)
             return null
@@ -489,6 +503,41 @@ class DetectionEngine(
         state.suppressedEvents = 0
         state.suppressedMaxScore = 0.0
         return formatAlert(attacker, probability, average, progress, suppressedEvents, suppressedMaxScore, sinceLastAlertSeconds)
+    }
+
+    /**
+     * Рассылает оповещение обладателям daynac.alerts и пишет очищенный от цветовых
+     * кодов текст в консольный лог. log=false — для уведомлений, у которых своя
+     * консольная строка уже есть (наказание логируется ветками punishPlayer).
+     */
+    private fun sendAlert(message: String, log: Boolean = true) {
+        Bukkit.getOnlinePlayers().filter { it.hasPermission(Permissions.ALERTS) }.forEach { it.sendMessage(message) }
+        if (log) plugin.logger.warning(message.replace(colorCodes, ""))
+    }
+
+    /**
+     * Итоговый выпуск агрегата подавленных кулдауном ударов при окончании боя —
+     * сброс по простою, наказание не случилось или ручная очистка флагов. Без
+     * этого suppressedEvents жили до следующего подозрительного удара, а тот мог
+     * не наступить: подавленная активность пропадала бы из поля зрения админов
+     * навсегда (состояние умирает в TTL-чистке). После выпуска кулдаун снимается
+     * целиком — первый подозрительный удар нового боя оповещает мгновенно.
+     */
+    private fun flushPendingAlert(playerId: UUID) {
+        val state = alertStates[playerId] ?: return
+        val pendingEvents = state.suppressedEvents
+        val pendingMaxScore = state.suppressedMaxScore
+        state.suppressedEvents = 0
+        state.suppressedMaxScore = 0.0
+        state.lastAlertTimeMillis = 0L
+        if (pendingEvents == 0) return
+        // Имя нужно для текста; не в сети (например, цель ручной очистки) —
+        // выпускать некуда, состояние по-прежнему очищено.
+        val name = Bukkit.getPlayer(playerId)?.name ?: return
+        sendAlert(
+            "[DaynAC] §c$name§7: подозрительная серия окончена — ещё §c$pendingEvents§7 необычных ударов не показано, макс §e" +
+                    String.format(Locale.US, "%.2f", pendingMaxScore) + "§7"
+        )
     }
 
     /**
@@ -528,10 +577,12 @@ class DetectionEngine(
         }
         if (suppressedEvents > 0) {
             // Удары, скрытые кулдауном, показываются как агрегат, чтобы картина
-            // не занижала активность читера. Не нулевой suppressedEvents возможен
-            // только когда оповещение уже отправлялось, поэтому
-            // sinceLastAlertSeconds > 0 гарантировано.
-            append(" §8[ещё §c$suppressedEvents§8 уд. за §f$sinceLastAlertSeconds§8с§8, макс §e")
+            // не занижала активность читера. С байпасом агрегат может уйти
+            // в тот же тик, когда накопился (sinceLastAlertSeconds == 0) —
+            // показываем «<1 с» честно.
+            append(" §8[ещё §c$suppressedEvents§8 уд. за §f")
+            append(if (sinceLastAlertSeconds <= 0) "<1 с" else "$sinceLastAlertSeconds с")
+            append("§8, макс §e")
             append(String.format(Locale.US, "%.2f", suppressedMaxScore))
             append("§8]")
         }
@@ -649,6 +700,19 @@ class DetectionEngine(
             }
         }
 
+        // Уведомление админам в чат о факте наказания: обычные оповещения могли
+        // быть подавлены кулдауном прямо перед киком/баном, и без этой строки
+        // наказание видно только в консоли. Консольный лог дублирующего текста
+        // избегаем (log = false) — у веток выше он уже есть.
+        sendAlert(
+            "[DaynAC] §4" + player.name + when {
+                punishAction == "kick" -> "§7: авто-кик — средний скор §e"
+                punishAction == "ban" && banWithIp -> "§7: авто-бан (профиль + IP) — средний скор §e"
+                else -> "§7: авто-бан — средний скор §e"
+            } + percent + "%§7",
+            log = false
+        )
+
         // Кик/бан — игрока на сервере больше нет: убираем из GUI и tracking-карт
         predictions.remove(player.uniqueId)
         scoreHistory.remove(player.uniqueId)
@@ -686,10 +750,21 @@ class DetectionEngine(
      * «Последние удары» и «Макс» переживают сброс. В карточке такой игрок
      * показан как «Флаги сняты после простоя».
      *
+     * Кулдаун оповещений завершается [flushPendingAlert]: накопленный агрегат
+     * подавленных ударов уходит админам итоговым сообщением (иначе он бы не
+     * показался никогда — нового подозрительного удара может не быть), после
+     * чего кулдаун снят целиком и первый подозрительный удар нового боя
+     * оповещает мгновенно.
+     *
      * Окно ударов (HitTracker) и тайминги (SnapshotTracker) чистит вызывающая
      * сторона — движок их не знает.
      */
     fun resetFlags(playerId: UUID, keepCarryOver: Boolean = true) {
+        // Бой окончен — последняя возможность показать подавленную кулдауном
+        // активность: без выпуска она пропала бы, если новый подозрительный
+        // удар не наступит. Агрегат уходит админам итоговым сообщением,
+        // кулдаун снимается целиком.
+        flushPendingAlert(playerId)
         if (keepCarryOver) {
             // Читер не должен получать «чистый лист» после 30 секунд тишины: иначе первые
             // windowSize ударов каждого нового боя идут без вердикта и без снижения урона.
@@ -710,14 +785,6 @@ class DetectionEngine(
             // если активных предсказаний уже нет — запись могла остаться от прошлого
             // сброса по простою и продолжила бы снижать урон в новом бою.
             carryOver.remove(playerId)
-        }
-        // Незавершённый кулдаун оповещений: агрегат подавленных ударов прошлого боя
-        // не должен вливаться в первое сообщение нового. Само время кулдауна не
-        // трогаем: оно по часам, а простой обычно дольше кулдауна — первое
-        // оповещение нового боя всё равно мгновенно.
-        alertStates[playerId]?.let {
-            it.suppressedEvents = 0
-            it.suppressedMaxScore = 0.0
         }
         predictions.remove(playerId)
         lastHitTimes.remove(playerId)

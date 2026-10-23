@@ -447,7 +447,9 @@ class DetectionEngineTest {
         onlinePlayers += admin
         val p = player("Cheater")
 
-        repeat(10) { engine.handlePrediction(p, 0.9) }
+        // 0.6 выше flag (0.5), но ниже punish (0.75): серия не растёт и байпас
+        // кулдауна не затрагивается.
+        repeat(10) { engine.handlePrediction(p, 0.6) }
 
         // Первый удар ≥ flag-threshold оповещает мгновенно; остальные 9 происходят
         // в тот же момент фейковых часов (внутри кулдауна 5 с) и не создают
@@ -501,22 +503,62 @@ class DetectionEngineTest {
     }
 
     @Test
-    fun `idle reset drops pending suppressed aggregate`() {
-        val engine = createEngine(custom(), windowSize = 4)
+    fun `punish confirmation bypasses alert cooldown`() {
+        val engine = createEngine(custom(), windowSize = 2)
         val admin = alertAdmin()
         onlinePlayers += admin
         val p = player("Cheater")
 
-        engine.handlePrediction(p, 0.9)  // оповещение
-        engine.handlePrediction(p, 0.81) // подавлен кулдауном — стал бы агрегатом
-        engine.resetFlags(p.uniqueId)    // сброс по простою: начался новый бой
+        engine.handlePrediction(p, 0.6) // обычный подозрительный удар: алерт, кулдаун активен
+        val opensSeries = engine.handlePrediction(p, 0.8) // 0→1: рост — мимо кулдауна
+        assertFalse(opensSeries, "одно окно пока не наказание")
+        engine.handlePrediction(p, 0.6) // внутри кулдауна: подавлен, запомнен как агрегат
+        val punished = engine.handlePrediction(p, 0.8) // 1→2: рост — мимо кулдауна
 
-        now = 1_000_000L + 6_000 // кулдаун истёк
-        engine.handlePrediction(p, 0.9)
+        assertTrue(punished, "ветка наказания сработала")
+        val captor = argumentCaptor<String>()
+        verify(admin, times(3)).sendMessage(captor.capture())
+        val plain = captor.thirdValue.replace(Regex("§[0-9a-f]"), "")
+        assertTrue(plain.contains("2/2"), "статус окон 2/2 виден админам вовремя")
+        assertTrue(plain.contains("наказание"), "статус «наказание» виден до кика")
+        assertTrue(plain.contains("ещё 1"), "байпас выпуска накопленный агрегат")
+    }
+
+    @Test
+    fun `punishment sends chat notice to admins`() {
+        val engine = createEngine()
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+
+        engine.punishPlayer(p)
+
+        verify(admin).sendMessage(contains("авто-кик"))
+        // Уведомление не дублируется в лог: у ветки наказания своя консольная строка.
+        verify(logger, times(1)).warning(any<String>())
+    }
+
+    @Test
+    fun `idle reset flushes pending suppressed aggregate`() {
+        val engine = createEngine(custom(), windowSize = 4)
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+        bukkit.`when`<Player?> { Bukkit.getPlayer(p.uniqueId) }.thenReturn(p)
+
+        engine.handlePrediction(p, 0.9)  // оповещение (рост серии 0→1 — тоже мимо кулдауна)
+        engine.handlePrediction(p, 0.81) // подавлен кулдауном
+        engine.resetFlags(p.uniqueId)    // бой окончен: итоговое сообщение с агрегатом
+
+        now = 1_000_000L + 6_000 // новый бой, кулдаун снят целиком
+        engine.handlePrediction(p, 0.9) // мгновенное оповещение без агрегата
 
         val captor = argumentCaptor<String>()
-        verify(admin, times(2)).sendMessage(captor.capture())
-        assertFalse(captor.secondValue.contains("ещё"), "агрегат прошлого боя не вливается в новый")
+        verify(admin, times(3)).sendMessage(captor.capture())
+        val flushed = captor.secondValue.replace(Regex("§[0-9a-f]"), "")
+        assertTrue(flushed.contains("ещё 1"), "итоговое сообщение показывает подавленный удар")
+        assertTrue(flushed.contains("0.81"), "максимум среди подавленных ударов")
+        assertFalse(captor.thirdValue.contains("ещё"), "новый бой начинается с чистым листом оповещений")
     }
 
     // --- Серия независимых окон для наказания ------------------------------
