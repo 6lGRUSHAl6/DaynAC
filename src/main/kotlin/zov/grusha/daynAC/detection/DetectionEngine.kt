@@ -69,6 +69,15 @@ class DetectionEngine(
     val punishConfirmWindows: Int
 
     /**
+     * Кулдаун оповещений об одном игроке, секунды (0 = оповещение на каждый удар
+     * ≥ [flagThreshold] — прежнее поведение, заметный спам при высокой CPS). Первый
+     * подозрительный удар оповещает мгновенно; удары, пришедшие внутри кулдауна,
+     * не теряются — суммируются в следующее оповещение. Кулдаун трогает только
+     * сообщения: снижение урона, punish-progress и наказание работают без изменений.
+     */
+    val alertCooldownSeconds: Int
+
+    /**
      * Простой в секундах, после которого с игрока снимаются флаги и окно ударов
      * начинается заново (0 = сброс выключен). См. [isIdle] и [resetFlags].
      */
@@ -101,6 +110,7 @@ class DetectionEngine(
         punishThreshold = config.getDouble("detection.punish-threshold", 0.95)
         maxRecentPredictions = config.getInt("detection.max-recent-predictions", 10)
         punishConfirmWindows = config.getInt("detection.punish-confirm-windows", 2)
+        alertCooldownSeconds = config.getInt("detection.alert-cooldown-seconds", 5)
         inactivityResetSeconds = config.getInt("detection.inactivity-reset-seconds", 30)
         carryOverSeconds = config.getInt("detection.carry-over-seconds", 600)
         punishEnabled = config.getBoolean("detection.punish-enabled", true)
@@ -130,6 +140,7 @@ class DetectionEngine(
         }
         require(carryOverSeconds >= 0) { "detection.carry-over-seconds должен быть ≥ 0 (0 = выключен), получено $carryOverSeconds" }
         require(punishConfirmWindows >= 1) { "detection.punish-confirm-windows должен быть ≥ 1, получено $punishConfirmWindows" }
+        require(alertCooldownSeconds >= 0) { "detection.alert-cooldown-seconds должен быть ≥ 0 (0 = без кулдауна), получено $alertCooldownSeconds" }
         require(windowSize >= 1) { "windowSize должен быть ≥ 1, получено $windowSize" }
         require(maxRecentPredictions >= 1) { "detection.max-recent-predictions должен быть ≥ 1, получено $maxRecentPredictions" }
         require(inactivityResetSeconds >= 0) { "detection.inactivity-reset-seconds должен быть ≥ 0 (0 = выключен), получено $inactivityResetSeconds" }
@@ -149,6 +160,9 @@ class DetectionEngine(
      * решений, и должен переживать сброс по простою.
      */
     private val maxScoreHistory = 100
+
+    /** Цветовые коды Minecraft — вычищаются, когда оповещение пишется в консольный лог. */
+    private val colorCodes = Regex("§[0-9a-f]")
 
     /**
      * АКТИВНЫЕ предсказания по игрокам — то, чем движок реально руководствуется:
@@ -186,6 +200,19 @@ class DetectionEngine(
     }
 
     private val punishProgress = ConcurrentHashMap<UUID, PunishProgress>()
+
+    /**
+     * Состояние кулдауна оповещений игрока: когда ушло последнее сообщение и что
+     * накопилось с тех пор (сколько необычных ударов подавлено, их результат).
+     * Трогается только на главном потоке (handlePrediction, resetFlags).
+     */
+    private class AlertState {
+        var lastAlertTimeMillis: Long = 0L // 0 = ещё не оповещали
+        var suppressedEvents: Int = 0
+        var suppressedMaxScore: Double = 0.0
+    }
+
+    private val alertStates = ConcurrentHashMap<UUID, AlertState>()
 
     /** Скор игрока на момент сброса по простою и время сброса — см. [carryOverSeconds]. */
     private class CarryOver(val score: Double, val timeMillis: Long)
@@ -233,40 +260,6 @@ class DetectionEngine(
     }
 
     /**
-     * Снимает с игрока флаги после простоя: активные предсказания стираются,
-     * поэтому урон снова проходит целиком, а автонаказание не срабатывает, пока
-     * игрок не наберёт окно ударов заново ([FeatureExtractor.extract] до этого
-     * возвращает null — предсказаний нет).
-     *
-     * Журнал ([scoreHistory]) и счётчик ударов ([hitCounts]) СОЗНАТЕЛЬНО остаются:
-     * это витрина админа в /daynac allinfo — игрок не исчезает из списка, а его
-     * «Последние удары» и «Макс» переживают сброс. В карточке такой игрок
-     * показан как «Флаги сняты после простоя».
-     *
-     * Окно ударов (HitTracker) и тайминги (SnapshotTracker) чистит вызывающая
-     * сторона — движок их не знает.
-     */
-    fun resetFlags(playerId: UUID) {
-        // Читер не должен получать «чистый лист» после 30 секунд тишины: иначе первые
-        // windowSize ударов каждого нового боя идут без вердикта и без снижения урона.
-        // Запоминаем средний скор перед сбросом; затухает за carryOverSeconds.
-        predictions[playerId]?.let { deque ->
-            val snapshot = synchronized(deque) { deque.toList() }
-            if (snapshot.isNotEmpty()) {
-                val average = snapshot.sumOf { it.probability } / snapshot.size
-                if (carryOverSeconds > 0 && average >= reduceThreshold) {
-                    carryOver[playerId] = CarryOver(average, clock())
-                } else {
-                    carryOver.remove(playerId) // последнее окно было чистым — подозрение снято
-                }
-            }
-        }
-        predictions.remove(playerId)
-        lastHitTimes.remove(playerId)
-        punishProgress.remove(playerId) // окно ударов начинается заново — серия подтверждений тоже
-    }
-
-    /**
      * Удаляет записи о неактивных игроках старше TTL. Предсказания и счётчики
      * ударов сохраняются после выхода игрока специально (GUI показывает и
      * оффлайн-игроков), но без ограничения срока они копятся бесконечно на
@@ -296,6 +289,12 @@ class DetectionEngine(
         lastHitTimes.keys.retainAll { uuid ->
             scoreHistory.containsKey(uuid) || predictions.containsKey(uuid) ||
                     hitCounts.containsKey(uuid) || Bukkit.getPlayer(uuid) != null
+        }
+        // Кулдаун оповещений чистится вместе с прочим отслеживанием: у забытого
+        // игрока (оффлайн, без предсказаний и истории) состояние не нужно. Сброс
+        // по простою состояние переживает — scoreHistory его «держит» живым.
+        alertStates.keys.retainAll { uuid ->
+            scoreHistory.containsKey(uuid) || predictions.containsKey(uuid) || Bukkit.getPlayer(uuid) != null
         }
         punishProgress.keys.retainAll { uuid -> predictions.containsKey(uuid) }
         carryOver.entries.removeIf { now - it.value.timeMillis >= carryOverSeconds * 1000L }
@@ -436,38 +435,17 @@ class DetectionEngine(
         val average = getAveragePrediction(attacker) ?: probability
         val progress = updatePunishProgress(attacker.uniqueId, probability)
 
-        // Мгновенное оповещение на каждый необычный удар — без таймеров и кулдаунов:
-        // скор этого удара превысил flag-threshold => пишем сразу
+        // Оповещение об ударе ≥ flag-threshold, но не чаще alert-cooldown-seconds на
+        // игрока: вердикты приходят на каждый удар (окна перекрываются), и без кулдауна
+        // подозрительный игрок сыпал бы по несколько сообщений в секунду в чат админов
+        // и консоль. Первый удар кулдаун-окна оповещается мгновенно; остальные за окно
+        // не теряются — идут агрегатом в следующее сообщение. На детекцию кулдаун не
+        // влияет: punish-progress обновлён выше, наказание работает как раньше.
         if (probability >= flagThreshold) {
-            // Сводка по последним 4 ударам — динамика вокруг необычного удара
-            val recent4 = getRecentPredictions(attacker.uniqueId).takeLast(4)
-            val scoresLine = recent4.joinToString(" ") { score ->
-                scoreColor(score) + String.format(Locale.US, "%.2f", score)
+            buildAlert(attacker, probability, average, progress)?.let { message ->
+                Bukkit.getOnlinePlayers().filter { it.hasPermission(Permissions.ALERTS) }.forEach { it.sendMessage(message) }
+                plugin.logger.warning(message.replace(colorCodes, ""))
             }
-
-            val message = buildString {
-                append("[DaynAC] §c")
-                append(attacker.name)
-                append("§7: необычный удар §e")
-                append(String.format(Locale.US, "%.3f", probability))
-                append("§7 > порога §f")
-                append(flagThreshold)
-                append("§7 — последние удары: ")
-                append(scoresLine)
-                append("§7 (средний: §e")
-                append(String.format(Locale.US, "%.3f", average))
-                append("§7)")
-                if (progress.confirmed > 0) {
-                    val status = when {
-                        progress.confirmed >= punishConfirmWindows -> "§cнаказание"
-                        progress.verdictsSinceConfirm >= windowSize -> "§7проверка окна сейчас"
-                        else -> "§7следующее окно через ${windowSize - progress.verdictsSinceConfirm} уд."
-                    }
-                    append(" §8[окна для наказания: §c${progress.confirmed}§8/$punishConfirmWindows§8, $status§8]")
-                }
-            }
-            Bukkit.getOnlinePlayers().filter { it.hasPermission(Permissions.ALERTS) }.forEach { it.sendMessage(message) }
-            plugin.logger.warning(message.replace("§[0-9a-f]".toRegex(), ""))
         }
 
         // Автонаказание: нужны punishConfirmWindows независимых окон подряд ≥ punishThreshold.
@@ -477,6 +455,86 @@ class DetectionEngine(
         val confirmed = progress.confirmed >= punishConfirmWindows
         if (confirmed) punishProgress.remove(attacker.uniqueId)
         return punishEnabled && confirmed
+    }
+
+    /**
+     * Кулдаун оповещений: первый удар ≥ flag-threshold за кулдаун-интервал
+     * отправляется немедленно, остальные за интервал подавляются, запоминаются
+     * (количество и максимальный скор) и агрегируются в следующее сообщение.
+     * Возвращает null, если удар попал под кулдаун: текст не отправлен, но сама
+     * детекция уже сработала — punish-progress в handlePrediction обновлён.
+     */
+    private fun buildAlert(
+        attacker: Player,
+        probability: Double,
+        average: Double,
+        progress: PunishProgress,
+    ): String? {
+        if (alertCooldownSeconds <= 0) {
+            // Кулдаун выключен: сообщение на каждый удар, как и раньше.
+            return formatAlert(attacker, probability, average, progress, 0, 0.0, 0)
+        }
+        val state = alertStates.computeIfAbsent(attacker.uniqueId) { AlertState() }
+        val now = clock()
+        if (now - state.lastAlertTimeMillis < alertCooldownSeconds * 1000L) {
+            state.suppressedEvents++
+            state.suppressedMaxScore = maxOf(state.suppressedMaxScore, probability)
+            return null
+        }
+        val suppressedEvents = state.suppressedEvents
+        val suppressedMaxScore = state.suppressedMaxScore
+        val sinceLastAlertSeconds =
+            if (state.lastAlertTimeMillis > 0L) ((now - state.lastAlertTimeMillis) / 1000L).toInt() else 0
+        state.lastAlertTimeMillis = now
+        state.suppressedEvents = 0
+        state.suppressedMaxScore = 0.0
+        return formatAlert(attacker, probability, average, progress, suppressedEvents, suppressedMaxScore, sinceLastAlertSeconds)
+    }
+
+    /**
+     * Текст оповещения: текущий удар, динамика последних 4 хитов, среднее,
+     * прогресс окон наказания и агрегат ударов, не показанных из-за кулдауна.
+     */
+    private fun formatAlert(
+        attacker: Player,
+        probability: Double,
+        average: Double,
+        progress: PunishProgress,
+        suppressedEvents: Int,
+        suppressedMaxScore: Double,
+        sinceLastAlertSeconds: Int,
+    ): String = buildString {
+        append("[DaynAC] §c")
+        append(attacker.name)
+        append("§7: необычный удар §e")
+        append(String.format(Locale.US, "%.3f", probability))
+        append("§7 > порога §f")
+        append(String.format(Locale.US, "%.2f", flagThreshold))
+        append("§7 — последние удары: ")
+        // Сводка по последним 4 ударам — динамика вокруг необычного удара
+        getRecentPredictions(attacker.uniqueId).takeLast(4).joinTo(this, " ") { score ->
+            scoreColor(score) + String.format(Locale.US, "%.2f", score)
+        }
+        append("§7 (средний: §e")
+        append(String.format(Locale.US, "%.3f", average))
+        append("§7)")
+        if (progress.confirmed > 0) {
+            val status = when {
+                progress.confirmed >= punishConfirmWindows -> "§cнаказание"
+                progress.verdictsSinceConfirm >= windowSize -> "§7проверка окна сейчас"
+                else -> "§7следующее окно через ${windowSize - progress.verdictsSinceConfirm} уд."
+            }
+            append(" §8[окна для наказания: §c${progress.confirmed}§8/$punishConfirmWindows§8, $status§8]")
+        }
+        if (suppressedEvents > 0) {
+            // Удары, скрытые кулдауном, показываются как агрегат, чтобы картина
+            // не занижала активность читера. Не нулевой suppressedEvents возможен
+            // только когда оповещение уже отправлялось, поэтому
+            // sinceLastAlertSeconds > 0 гарантировано.
+            append(" §8[ещё §c$suppressedEvents§8 уд. за §f$sinceLastAlertSeconds§8с§8, макс §e")
+            append(String.format(Locale.US, "%.2f", suppressedMaxScore))
+            append("§8]")
+        }
     }
 
     /**
@@ -598,6 +656,7 @@ class DetectionEngine(
         lastHitTimes.remove(player.uniqueId)
         punishProgress.remove(player.uniqueId)
         carryOver.remove(player.uniqueId)
+        alertStates.remove(player.uniqueId)
     }
 
     /** Запасной путь наказания: команда от имени консоли (причина — одной строкой). Только с главного потока. */
@@ -651,6 +710,14 @@ class DetectionEngine(
             // если активных предсказаний уже нет — запись могла остаться от прошлого
             // сброса по простою и продолжила бы снижать урон в новом бою.
             carryOver.remove(playerId)
+        }
+        // Незавершённый кулдаун оповещений: агрегат подавленных ударов прошлого боя
+        // не должен вливаться в первое сообщение нового. Само время кулдауна не
+        // трогаем: оно по часам, а простой обычно дольше кулдауна — первое
+        // оповещение нового боя всё равно мгновенно.
+        alertStates[playerId]?.let {
+            it.suppressedEvents = 0
+            it.suppressedMaxScore = 0.0
         }
         predictions.remove(playerId)
         lastHitTimes.remove(playerId)

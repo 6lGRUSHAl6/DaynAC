@@ -14,6 +14,7 @@ import org.mockito.ArgumentMatchers.contains
 import org.mockito.MockedStatic
 import org.mockito.Mockito
 import org.mockito.kotlin.any
+import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.doAnswer
 import org.mockito.kotlin.doThrow
 import org.mockito.kotlin.eq
@@ -98,7 +99,8 @@ class DetectionEngineTest {
         action: String = "kick",
         banWithIp: Boolean = false,
         carryOver: Int = 60,
-        inactivity: Int = 30
+        inactivity: Int = 30,
+        alertCooldown: Int = 5
     ): String = """
         detection:
           flag-threshold: 0.5
@@ -107,6 +109,7 @@ class DetectionEngineTest {
           punish-threshold: 0.75
           max-recent-predictions: $maxRecent
           punish-confirm-windows: $confirmWindows
+          alert-cooldown-seconds: $alertCooldown
           inactivity-reset-seconds: $inactivity
           carry-over-seconds: $carryOver
           punish-enabled: $punishEnabled
@@ -187,6 +190,7 @@ class DetectionEngineTest {
         assertEquals(0.95, engine.punishThreshold)
         assertEquals(10, engine.maxRecentPredictions)
         assertEquals(2, engine.punishConfirmWindows)
+        assertEquals(5, engine.alertCooldownSeconds)
         assertEquals(30, engine.inactivityResetSeconds)
         assertEquals(600, engine.carryOverSeconds)
         assertTrue(engine.punishEnabled)
@@ -434,6 +438,85 @@ class DetectionEngineTest {
         verify(admin).sendMessage(contains("0.800"))
         verify(admin).sendMessage(contains("средний"))
         verify(admin).sendMessage(contains("окна для наказания"))
+    }
+
+    @Test
+    fun `alert cooldown throttles repeated flagged hits`() {
+        val engine = createEngine(custom(), windowSize = 4)
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+
+        repeat(10) { engine.handlePrediction(p, 0.9) }
+
+        // Первый удар ≥ flag-threshold оповещает мгновенно; остальные 9 происходят
+        // в тот же момент фейковых часов (внутри кулдауна 5 с) и не создают
+        // ни сообщения админам, ни строки в консольном логе.
+        verify(admin, times(1)).sendMessage(any<String>())
+        verify(logger, times(1)).warning(any<String>())
+    }
+
+    @Test
+    fun `alert cooldown aggregates suppressed hits in next message`() {
+        val engine = createEngine(custom(), windowSize = 4)
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+
+        engine.handlePrediction(p, 0.9) // мгновенное оповещение
+        engine.handlePrediction(p, 0.81) // кулдаун: подавлен и запомнен
+        engine.handlePrediction(p, 0.99) // кулдаун: подавлен, становится максимумом
+
+        now = 1_000_000L + 6_000 // 6 с спустя — кулдаун (5 с) истёк
+        engine.handlePrediction(p, 0.87) // новое оповещение с агрегатом
+
+        val captor = argumentCaptor<String>()
+        verify(admin, times(2)).sendMessage(captor.capture())
+        // Без цветовых кодов — чтобы проверять текст, а не раскраску.
+        val plain = captor.secondValue.replace(Regex("§[0-9a-f]"), "")
+        assertFalse(captor.firstValue.contains("ещё"), "у первого оповещения агрегата нет")
+        assertTrue(plain.contains("ещё 2"), "число подавленных кулдауном ударов")
+        assertTrue(plain.contains("0.99"), "максимальный скор среди подавленных")
+    }
+
+    @Test
+    fun `cooldown zero alerts on every flagged hit`() {
+        val engine = createEngine(custom(alertCooldown = 0))
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+
+        repeat(3) { engine.handlePrediction(p, 0.9) }
+
+        // 0 = прежнее поведение: оповещение на каждый удар без кулдауна.
+        verify(admin, times(3)).sendMessage(any<String>())
+        verify(logger, times(3)).warning(any<String>())
+    }
+
+    @Test
+    fun `alert cooldown must not be negative`() {
+        assertFailsWith<IllegalArgumentException> {
+            createEngine("detection:\n  alert-cooldown-seconds: -1")
+        }
+    }
+
+    @Test
+    fun `idle reset drops pending suppressed aggregate`() {
+        val engine = createEngine(custom(), windowSize = 4)
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+
+        engine.handlePrediction(p, 0.9)  // оповещение
+        engine.handlePrediction(p, 0.81) // подавлен кулдауном — стал бы агрегатом
+        engine.resetFlags(p.uniqueId)    // сброс по простою: начался новый бой
+
+        now = 1_000_000L + 6_000 // кулдаун истёк
+        engine.handlePrediction(p, 0.9)
+
+        val captor = argumentCaptor<String>()
+        verify(admin, times(2)).sendMessage(captor.capture())
+        assertFalse(captor.secondValue.contains("ещё"), "агрегат прошлого боя не вливается в новый")
     }
 
     // --- Серия независимых окон для наказания ------------------------------

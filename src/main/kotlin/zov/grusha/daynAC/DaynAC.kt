@@ -387,7 +387,8 @@ class DaynAC : JavaPlugin(), Listener {
                             }
                             append("[DaynAC] Пороги: flag ${detectionEngine.flagThreshold} / reduce ${detectionEngine.reduceThreshold}" +
                                     " / cancel ${detectionEngine.cancelThreshold} / punish ${detectionEngine.punishThreshold}" +
-                                    " / окно усреднения ${detectionEngine.maxRecentPredictions}")
+                                    " / окно усреднения ${detectionEngine.maxRecentPredictions}" +
+                                    " / кулдаун алертов ${detectionEngine.alertCooldownSeconds} с")
                             appendLine()
                             append("[DaynAC] Наказание: " + when {
                                 !detectionEngine.punishEnabled -> "§eВЫКЛЮЧЕНО (режим наблюдения)"
