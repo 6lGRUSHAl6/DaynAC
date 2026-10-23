@@ -503,25 +503,71 @@ class DetectionEngineTest {
     }
 
     @Test
-    fun `punish confirmation bypasses alert cooldown`() {
+    fun `final punish confirmation bypasses alert cooldown`() {
         val engine = createEngine(custom(), windowSize = 2)
         val admin = alertAdmin()
         onlinePlayers += admin
         val p = player("Cheater")
 
         engine.handlePrediction(p, 0.6) // обычный подозрительный удар: алерт, кулдаун активен
-        val opensSeries = engine.handlePrediction(p, 0.8) // 0→1: рост — мимо кулдауна
-        assertFalse(opensSeries, "одно окно пока не наказание")
-        engine.handlePrediction(p, 0.6) // внутри кулдауна: подавлен, запомнен как агрегат
-        val punished = engine.handlePrediction(p, 0.8) // 1→2: рост — мимо кулдауна
+        engine.handlePrediction(p, 0.8) // открытие серии (0→1) — под кулдауном, как обычное оповещение
+        engine.handlePrediction(p, 0.6) // тоже под кулдауном: подавлен, запомнен как агрегат
+        val punished = engine.handlePrediction(p, 0.8) // 1→2 — последнее окно перед наказанием
 
         assertTrue(punished, "ветка наказания сработала")
         val captor = argumentCaptor<String>()
-        verify(admin, times(3)).sendMessage(captor.capture())
-        val plain = captor.thirdValue.replace(Regex("§[0-9a-f]"), "")
+        verify(admin, times(2)).sendMessage(captor.capture())
+        val plain = captor.secondValue.replace(Regex("§[0-9a-f]"), "")
         assertTrue(plain.contains("2/2"), "статус окон 2/2 виден админам вовремя")
         assertTrue(plain.contains("наказание"), "статус «наказание» виден до кика")
-        assertTrue(plain.contains("ещё 1"), "байпас выпуска накопленный агрегат")
+        assertTrue(plain.contains("ещё 2"), "байпас выпустил накопленный агрегат")
+    }
+
+    @Test
+    fun `observation mode keeps cooldown on punish-threshold hits`() {
+        // punish-enabled: false: серия расходуется при подтверждении и открывается
+        // заново каждые ~windowSize ударов. Рост без наказания не байпасится —
+        // иначе наблюдательный режим возвращал бы спам.
+        val engine = createEngine(custom(punishEnabled = false), windowSize = 2)
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+
+        // 20 ударов = около десятка циклов open→confirm→open.
+        repeat(20) { engine.handlePrediction(p, 0.9) }
+
+        verify(admin, times(1)).sendMessage(any<String>())
+        verify(logger, times(1)).warning(any<String>())
+    }
+
+    @Test
+    fun `punish action none keeps cooldown on punish-threshold hits`() {
+        // punish-action: none: серия циклится так же, как при punish-enabled: false.
+        val engine = createEngine(custom(action = "none"), windowSize = 2)
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+
+        repeat(20) { engine.handlePrediction(p, 0.9) }
+
+        verify(admin, times(1)).sendMessage(any<String>())
+        verify(logger, times(1)).warning(any<String>())
+    }
+
+    @Test
+    fun `first alert is instant even with small clock origin`() {
+        // lastAlertTimeMillis == 0 нельзя считать активным кулдауном: на часах,
+        // отсчитываемых от малого значения (шов clock в тестах), проверка
+        // now - 0 < cooldown подавила бы первое оповещение.
+        now = 2_500
+        val engine = createEngine(custom())
+        val admin = alertAdmin()
+        onlinePlayers += admin
+        val p = player("Cheater")
+
+        engine.handlePrediction(p, 0.6)
+
+        verify(admin, times(1)).sendMessage(any<String>())
     }
 
     @Test

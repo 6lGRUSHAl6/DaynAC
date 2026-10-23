@@ -436,19 +436,28 @@ class DetectionEngine(
         val average = getAveragePrediction(attacker) ?: probability
         val confirmedBefore = punishProgress[attacker.uniqueId]?.confirmed ?: 0
         val progress = updatePunishProgress(attacker.uniqueId, probability)
-        // Засчитано новое независимое окно ≤ punishThreshold — событие важнее кулдауна:
-        // админ должен увидеть «окна 2/2 — наказание» до кика, а не после него.
         val seriesGrew = progress.confirmed > confirmedBefore
+        // Байпас кулдауна заслуживает только предвестие РЕАЛЬНОГО наказания:
+        // засчитано последнее окно серии, кик/бан сейчас произойдёт. Байпас на
+        // любой рост (включая открытие 0→1) недопустим: серия «расходуется»
+        // в handlePrediction независимо от punish-enabled и punish-action, поэтому
+        // в режимах наблюдения (punish-enabled: false, punish-action: none)
+        // новая серия открывается каждые ~windowSize ударов, и байпас возвращал
+        // бы спам (с punish-confirm-windows: 1 — на каждый удар ≥ punishThreshold).
+        // Там кулдаун обязателен для всех сообщений.
+        val isEscalation = punishEnabled && punishAction != "none" &&
+                seriesGrew && progress.confirmed >= punishConfirmWindows
 
         // Оповещение об ударе ≥ flag-threshold, но не чаще alert-cooldown-seconds на
         // игрока: вердикты приходят на каждый удар (окна перекрываются), и без кулдауна
         // подозрительный игрок сыпал бы по несколько сообщений в секунду в чат админов
         // и консоль. Первый удар кулдаун-окна оповещается мгновенно; остальные за окно
-        // не теряются — идут агрегатом в следующее сообщение. Рост серии (seriesGrew)
-        // проходит мимо кулдауна. На детекцию кулдаун не влияет: punish-progress
-        // обновлён выше, наказание работает как раньше.
+        // не теряются — идут агрегатом в следующее сообщение. Предвестие реального
+        // наказания (isEscalation) и сам факт наказания (уведомление в punishPlayer)
+        // идут мимо кулдауна. На детекцию кулдаун не влияет: punish-progress обновлён
+        // выше, наказание работает как раньше.
         if (probability >= flagThreshold) {
-            buildAlert(attacker, probability, average, progress, seriesGrew)?.let { message ->
+            buildAlert(attacker, probability, average, progress, isEscalation)?.let { message ->
                 sendAlert(message)
             }
         }
@@ -466,8 +475,12 @@ class DetectionEngine(
      * Кулдаун оповещений: первый удар ≥ flag-threshold за кулдаун-интервал
      * отправляется немедленно, остальные за интервал подавляются, запоминаются
      * (количество и максимальный скор) и агрегируются в следующее сообщение.
-     * Рост серии подтверждений ([seriesGrew]) проходит мимо кулдауна и заодно
-     * выпускает накопленный агрегат.
+     * [isEscalation] — засчитано последнее окно серии перед реальным наказанием
+     * (punish-enabled и punish-action ≠ none): такое сообщение идёт мимо кулдауна
+     * и выпускает накопленный агрегат. Рост серии БЕЗ наказания (режимы
+     * наблюдения, где серия расходуется и открывается заново) подчиняется
+     * кулдауну наравне с обычными оповещениями — иначе цикличные открытия
+     * возвращали бы спам.
      *
      * Возвращает null, если удар попал под кулдаун: текст не отправлен, но сама
      * детекция уже сработала — punish-progress в handlePrediction обновлён.
