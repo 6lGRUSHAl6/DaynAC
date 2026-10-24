@@ -203,6 +203,18 @@ class DatasetManager(
     }
 
     /**
+     * Лёгкая проверка формата строки без выделения DoubleArray и парсинга чисел.
+     * Используется в статистике для мгновенного подсчёта валидных строк.
+     */
+    private fun isValidVectorLine(line: String): Boolean {
+        val trimmed = line.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith("h0")) return false
+        val parts = trimmed.split(',')
+        val hasMeta = parts.size == featureCount + META_COLUMNS.size
+        return parts.size == featureCount || hasMeta
+    }
+
+    /**
      * Пишет вектор признаков окна ударов (windowSize * 21 + 7 значений) и две колонки
      * метаданных: [sessionId] (сессия записи) и [playerHash] (см. [playerHash]).
      * Метаданные в обучение не идут — по ним делится выборка на train/val/test.
@@ -276,9 +288,8 @@ class DatasetManager(
         fun countValidSamples(file: File): Int =
             if (!file.exists()) 0
             else file.useLines { lines ->
-                lines.count { line -> parseVectorLine(line) is ParseResult.Success }
+                lines.count { line -> isValidVectorLine(line) }
             }
-
         return Pair(countValidSamples(legitVectorFile), countValidSamples(cheatVectorFile))
     }
 
@@ -290,11 +301,19 @@ class DatasetManager(
         fun countSessions(file: File): Int =
             if (!file.exists()) 0
             else file.useLines { lines ->
-                lines.mapNotNull { line -> (parseVectorLine(line) as? ParseResult.Success)?.sessionId }
-                    .toSet()
-                    .size
+                val sessions = mutableSetOf<String>()
+                for (line in lines) {
+                    val trimmed = line.trim()
+                    if (trimmed.isEmpty() || trimmed.startsWith("h0")) continue
+                    val parts = trimmed.split(',')
+                    val hasMeta = parts.size == featureCount + META_COLUMNS.size
+                    if (hasMeta) {
+                        val sessionId = parts[featureCount].trim()
+                        if (sessionId.isNotEmpty()) sessions.add(sessionId)
+                    }
+                }
+                sessions.size
             }
-
         return Pair(countSessions(legitVectorFile), countSessions(cheatVectorFile))
     }
 }

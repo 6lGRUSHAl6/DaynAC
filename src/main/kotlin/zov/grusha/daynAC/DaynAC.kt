@@ -191,53 +191,15 @@ class DaynAC : JavaPlugin(), Listener {
                         return true
                     }
 
-                    val dataset = datasetManager.readVectorSamples()
-                    val features = dataset.samples.map { it.features }
-                    val labels = dataset.samples.map { it.label }
-                    val legitCount = dataset.legitCount
-                    val cheatCount = dataset.cheatCount
-
-                    // По какой группе делить выборку, чтобы окна одной сессии/игрока не попали
-                    // сразу в train и test (training.split-by: session | player).
-                    val splitBy = config.getString("training.split-by", "session")?.lowercase()
-                        ?.takeIf { it == "session" || it == "player" } ?: "session"
-                    val groups: List<String?> = dataset.samples.map { if (splitBy == "player") it.playerHash else it.sessionId }
-
-                    if (features.size < 10) {
-                        sender.sendMessage(
-                            "Недостаточно данных: $legitCount легит / $cheatCount чит векторов " +
-                                    "(нужно ≥ 10). Соберите через /daynac record."
-                        )
-                        return true
-                    }
-                    if (legitCount == 0 || cheatCount == 0) {
-                        sender.sendMessage(
-                            "Датасет однобок: $legitCount легит / $cheatCount чит. " +
-                                    "Нужны оба класса — соберите и legit, и cheat векторы."
-                        )
-                        return true
-                    }
-
-                    if (legitCount < NeuralNetwork.MIN_SAMPLES_PER_CLASS || cheatCount < NeuralNetwork.MIN_SAMPLES_PER_CLASS) {
-                        sender.sendMessage(
-                            "Слишком мало данных для разбиения train/val/test: $legitCount легит / $cheatCount чит. " +
-                                    "Нужно ≥ ${NeuralNetwork.MIN_SAMPLES_PER_CLASS} векторов каждого класса " +
-                                    "(желательно сотни)."
-                        )
-                        return true
-                    }
-
-                    // Атомарная попытка занять слот обучения — после валидации датасета,
-                    // чтобы ранние return выше не оставляли флаг навечно поднятым.
+                    // Занимаем слот обучения сразу, чтобы не было гонок
                     if (!training.compareAndSet(false, true)) {
                         sender.sendMessage("Обучение уже идёт, дождитесь завершения.")
                         return true
                     }
-                    sender.sendMessage("Обучение запущено: $legitCount легит / $cheatCount чит векторов...")
+                    sender.sendMessage("§a[DaynAC] Обучение запущено...")
 
                     thread(name = "DaynAC-Training", isDaemon = true) {
                         // Отчёты отправляем на главный поток — Bukkit API из async-потока нельзя.
-                        // Если плагин уже выключается, планировщик отвергнет задачу — логируем напрямую.
                         fun report(message: String) {
                             if (isEnabled) {
                                 Bukkit.getScheduler().runTask(this@DaynAC, Runnable { sender.sendMessage(message) })
@@ -246,94 +208,123 @@ class DaynAC : JavaPlugin(), Listener {
                             }
                         }
 
-                        // --- Визуализация обучения ---
-                        // Игроку: живой прогресс-бар в action bar (не засоряет чат),
-                        // обновляется не чаще 2 раз/сек. Консоли: только контрольные
-                        // точки в чат/лог каждые 10% эпох. Action bar очищается по завершении.
-                        val senderPlayer = sender as? Player
-                        val maxEpochs = 1000
-                        val milestoneStep = maxOf(1, maxEpochs / 10)
-                        val lastActionBarMs = java.util.concurrent.atomic.AtomicLong(0L)
-
-                        fun progressBar(fraction: Double, width: Int = 20): String {
-                            val filled = (fraction.coerceIn(0.0, 1.0) * width).toInt()
-                            return "§a" + "▮".repeat(filled) + "§8" + "▯".repeat(width - filled)
-                        }
-
-                        fun actionBar(text: String) {
-                            if (senderPlayer == null || !isEnabled) return
-                            Bukkit.getScheduler().runTask(this@DaynAC, Runnable {
-                                Compat.actionBar(senderPlayer, text)
-                            })
-                        }
-
+                        // Единый try/catch/finally гарантирует, что training.set(false)
+                        // сработает при любом исключении: IO, OOM, валидация, обучение.
                         try {
-                            val startTime = System.currentTimeMillis()
-                            val result = neuralNetwork.train(
-                                samples = features,
-                                labels = labels,
-                                groups = groups,
-                                learningRate = 0.001,
-                                maxEpochs = maxEpochs,
-                                patience = 15,
-                                onProgress = { epoch, trainLoss, valLoss, valAcc ->
-                                    val now = System.currentTimeMillis()
+                            report("§7Загрузка датасета...")
+                            val dataset = datasetManager.readVectorSamples()
+                            val features = dataset.samples.map { it.features }
+                            val labels = dataset.samples.map { it.label }
+                            val legitCount = dataset.legitCount
+                            val cheatCount = dataset.cheatCount
 
-                                    // Action bar — не чаще двух раз в секунду
-                                    if (senderPlayer != null && now - lastActionBarMs.get() >= 500L) {
-                                        lastActionBarMs.set(now)
-                                        val lossText = String.format(Locale.US, "%.4f", trainLoss)
-                                        val valText = valAcc?.let { " §7| val §f" + String.format(Locale.US, "%.1f%%", it * 100) } ?: ""
-                                        actionBar(
-                                            "${progressBar((epoch + 1).toDouble() / maxEpochs)} " +
-                                                    "§f${epoch + 1}/$maxEpochs §7| loss §f$lossText$valText"
-                                        )
+                            // Валидация внутри потока
+                            if (features.size < 10) {
+                                report("§c[DaynAC] Недостаточно данных: $legitCount легит / $cheatCount чит векторов (нужно ≥ 10). Соберите через /daynac record.")
+                                return@thread
+                            }
+                            if (legitCount == 0 || cheatCount == 0) {
+                                report("§c[DaynAC] Датасет однобок: $legitCount легит / $cheatCount чит. Нужны оба класса — соберите и legit, и cheat векторы.")
+                                return@thread
+                            }
+                            if (legitCount < NeuralNetwork.MIN_SAMPLES_PER_CLASS || cheatCount < NeuralNetwork.MIN_SAMPLES_PER_CLASS) {
+                                report("§c[DaynAC] Слишком мало данных для разбиения train/val/test: $legitCount легит / $cheatCount чит. Нужно ≥ ${NeuralNetwork.MIN_SAMPLES_PER_CLASS} векторов каждого класса (желательно сотни).")
+                                return@thread
+                            }
+
+                            // По какой группе делить выборку, чтобы окна одной сессии/игрока не попали
+                            // сразу в train и test (training.split-by: session | player).
+                            val splitBy = config.getString("training.split-by", "session")?.lowercase()
+                                ?.takeIf { it == "session" || it == "player" } ?: "session"
+                            val groups: List<String?> = dataset.samples.map { if (splitBy == "player") it.playerHash else it.sessionId }
+
+                            // --- Визуализация обучения ---
+                            val senderPlayer = sender as? Player
+                            val maxEpochs = 1000
+                            val milestoneStep = maxOf(1, maxEpochs / 10)
+                            val lastActionBarMs = java.util.concurrent.atomic.AtomicLong(0L)
+
+                            fun progressBar(fraction: Double, width: Int = 20): String {
+                                val filled = (fraction.coerceIn(0.0, 1.0) * width).toInt()
+                                return "§a" + "▮".repeat(filled) + "§8" + "▯".repeat(width - filled)
+                            }
+
+                            fun actionBar(text: String) {
+                                if (senderPlayer == null || !isEnabled) return
+                                Bukkit.getScheduler().runTask(this@DaynAC, Runnable {
+                                    Compat.actionBar(senderPlayer, text)
+                                })
+                            }
+
+                            try {
+                                val startTime = System.currentTimeMillis()
+                                val result = neuralNetwork.train(
+                                    samples = features,
+                                    labels = labels,
+                                    groups = groups,
+                                    learningRate = 0.001,
+                                    maxEpochs = maxEpochs,
+                                    patience = 15,
+                                    onProgress = { epoch, trainLoss, valLoss, valAcc ->
+                                        val now = System.currentTimeMillis()
+
+                                        // Action bar — не чаще двух раз в секунду
+                                        if (senderPlayer != null && now - lastActionBarMs.get() >= 500L) {
+                                            lastActionBarMs.set(now)
+                                            val lossText = String.format(Locale.US, "%.4f", trainLoss)
+                                            val valText = valAcc?.let { " §7| val §f" + String.format(Locale.US, "%.1f%%", it * 100) } ?: ""
+                                            actionBar(
+                                                "${progressBar((epoch + 1).toDouble() / maxEpochs)} " +
+                                                        "§f${epoch + 1}/$maxEpochs §7| loss §f$lossText$valText"
+                                            )
+                                        }
+
+                                        // Контрольная точка в чат каждые 10% эпох.
+                                        if (epoch > 0 && epoch % milestoneStep == 0) {
+                                            val valPart = valLoss?.let {
+                                                " §7| val §f" + String.format(Locale.US, "%.4f", it) +
+                                                        " §7/ acc §f" + String.format(Locale.US, "%.1f%%", (valAcc ?: 0.0) * 100)
+                                            } ?: ""
+                                            report(
+                                                "§7[DaynAC] ${progressBar(epoch.toDouble() / maxEpochs, 10)} " +
+                                                        "эпоха §f$epoch/$maxEpochs §7| loss §f" +
+                                                        String.format(Locale.US, "%.4f", trainLoss) + "$valPart"
+                                            )
+                                        }
                                     }
-
-                                    // Контрольная точка в чат каждые 10% эпох.
-                                    // milestoneStep кратен valCheckInterval, поэтому здесь
-                                    // valLoss/valAcc уже посчитаны и не равны null.
-                                    if (epoch > 0 && epoch % milestoneStep == 0) {
-                                        val valPart = valLoss?.let {
-                                            " §7| val §f" + String.format(Locale.US, "%.4f", it) +
-                                                    " §7/ acc §f" + String.format(Locale.US, "%.1f%%", (valAcc ?: 0.0) * 100)
-                                        } ?: ""
-                                        report(
-                                            "§7[DaynAC] ${progressBar(epoch.toDouble() / maxEpochs, 10)} " +
-                                                    "эпоха §f$epoch/$maxEpochs §7| loss §f" +
-                                                    String.format(Locale.US, "%.4f", trainLoss) + "$valPart"
-                                        )
-                                    }
-                                }
-                            )
-
-                            neuralNetwork.saveTo(modelFile)
-                            detectionEngine.enableDetection()
-                            actionBar("") // очищаем action bar
-
-                            val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
-                            report(buildString {
-                                fun pct(v: Double) = String.format(Locale.US, "%.1f%%", v * 100)
-                                fun num(v: Double) = String.format(Locale.US, "%.4f", v)
-                                appendLine("§a[DaynAC] Обучение завершено за ${String.format(Locale.US, "%.1f", elapsed)}с")
-                                appendLine("§7Эпох: §f${result.epochsRun} §7(лучшая: ${result.bestEpoch}" +
-                                        if (result.earlyStopped) ", early stop)" else ")")
-                                appendLine("§7Train loss/acc: §f${num(result.trainLoss)} / ${pct(result.trainAccuracy)}")
-                                appendLine("§7Val loss/acc:   §f${num(result.valLoss)} / ${pct(result.valAccuracy)}")
-                                result.testLoss?.let { tl ->
-                                    appendLine("§7Test loss/acc:  §f${num(tl)} / ${pct(result.testAccuracy ?: 0.0)}")
-                                }
-                                result.split?.let { appendLine(describeSplit(it, splitBy)) }
-                                appendLine(
-                                    if (result.overfitGap > 0.05) "§eПереобучение: разрыв train/val ${pct(result.overfitGap)} — соберите больше данных"
-                                    else "§aРазрыв train/val: ${pct(result.overfitGap)} — в норме"
                                 )
-                                append("§aМодель сохранена, детекция активна.")
-                            })
+
+                                neuralNetwork.saveTo(modelFile)
+                                detectionEngine.enableDetection()
+                                actionBar("") // очищаем action bar
+
+                                val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
+                                report(buildString {
+                                    fun pct(v: Double) = String.format(Locale.US, "%.1f%%", v * 100)
+                                    fun num(v: Double) = String.format(Locale.US, "%.4f", v)
+                                    appendLine("§a[DaynAC] Обучение завершено за ${String.format(Locale.US, "%.1f", elapsed)}с")
+                                    appendLine("§7Эпох: §f${result.epochsRun} §7(лучшая: ${result.bestEpoch}" +
+                                            if (result.earlyStopped) ", early stop)" else ")")
+                                    appendLine("§7Train loss/acc: §f${num(result.trainLoss)} / ${pct(result.trainAccuracy)}")
+                                    appendLine("§7Val loss/acc:   §f${num(result.valLoss)} / ${pct(result.valAccuracy)}")
+                                    result.testLoss?.let { tl ->
+                                        appendLine("§7Test loss/acc:  §f${num(tl)} / ${pct(result.testAccuracy ?: 0.0)}")
+                                    }
+                                    result.split?.let { appendLine(describeSplit(it, splitBy)) }
+                                    appendLine(
+                                        if (result.overfitGap > 0.05) "§eПереобучение: разрыв train/val ${pct(result.overfitGap)} — соберите больше данных"
+                                        else "§aРазрыв train/val: ${pct(result.overfitGap)} — в норме"
+                                    )
+                                    append("§aМодель сохранена, детекция активна.")
+                                })
+                            } catch (e: Exception) {
+                                actionBar("") // убираем зависший прогресс-бар
+                                logger.severe("Обучение упало: ${e.message}")
+                                report("§c[DaynAC] Ошибка обучения: ${e.message}")
+                            }
                         } catch (e: Exception) {
-                            actionBar("") // убираем зависший прогресс-бар
-                            logger.severe("Обучение упало: ${e.message}")
-                            report("§c[DaynAC] Ошибка обучения: ${e.message}")
+                            report("§c[DaynAC] Ошибка загрузки/валидации датасета: ${e.message}")
+                            logger.severe("Ошибка подготовки датасета: ${e.message}")
                         } finally {
                             training.set(false)
                         }
