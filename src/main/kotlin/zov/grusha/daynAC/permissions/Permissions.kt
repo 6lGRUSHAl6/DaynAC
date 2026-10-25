@@ -12,7 +12,7 @@ object Permissions {
     const val ADMIN = "daynac.admin"
     const val VIEW = "daynac.view"                    // ver, info, allinfo (только просмотр)
     const val ALERTS = "daynac.alerts"                // оповещения и лог ударов в чат
-    const val SPECTATE = "daynac.spectate"            // телепорт из GUI в режиме наблюдателя
+    const val SPECTATE = "daynac.spectate"            // телепорт из GUI и возврат через /daynac reset
     const val RECORD = "daynac.record"                // запись датасета (даёт игроку иммунитет на время сессии)
     const val TRAIN = "daynac.train"                  // train, eval
     const val CONFIG = "daynac.config"                // reload, debug, clearflags
@@ -24,6 +24,7 @@ object Permissions {
         "ver" to VIEW,
         "info" to VIEW,
         "allinfo" to VIEW,
+        "reset" to SPECTATE,
         "record" to RECORD,
         "train" to TRAIN,
         "eval" to TRAIN,

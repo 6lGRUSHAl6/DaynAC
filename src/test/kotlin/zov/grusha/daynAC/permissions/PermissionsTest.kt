@@ -79,5 +79,6 @@ class PermissionsTest {
     fun `clearflags and exempt subcommands are wired to expected permissions`() {
         assertEquals(Permissions.CONFIG, Permissions.SUBCOMMANDS["clearflags"])
         assertEquals(Permissions.EXEMPT_MANAGE, Permissions.SUBCOMMANDS["exempt"])
+        assertEquals(Permissions.SPECTATE, Permissions.SUBCOMMANDS["reset"])
     }
 }

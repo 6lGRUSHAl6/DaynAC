@@ -132,6 +132,7 @@ gradle runServer -PmcVersion=26.1.2    # то же на другой верси�
 | `/daynac info` | Датасет, сессии, состояние модели, пороги | `daynac.view` |
 | `/daynac ver [ник]` | Без ника - статус плагина; с ником - скор игрока и число ударов | `daynac.view` |
 | `/daynac allinfo` | GUI наблюдения за игроками (телепорт из него - `daynac.spectate`) | `daynac.view` |
+| `/daynac reset` | Вернуться из наблюдения в точку, где оно началось (локация и игровой режим) | `daynac.spectate` |
 | `/daynac debug` | Вкл/выкл логирование каждого удара игрокам с `daynac.alerts` | `daynac.config` |
 | `/daynac clearflags <ник>` | Сбросить флаги и текущее окно игрока вручную | `daynac.config` |
 | `/daynac exempt <ник> [время\|off]` | Выдать временное исключение из детекции (`30s`, `5m`, `2h`, `1d`); без времени - бессрочно; `off` - снять | `daynac.exempt.manage` |
@@ -147,7 +148,7 @@ gradle runServer -PmcVersion=26.1.2    # то же на другой верси�
 |---|---|
 | `daynac.view` | `/daynac ver`, `info`, `allinfo` (только просмотр) |
 | `daynac.alerts` | оповещения о подозрительных ударах и лог ударов (`/daynac debug`) в чат |
-| `daynac.spectate` | телепорт к игроку из `/daynac allinfo` в режиме наблюдателя |
+| `daynac.spectate` | телепорт к игроку из `/daynac allinfo` в режиме наблюдателя и возврат через `/daynac reset` |
 | `daynac.record` | `/daynac record` |
 | `daynac.train` | `/daynac train`, `eval` |
 | `daynac.config` | `/daynac reload`, `debug`, `clearflags` |
