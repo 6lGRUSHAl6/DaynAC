@@ -341,6 +341,18 @@ class DaynAC : JavaPlugin(), Listener {
                     }
                     allInfoGUI.open(admin)
                 }
+                args.isNotEmpty() && args[0] == "reset" -> {
+                    val admin = sender as? Player
+                    if (admin == null) {
+                        sender.sendMessage("Команда доступна только игрокам.")
+                        return true
+                    }
+                    if (allInfoGUI.resetSpectate(admin)) {
+                        admin.sendMessage("§a[DaynAC] Вы вернулись в точку начала наблюдения.")
+                    } else {
+                        admin.sendMessage("§e[DaynAC] Вы не наблюдаете за игроком из /daynac allinfo.")
+                    }
+                }
                 args.isNotEmpty() && args[0] == "debug" -> {
                     // Переключение подробного логгирования ударов (сохраняется в config.yml)
                     hitLogging = !hitLogging
@@ -573,7 +585,7 @@ class DaynAC : JavaPlugin(), Listener {
                     logger.info("[DaynAC] ${sender.name} выдал исключение игроку $targetName до $until")
                 }
                 else -> {
-                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|eval|clearflags|exempt|reload>")
+                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|reset|eval|clearflags|exempt|reload>")
                 }
             }
             return true

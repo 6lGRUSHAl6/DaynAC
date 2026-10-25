@@ -3,6 +3,7 @@
 package zov.grusha.daynAC.gui
 
 import org.bukkit.GameMode
+import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
 import org.bukkit.entity.Player
@@ -11,6 +12,7 @@ import org.bukkit.event.inventory.InventoryAction
 import org.bukkit.event.inventory.InventoryClickEvent
 import org.bukkit.event.inventory.InventoryCloseEvent
 import org.bukkit.event.inventory.InventoryType
+import org.bukkit.event.player.PlayerGameModeChangeEvent
 import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.inventory.Inventory
 import org.bukkit.inventory.ItemStack
@@ -31,6 +33,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -411,6 +414,55 @@ class AllInfoGUITest {
         assertEquals(target.world, admin.world)
         assertTrue(admin.location.distance(target.location) < 0.01)
         assertTrue(admin.nextMessage().orEmpty().contains("Наблюдение за"))
+    }
+
+    @Test
+    fun `reset returns admin to start location and previous game mode`() {
+        val target = server.addPlayer("Cheater")
+        track(target.uniqueId, listOf(0.9))
+        val admin = admin(Permissions.VIEW, Permissions.SPECTATE)
+        val start = Location(admin.world, 12.5, 70.0, -3.5)
+        admin.teleport(start)
+        admin.gameMode = GameMode.CREATIVE
+        val inventory = gui.open(admin)
+
+        gui.onInventoryClick(click(admin, compassSlot(inventory, target.uniqueId)))
+
+        assertEquals(GameMode.SPECTATOR, admin.gameMode)
+        assertTrue(gui.resetSpectate(admin))
+        assertEquals(GameMode.CREATIVE, admin.gameMode)
+        assertTrue(admin.location.distance(start) < 0.01)
+        assertFalse(gui.resetSpectate(admin), "повторный reset без наблюдения ничего не делает")
+    }
+
+    @Test
+    fun `switching observed players keeps the original return point`() {
+        val first = server.addPlayer("First")
+        val second = server.addPlayer("Second")
+        track(first.uniqueId, listOf(0.9))
+        track(second.uniqueId, listOf(0.8))
+        val admin = admin(Permissions.VIEW, Permissions.SPECTATE)
+        val start = Location(admin.world, 4.0, 64.0, 4.0)
+        admin.teleport(start)
+
+        gui.onInventoryClick(click(admin, compassSlot(gui.open(admin), first.uniqueId)))
+        gui.onInventoryClick(click(admin, compassSlot(gui.open(admin), second.uniqueId)))
+
+        assertTrue(gui.resetSpectate(admin))
+        assertTrue(admin.location.distance(start) < 0.01, "reset должен вернуть к началу первого наблюдения")
+    }
+
+    @Test
+    fun `leaving spectator manually drops the return point`() {
+        val target = server.addPlayer("Cheater")
+        track(target.uniqueId, listOf(0.9))
+        val admin = admin(Permissions.VIEW, Permissions.SPECTATE)
+        val inventory = gui.open(admin)
+        gui.onInventoryClick(click(admin, compassSlot(inventory, target.uniqueId)))
+
+        gui.onGameModeChange(PlayerGameModeChangeEvent(admin, GameMode.SURVIVAL))
+
+        assertFalse(gui.resetSpectate(admin), "после ручного выхода из spectator reset не должен телепортировать")
     }
 
     @Test

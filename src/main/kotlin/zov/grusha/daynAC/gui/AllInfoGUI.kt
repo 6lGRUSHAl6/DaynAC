@@ -1,14 +1,18 @@
 package zov.grusha.daynAC.gui
 
 import org.bukkit.Bukkit
+import org.bukkit.GameMode
+import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
+import org.bukkit.event.EventPriority
 import org.bukkit.event.Listener
 import org.bukkit.event.inventory.InventoryAction
 import org.bukkit.event.inventory.InventoryClickEvent
 import org.bukkit.event.inventory.InventoryCloseEvent
+import org.bukkit.event.player.PlayerGameModeChangeEvent
 import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.inventory.Inventory
 import org.bukkit.inventory.ItemStack
@@ -22,15 +26,6 @@ import zov.grusha.daynAC.tracking.HitTracker
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * GUI со списком всех наблюдаемых игроков и их скоров детекции.
- * Раздел 13 daynac.md: сундук-инвентарь, каждый игрок — компас,
- * ЛКМ по компасу — телепорт в режиме наблюдателя.
- *
- * Разбит на страницы по [PLAYERS_PER_PAGE]: 5 рядов под карточки, 6-й — под навигацию.
- * Список детерминированно отсортирован (см. [collectCards]), поэтому страницы
- * стабильны между переоткрытиями, а не «пересобираются в случайном порядке».
- */
 class AllInfoGUI(
     private val plugin: Plugin,
     private val engine: DetectionEngine,
@@ -48,7 +43,7 @@ class AllInfoGUI(
         private const val NAV_INFO_SLOT = 49
         private const val NAV_NEXT_SLOT = 53
 
-        /** Иконка по величине скора — как в daynac.md. */
+        /** Иконка по величине скора */
         fun scoreIcon(score: Double): String = when {
             score < 0.4 -> "§a✔"
             score < 0.65 -> "§e●"
@@ -78,6 +73,16 @@ class AllInfoGUI(
      */
     private val openPages = ConcurrentHashMap<UUID, Int>()
 
+    /** Куда и в каком режиме вернуть админа после наблюдения. */
+    private data class SpectateReturnPoint(val location: Location, val gameMode: GameMode)
+
+    /**
+     * Админ → точка, из которой он начал наблюдение. Хранится, пока админ находится
+     * в spectator: смена режима вручную означает, что наблюдение закончено, и точка
+     * удаляется, чтобы `/daynac reset` не телепортировал игрока неожиданно позже.
+     */
+    private val spectateReturnPoints = ConcurrentHashMap<UUID, SpectateReturnPoint>()
+
     /** Собирает и открывает GUI для администратора. */
     fun open(admin: Player): Inventory {
         val inventory = Bukkit.createInventory(null, GUI_SIZE, TITLE)
@@ -87,7 +92,20 @@ class AllInfoGUI(
         return inventory
     }
 
-    // ------------------------------------------------------------------ populate
+    /**
+     * Возвращает админа из режима наблюдения в точку, откуда он его начал:
+     * восстанавливает локацию и прежний игровой режим.
+     *
+     * @return true, если админ действительно наблюдал и был возвращён
+     */
+    fun resetSpectate(admin: Player): Boolean {
+        val returnPoint = spectateReturnPoints.remove(admin.uniqueId) ?: return false
+        // Сначала телепорт, потом режим: иначе админ окажется в survival
+        // в точке наблюдения ещё до перемещения назад.
+        admin.teleport(returnPoint.location)
+        admin.gameMode = returnPoint.gameMode
+        return true
+    }
 
     /**
      * Снимок всего, что нужно и для отрисовки, и для сортировки.
@@ -271,8 +289,6 @@ class AllInfoGUI(
         for (slot in 0 until GUI_SIZE) inventory.setItem(slot, filler)
     }
 
-    // ------------------------------------------------------------------ lore
-
     private fun buildLore(
         maxScore: Double,
         average: Double,
@@ -329,7 +345,6 @@ class AllInfoGUI(
 
     private fun fmt(v: Double): String = String.format(java.util.Locale.US, "%.3f", v)
 
-    // ------------------------------------------------------------------ events
 
     @EventHandler
     fun onInventoryClick(event: InventoryClickEvent) {
@@ -386,13 +401,19 @@ class AllInfoGUI(
             return
         }
 
-        // Телепорт в режиме наблюдателя
+        // Телепорт в режиме наблюдателя. Точку возврата запоминаем только при первом
+        // клике: если админ переключается между игроками прямо из spectator, /daynac reset
+        // всё равно вернёт его туда, откуда он начал наблюдение.
         player.closeInventory()
         openGuis.remove(player.uniqueId)
 
-        player.gameMode = org.bukkit.GameMode.SPECTATOR
+        spectateReturnPoints.putIfAbsent(
+            player.uniqueId,
+            SpectateReturnPoint(player.location.clone(), player.gameMode)
+        )
+        player.gameMode = GameMode.SPECTATOR
         player.teleport(target.location)
-        player.sendMessage("§7[DaynAC] Наблюдение за §c${target.name}§7. Выйти из наблюдателя: /gamemode survival")
+        player.sendMessage("§7[DaynAC] Наблюдение за §c${target.name}§7. Вернуться обратно: /daynac reset")
     }
 
     /** Чистка при закрытии GUI. Страницу не трогаем — переоткрытие вернёт админа туда же. */
@@ -404,10 +425,19 @@ class AllInfoGUI(
         }
     }
 
+    /** Смена режима вручную завершает наблюдение — точка возврата больше не актуальна. */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    fun onGameModeChange(event: PlayerGameModeChangeEvent) {
+        if (event.newGameMode != GameMode.SPECTATOR) {
+            spectateReturnPoints.remove(event.player.uniqueId)
+        }
+    }
+
     /** Полная очистка при выходе админа — состояние страницы больше не нужно. */
     @EventHandler
     fun onQuit(event: PlayerQuitEvent) {
         openGuis.remove(event.player.uniqueId)
         openPages.remove(event.player.uniqueId)
+        spectateReturnPoints.remove(event.player.uniqueId)
     }
 }

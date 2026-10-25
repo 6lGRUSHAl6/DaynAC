@@ -8,7 +8,7 @@ load: POSTWORLD
 commands:
   daynac:
     description: Daynac anticheat command
-    usage: /daynac <ver|record|train|info|debug|allinfo|eval|clearflags|exempt|reload>
+    usage: /daynac <ver|record|train|info|debug|allinfo|reset|eval|clearflags|exempt|reload>
 
 permissions:
   daynac.admin:
@@ -29,7 +29,7 @@ permissions:
     description: Получать оповещения о подозрительных ударах и лог ударов
     default: false
   daynac.spectate:
-    description: Телепорт к игроку из /daynac allinfo в режиме наблюдателя
+    description: Телепорт к игроку из /daynac allinfo и возврат через /daynac reset
     default: false
   daynac.record:
     description: Запись датасета (на время записи игрок не проверяется детекцией)

@@ -140,6 +140,7 @@ Each command requires its own permission (see [Permissions](#permissions)); `day
 | `/daynac info` | Dataset, sessions, model state, thresholds | `daynac.view` |
 | `/daynac ver [player]` | Without a name: plugin status; with a name: the player's scores and hit count | `daynac.view` |
 | `/daynac allinfo` | Player-monitoring GUI (teleporting from it needs `daynac.spectate`) | `daynac.view` |
+| `/daynac reset` | Return from observation to where it started (location and game mode) | `daynac.spectate` |
 | `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` | `daynac.config` |
 | `/daynac clearflags <player>` | Manually reset a player's flags and current window | `daynac.config` |
 | `/daynac exempt <player> [time\|off]` | Grant a temporary exemption from detection (`30s`, `5m`, `2h`, `1d`); without time - permanent; `off` - remove | `daynac.exempt.manage` |
@@ -155,7 +156,7 @@ Permissions are checked per subcommand, so access can be granted in parts (for e
 |---|---|
 | `daynac.view` | `/daynac ver`, `info`, `allinfo` (read-only) |
 | `daynac.alerts` | suspicious-hit alerts and the per-hit log (`/daynac debug`) in chat |
-| `daynac.spectate` | teleport to a player from `/daynac allinfo` in spectator mode |
+| `daynac.spectate` | teleport to a player from `/daynac allinfo` in spectator mode and return via `/daynac reset` |
 | `daynac.record` | `/daynac record` |
 | `daynac.train` | `/daynac train`, `eval` |
 | `daynac.config` | `/daynac reload`, `debug`, `clearflags` |
