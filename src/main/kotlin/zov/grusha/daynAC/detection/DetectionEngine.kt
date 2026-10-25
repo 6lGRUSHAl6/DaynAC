@@ -179,7 +179,12 @@ class DetectionEngine(
      */
     private val scoreHistory = ConcurrentHashMap<UUID, ArrayDeque<PlayerVerdict>>()
 
-    /** Сколько ударов игрок сделал (для /daynac ver и GUI — видно, почему нет предсказаний). */
+    /**
+     * Сколько ударов игрок сделал за всё время (GUI показывает это как «Всего ударов»).
+     * Для прогресса ТЕКУЩЕГО окна (и подсказки «нужно 16» в /daynac ver) используется
+     * [zov.grusha.daynAC.tracking.HitTracker.getWindowFill]: после сброса по простою
+     * этот счётчик СОЗНАТЕЛЬНО не обнуляется — он хранит историческую статистику.
+     */
     val hitCounts = java.util.concurrent.ConcurrentHashMap<UUID, Int>()
 
     /**
