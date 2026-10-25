@@ -138,7 +138,7 @@ Each command requires its own permission (see [Permissions](#permissions)); `day
 | `/daynac train` | Train the model on the collected dataset | `daynac.train` |
 | `/daynac eval` | Test-set metrics across a range of thresholds | `daynac.train` |
 | `/daynac info` | Dataset, sessions, model state, thresholds | `daynac.view` |
-| `/daynac ver [player]` | Without a name: plugin status; with a name: the player's scores and hit count | `daynac.view` |
+| `/daynac ver [player]` | Without a name: plugin status; with a name: the player's scores and hit count in the current window | `daynac.view` |
 | `/daynac allinfo` | Player-monitoring GUI (teleporting from it needs `daynac.spectate`) | `daynac.view` |
 | `/daynac reset` | Return from observation to where it started (location and game mode) | `daynac.spectate` |
 | `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` | `daynac.config` |

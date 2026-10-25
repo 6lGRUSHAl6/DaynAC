@@ -177,7 +177,10 @@ class DaynAC : JavaPlugin(), Listener {
                     }
                     val last = detectionEngine.getLastPrediction(target)
                     val avg = detectionEngine.getAveragePrediction(target)
-                    val hits = detectionEngine.getHitCount(target.uniqueId)
+                    // Прогресс ТЕКУЩЕГО окна, а не суммарный getHitCount: после сброса
+                    // по простою hitCounts сохраняется как историческая статистика,
+                    // но окно ударов начинается заново (тот же источник, что и в GUI).
+                    val hits = hitTracker.getWindowFill(target.uniqueId)
                     sender.sendMessage(
                         "[DaynAC] ${target.name}: последний скор = " +
                                 (last?.let { String.format(Locale.US, "%.3f", it) } ?: "нет данных") +

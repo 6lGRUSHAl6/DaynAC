@@ -130,7 +130,7 @@ gradle runServer -PmcVersion=26.1.2    # то же на другой верси�
 | `/daynac train` | Обучение модели на собранном датасете | `daynac.train` |
 | `/daynac eval` | Метрики на test-сете по набору порогов | `daynac.train` |
 | `/daynac info` | Датасет, сессии, состояние модели, пороги | `daynac.view` |
-| `/daynac ver [ник]` | Без ника - статус плагина; с ником - скор игрока и число ударов | `daynac.view` |
+| `/daynac ver [ник]` | Без ника - статус плагина; с ником - скор игрока и число ударов в текущем окне | `daynac.view` |
 | `/daynac allinfo` | GUI наблюдения за игроками (телепорт из него - `daynac.spectate`) | `daynac.view` |
 | `/daynac reset` | Вернуться из наблюдения в точку, где оно началось (локация и игровой режим) | `daynac.spectate` |
 | `/daynac debug` | Вкл/выкл логирование каждого удара игрокам с `daynac.alerts` | `daynac.config` |
