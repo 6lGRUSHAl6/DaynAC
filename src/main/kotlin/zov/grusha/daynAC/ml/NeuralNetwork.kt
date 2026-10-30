@@ -3,6 +3,8 @@ package zov.grusha.daynAC.ml
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.Random
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
@@ -11,165 +13,140 @@ import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * MLP-классификатор «читер / легит» на чистом Kotlin, без внешних ML-библиотек.
+ * MLP-классификатор «читер / легит» на чистом Kotlin.
  *
- * Архитектура: 343 → 128 → 64 → 32 → 1
- * (343 = 16 ударов × 21 признаков + 7 агрегатов из [FeatureExtractor]).
- * Скрытые слои — ReLU, выход — Sigmoid (вероятность чита от 0 до 1).
+ * Скрытые слои — ReLU, выход — Sigmoid (вероятность чита). Обучение: BCE, backprop,
+ * Adam по одному сэмплу, L2, inverted dropout, z-score входов, early stopping по validation.
  *
- * Обучение: Binary Cross-Entropy + backpropagation + SGD (по одному сэмплу).
- *
- * Защита от переобучения (конструктивная, а не только подбором гиперпараметров):
- *  1. Узкий «бутылочный» хвост 64 → 32 → 1 — сжатие размерности перед выходом
- *     ограничивает ёмкость сети запоминать шум.
- *  2. L2 weight decay — каждое обновление весов штрафуется пропорционально
- *     величине веса, сеть стремится к малым весам => более гладкая граница решений.
- *  3. Early stopping на валидационной выборке (20%) с восстановлением лучших
- *     весов — обучение останавливается до того, как сеть начнёт заучивать train.
- *  4. Z-score нормализация входов — без неё большие по масштабу признаки
- *     (distance, hitTimeDelta) приводят к гигантским градиентам и нестабильному
- *     обучению, которое часто «лечат» завышенным lr и переобучают.
- *
- * Числовые защиты (как в daynac.md): clipping градиентов ±5.0,
- * clamp входа sigmoid в [-500, 500], epsilon 1e-15 в логарифмах BCE.
- *
- * Потокобезопасность: см. комментарий у [Weights] и [snapshot] — lock-free
- * predict, атомарная публикация результатов train/load.
+ * Потокобезопасность: [predict] не берёт блокировок и читает неизменяемый снапшот весов;
+ * [train] и [loadFrom] сериализуются [mutationLock] и публикуют результат одним атомарным set().
  */
 class NeuralNetwork(
-    val inputSize: Int,   // без дефолта, размер входа диктует FeatureExtractor
+    val inputSize: Int,
     hiddenSizes: IntArray = intArrayOf(8, 16),
     private val seed: Long = 42L
 ) {
 
-    /** Размеры всех слоёв: [inputSize, 128, 64, 32, 1]. */
     val layerSizes: IntArray = intArrayOf(inputSize, *hiddenSizes, 1)
 
     /**
-     * Состояние сети. Объект, извлечённый из [snapshot], менять нельзя —
-     * он может быть опубликован и использоваться другими потоками (это
-     * copy-on-write). Локальные рабочие копии (в train) мутируются свободно
-     * и публикуются одним set() только в готовом виде: AtomicReference
-     * гарантирует безопасную публикацию (happens-before), читатели никогда
-     * не видят частично обновлённые массивы.
+     * Состояние сети. Объект, опубликованный через [snapshot], менять нельзя (copy-on-write):
+     * train мутирует локальную копию и публикует её целиком.
      */
     private class Weights(
-        var weights: Array<Array<DoubleArray>>,
-        var biases: Array<DoubleArray>,
-        var featureMean: DoubleArray,
-        var featureStd: DoubleArray
-    )
+        val weights: Array<Array<DoubleArray>>,
+        val biases: Array<DoubleArray>,
+        val featureMean: DoubleArray,
+        val featureStd: DoubleArray,
+        val mWeights: Array<Array<DoubleArray>>,
+        val vWeights: Array<Array<DoubleArray>>,
+        val mBiases: Array<DoubleArray>,
+        val vBiases: Array<DoubleArray>
+    ) {
+        fun deepCopy() = Weights(
+            weights.deepCopy(), biases.deepCopy(), featureMean.copyOf(), featureStd.copyOf(),
+            mWeights.deepCopy(), vWeights.deepCopy(), mBiases.deepCopy(), vBiases.deepCopy()
+        )
+
+        fun copyFrom(other: Weights) {
+            weights.copyFrom(other.weights)
+            biases.copyFrom(other.biases)
+            other.featureMean.copyInto(featureMean)
+            other.featureStd.copyInto(featureStd)
+            mWeights.copyFrom(other.mWeights)
+            vWeights.copyFrom(other.vWeights)
+            mBiases.copyFrom(other.mBiases)
+            vBiases.copyFrom(other.vBiases)
+        }
+    }
+
+    /** Буферы активаций, масок dropout и дельт: один набор на всё обучение, без аллокаций на сэмпл. */
+    private class StepContext(
+        layerSizes: IntArray,
+        val learningRate: Double,
+        val l2Lambda: Double,
+        val dropoutRate: Double
+    ) {
+        val activations = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
+        val masks = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
+        val deltas = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
+        var biasCorrection1 = 1.0
+        var biasCorrection2 = 1.0
+    }
 
     /**
-     * Нормализованный TEST-сет последнего train() в этом сеансе.
-     * Нужен для /daynac eval. Это отдельный holdout: модель на нём не училась,
-     * и (в отличие от validation-сета) по нему не выбиралась лучшая эпоха
-     * при early stopping, поэтому метрики не завышены подбором под этот сет.
-     * Не сохраняется в model.dat: после рестарта сеанса eval недоступен
-     * до следующего train().
+     * Нормализованный test-сет последнего train(): модель на нём не училась и эпоха по нему
+     * не выбиралась. В model.dat не сохраняется — после рестарта eval недоступен до train().
      */
-    private data class HoldoutSet(
+    private class HoldoutSet(
         val normalizedFeatures: List<DoubleArray>,
-        val labels: List<Double>
+        val labels: DoubleArray
     )
 
     @Volatile
     private var lastTestSet: HoldoutSet? = null
 
-    private fun emptyWeights(): Weights = Weights(
-        weights = Array(layerSizes.size - 1) { l ->
-            Array(layerSizes[l + 1]) { DoubleArray(layerSizes[l]) }
-        },
-        biases = Array(layerSizes.size - 1) { l -> DoubleArray(layerSizes[l + 1]) },
-        featureMean = DoubleArray(inputSize),
-        featureStd = DoubleArray(inputSize) { 1.0 }
-    )
+    private fun emptyWeights(): Weights {
+        fun matrices() = Array(layerSizes.size - 1) { l -> Array(layerSizes[l + 1]) { DoubleArray(layerSizes[l]) } }
+        fun vectors() = Array(layerSizes.size - 1) { l -> DoubleArray(layerSizes[l + 1]) }
+        return Weights(
+            weights = matrices(),
+            biases = vectors(),
+            featureMean = DoubleArray(inputSize),
+            featureStd = DoubleArray(inputSize) { 1.0 },
+            mWeights = matrices(),
+            vWeights = matrices(),
+            mBiases = vectors(),
+            vBiases = vectors()
+        )
+    }
 
-    /** Текущее состояние сети; меняется только заменой целиком (copy-on-write). */
     private val snapshot = AtomicReference(emptyWeights())
 
     /**
-     * Сериализует изменяющие операции (train, loadFrom). Сам по себе
-     * AtomicReference даёт атомарность публикации, но не взаимное исключение:
-     * без лока train, стартовавший до loadFrom, в конце делал snapshot.set()
-     * и затирал только что загруженную модель. Читатели (predict, saveTo)
-     * лок не берут — им достаточно AtomicReference.get().
+     * Сериализует train и loadFrom: иначе train, стартовавший до loadFrom, затёр бы
+     * загруженную модель своим set(). Читатели (predict, saveTo) лок не берут.
      */
     private val mutationLock = ReentrantLock()
 
     companion object {
-        private const val EPS = 1e-15          // защита log(0) в BCE
-        private const val CLAMP = 5.0          // clipping градиентов
+        private const val EPS = 1e-15
+        private const val CLAMP = 5.0
         private const val SIGMOID_CLAMP = 500.0
-        private const val MIN_STD = 1e-8       // защита от деления на 0 в z-score
-        private const val MAGIC = 0x44414E41   // "DANA" — маркер файла модели
-        private const val FORMAT_VERSION = 3   // v2: + блок метрик обучения; v3: + версия признаков в заголовке
+        private const val MIN_STD = 1e-8
+        private const val BETA1 = 0.9
+        private const val BETA2 = 0.999
+        private const val ADAM_EPS = 1e-8
+        private const val MAGIC = 0x44414E41
+        private const val FORMAT_VERSION = 3   // v2: + метрики обучения; v3: + версия признаков
 
-        /**
-         * Разделение при обучении: 60% train / 20% validation / 20% test (по каждому классу).
-         * Validation — только для early stopping, test — только для финальной оценки и /daynac eval.
-         */
+        /** Доли validation (early stopping) и test (финальная оценка) на класс; остальное — train. */
         private const val VAL_FRACTION = 0.2
         private const val TEST_FRACTION = 0.2
 
-        /**
-         * Минимум сэмплов каждого класса: при 5 получается 3 train / 1 val / 1 test.
-         * Меньше — какой-то из сетов остаётся без класса и метрики теряют смысл.
-         */
+        /** Минимум сэмплов на класс: при 5 получается 3 train / 1 val / 1 test. */
         const val MIN_SAMPLES_PER_CLASS = 5
 
-        /**
-         * Минимум групп (сессий/игроков) на класс для разбиения по группам: по одной в
-         * train, val и test. Меньше — разбиение случайное по окнам, метрики завышены.
-         */
+        /** Минимум групп на класс для разбиения по группам (по одной в train, val и test). */
         const val MIN_GROUPS_PER_CLASS = 3
     }
 
-    // ------------------------------------------------------------------
-    // Активации
-    // ------------------------------------------------------------------
-
     private fun relu(x: Double): Double = if (x > 0.0) x else 0.0
 
-    private fun sigmoid(x: Double): Double {
-        val clamped = x.coerceIn(-SIGMOID_CLAMP, SIGMOID_CLAMP)
-        return 1.0 / (1.0 + exp(-clamped))
-    }
+    private fun sigmoid(x: Double): Double =
+        1.0 / (1.0 + exp(-x.coerceIn(-SIGMOID_CLAMP, SIGMOID_CLAMP)))
 
-    // ------------------------------------------------------------------
-    // Forward pass
-    // ------------------------------------------------------------------
-
-    /**
-     * Предсказание по «сырому» вектору признаков (без нормализации снаружи —
-     * Z-score применяется внутри по сохранённым статистикам).
-     * @return вероятность чита в (0, 1)
-     */
+    /** Вероятность чита в (0, 1) по «сырому» вектору признаков; z-score применяется внутри. */
     fun predict(rawFeatures: DoubleArray): Double {
         require(rawFeatures.size == inputSize) {
             "Ожидался вектор из $inputSize признаков, получен ${rawFeatures.size}"
         }
-
         val state = snapshot.get()
-        var activation = normalize(rawFeatures, state)
-
-        for (l in state.weights.indices) {
-            val next = DoubleArray(layerSizes[l + 1])
-            val isLast = (l == state.weights.size - 1)
-            for (j in next.indices) {
-                var z = state.biases[l][j]
-                val wj = state.weights[l][j]
-                for (k in activation.indices) {
-                    z += wj[k] * activation[k]
-                }
-                next[j] = if (isLast) sigmoid(z) else relu(z)
-            }
-            activation = next
-        }
-        return activation[0]
+        return forwardOnly(state, normalize(rawFeatures, state))
     }
 
     private fun normalize(features: DoubleArray, state: Weights): DoubleArray {
@@ -180,15 +157,39 @@ class NeuralNetwork(
         return out
     }
 
-    // ------------------------------------------------------------------
-    // Обучение
-    // ------------------------------------------------------------------
+    private fun newLayerBuffers() = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
+
+    private fun forwardLayer(state: Weights, l: Int, input: DoubleArray, output: DoubleArray, isLast: Boolean) {
+        val weights = state.weights[l]
+        val biases = state.biases[l]
+        for (j in output.indices) {
+            val wj = weights[j]
+            var z = biases[j]
+            for (k in input.indices) {
+                z += wj[k] * input[k]
+            }
+            output[j] = if (isLast) sigmoid(z) else relu(z)
+        }
+    }
+
+    private fun forwardOnly(
+        state: Weights,
+        normalizedFeatures: DoubleArray,
+        buffers: Array<DoubleArray> = newLayerBuffers()
+    ): Double {
+        var activation = normalizedFeatures
+        val lastLayer = state.weights.size - 1
+        for (l in 0..lastLayer) {
+            forwardLayer(state, l, activation, buffers[l], l == lastLayer)
+            activation = buffers[l]
+        }
+        return activation[0]
+    }
 
     /**
-     * Как разбит датасет. [legitGrouped]/[cheatGrouped] = true: группы (сессии или игроки)
-     * класса целиком попали в один из сетов, утечки между train и test нет. false: групп
-     * меньше [MIN_GROUPS_PER_CLASS] (или метаданных нет), разбиение случайное по окнам —
-     * окна одного игрока могут быть и в train, и в test, метрики оптимистичны.
+     * Как разбит датасет. `*Grouped` = true: группы (сессии или игроки) класса целиком попали
+     * в один сет, утечки между train и test нет. false: разбиение случайное по окнам,
+     * окна одного игрока могут оказаться и в train, и в test — метрики оптимистичны.
      */
     data class SplitSummary(
         val legitGrouped: Boolean,
@@ -202,7 +203,7 @@ class NeuralNetwork(
         val fullyGrouped: Boolean get() = legitGrouped && cheatGrouped
     }
 
-    /** Результат обучения — для отчёта администратору и диагностики переобучения. */
+    /** Результат обучения. Поля test* и [split] равны null, если результат загружен из model.dat. */
     data class TrainResult(
         val epochsRun: Int,
         val bestEpoch: Int,
@@ -211,42 +212,35 @@ class NeuralNetwork(
         val valLoss: Double,
         val trainAccuracy: Double,
         val valAccuracy: Double,
-        /** Метрики на test-сете. null — результат загружен из model.dat (test в файл не пишется). */
         val testLoss: Double? = null,
         val testAccuracy: Double? = null,
-        /** Как был разбит датасет. null — результат загружен из model.dat. */
         val split: SplitSummary? = null
     ) {
-        /** Разрыв train/val — грубая метрика переобучения (0.05+ уже подозрительно). */
+        /** Разрыв train/val accuracy — грубая метрика переобучения (0.05+ уже подозрительно). */
         val overfitGap: Double get() = trainAccuracy - valAccuracy
     }
 
-    /**
-     * Метрики последнего обучения. Устанавливается train()/loadFrom(),
-     * читается /daynac info. @Volatile достаточно: запись одна, чтений много,
-     * конкурентность не нужна — ссылка публикуется целиком.
-     */
+    /** Метрики последнего обучения; устанавливаются в train() и loadFrom(). */
     @Volatile
     var lastTrainResult: TrainResult? = null
         private set
 
     /**
-     * Полный цикл обучения: стратифицированный split 60/20/20 (train/val/test),
-     * нормализация по train-части, SGD по одному сэмплу, early stopping по val
-     * с восстановлением лучших весов. Test-сет в обучении и выборе эпохи не
-     * участвует — по нему считаются финальные метрики и /daynac eval.
+     * Стратифицированный split 60/20/20 (train/val/test), z-score по train, обучение по одному
+     * сэмплу с early stopping по val и восстановлением лучших весов. Test-сет в обучении
+     * и выборе эпохи не участвует.
      *
-     * @param groups группа каждого сэмпла (сессия записи или игрок; null — группы нет).
-     *               Если на класс приходится ≥ [MIN_GROUPS_PER_CLASS] групп, разбиение идёт
-     *               по группам: ни одна не попадает сразу в два сета.
-     *
-     * @param samples векторы признаков (каждый длиной [inputSize])
-     * @param labels  0.0 = легит, 1.0 = чит
-     * @param learningRate шаг SGD (оптимально 0.001–0.003)
+     * @param samples векторы признаков длиной [inputSize]
+     * @param labels 0.0 = легит, 1.0 = чит
+     * @param learningRate шаг Adam (оптимально 0.001–0.003)
      * @param maxEpochs максимальное число эпох
-     * @param patience сколько проверок val loss без улучшения до остановки
-     * @param l2Lambda коэффициент L2 weight decay (0 = отключить; 1e-4 — разумный дефолт)
-     * @param onProgress опциональный колбэк прогресса (эпоха, trainLoss, valLoss, valAcc)
+     * @param patience число проверок val loss без улучшения до остановки
+     * @param l2Lambda коэффициент L2 weight decay (0 — отключить)
+     * @param dropoutRate доля отключаемых нейронов скрытых слоёв
+     * @param groups группа каждого сэмпла (сессия или игрок). Если на класс приходится
+     *               ≥ [MIN_GROUPS_PER_CLASS] групп, разбиение идёт по группам
+     * @param onProgress колбэк прогресса (эпоха, trainLoss, valLoss, valAcc); valLoss и valAcc
+     *                   равны null на эпохах без проверки
      */
     fun train(
         samples: List<DoubleArray>,
@@ -270,69 +264,51 @@ class NeuralNetwork(
         }
 
         mutationLock.withLock {
-            // Инвалидируем предыдущий holdout на время обучения: пока идут эпохи,
-            // ни eval, ни /daynac info не должны видеть устаревший test-сет в паре
-            // с ещё не обученными весами.
             lastTestSet = null
 
-            // Обучаем ЛОКАЛЬНУЮ копию — боевой снапшот, по которому работает
-            // inference, не меняется до конца обучения и публикуется атомарно.
-            val local = snapshot.get().let {
-                Weights(
-                    weights = it.weights.map { layer -> layer.map { neuron -> neuron.copyOf() }.toTypedArray() }.toTypedArray(),
-                    biases = it.biases.map { it.copyOf() }.toTypedArray(),
-                    featureMean = it.featureMean.copyOf(),
-                    featureStd = it.featureStd.copyOf()
-                )
-            }
+            val local = snapshot.get().deepCopy()
+            val split = splitIndices(labels, groups, Random(seed))
 
-            // 1. Делим 60/20/20 (train/val/test) стратифицированно по классам и, если групп
-            // (сессий/игроков) хватает, ПО ГРУППАМ: окна одного игрока очень похожи, и при
-            // разбиении по окнам модель могла бы «узнавать» человека, а не чит. val нужен только
-            // early stopping'у, test — только финальной оценке. Подробности — в [splitIndices].
-            val rng = Random(seed)
-            val indexSplit = splitIndices(labels, groups, rng)
-            val trainIdx = indexSplit.train
-            val valIdx = indexSplit.validation
-            val testIdx = indexSplit.test
-
-            // 2. Инициализация весов заново — чистый старт (He init)
             initWeights(local)
+            computeNormStats(local, split.train.map { samples[it] })
 
-            // 3. Нормализационные статистики — ТОЛЬКО по train-части (без утечки данных)
-            computeNormStats(local, trainIdx.map { samples[it] })
-            val trainFeatures = trainIdx.map { normalize(samples[it], local) }
-            val valFeatures = valIdx.map { normalize(samples[it], local) }
-            val testFeatures = testIdx.map { normalize(samples[it], local) }
-            val trainLabels = trainIdx.map { labels[it] }
-            val valLabels = valIdx.map { labels[it] }
-            val testLabels = testIdx.map { labels[it] }
+            fun featuresOf(idx: List<Int>) = idx.map { normalize(samples[it], local) }
+            fun labelsOf(idx: List<Int>) = DoubleArray(idx.size) { labels[idx[it]] }
 
-            // 4. Цикл обучения
+            val trainFeatures = featuresOf(split.train)
+            val valFeatures = featuresOf(split.validation)
+            val testFeatures = featuresOf(split.test)
+            val trainLabels = labelsOf(split.train)
+            val valLabels = labelsOf(split.validation)
+            val testLabels = labelsOf(split.test)
+
+            val context = StepContext(layerSizes, learningRate, l2Lambda, dropoutRate)
+            val best = local.deepCopy()
+            val order = IntArray(trainFeatures.size)
             val valCheckInterval = max(1, min(5, maxEpochs / 50))
             var bestValLoss = Double.POSITIVE_INFINITY
             var bestEpoch = 0
             var staleCount = 0
             var earlyStopped = false
-            var bestWeights = copyWeights(local)
-            var bestBiases = copyBiases(local)
-
             var epoch = 0
-            val epochOrder = ArrayList<Int>(trainFeatures.size)
+
             while (epoch < maxEpochs) {
-                val epochRng = Random(seed + epoch + 1) // НОВОЕ: генератор для dropout на эту эпоху
-                epochOrder.clear()
-                for (i in trainFeatures.indices) epochOrder.add(i)
-                epochOrder.shuffle(epochRng) // Используем его же для перемешивания
+                val epochRng = Random(seed + epoch + 1)
+                for (i in order.indices) order[i] = i
+                order.shuffleInPlace(epochRng)
+
+                val t = (epoch + 1).toDouble()
+                context.biasCorrection1 = 1.0 - BETA1.pow(t)
+                context.biasCorrection2 = 1.0 - BETA2.pow(t)
 
                 var epochLoss = 0.0
-                for (i in epochOrder) {
-                    val prediction = forwardAndBackprop(local, trainFeatures[i], trainLabels[i], learningRate, l2Lambda, dropoutRate, epochRng)
-                    epochLoss += bceLoss(prediction, trainLabels[i])
+                for (i in order) {
+                    val label = trainLabels[i]
+                    val prediction = trainStep(local, context, trainFeatures[i], label, epochRng)
+                    epochLoss += bceLoss(prediction, label)
                 }
-                val trainLoss = epochLoss / trainFeatures.size
+                val trainLoss = epochLoss / order.size
 
-                // Проверка валидации каждые valCheckInterval эпох
                 if (epoch % valCheckInterval == 0) {
                     val valResult = evaluateNormalized(local, valFeatures, valLabels)
                     onProgress?.invoke(epoch, trainLoss, valResult.avgLoss, valResult.accuracy)
@@ -341,8 +317,7 @@ class NeuralNetwork(
                         bestValLoss = valResult.avgLoss
                         bestEpoch = epoch
                         staleCount = 0
-                        bestWeights = copyWeights(local)
-                        bestBiases = copyBiases(local)
+                        best.copyFrom(local)
                     } else {
                         staleCount++
                         if (patience > 0 && staleCount >= patience) {
@@ -357,19 +332,12 @@ class NeuralNetwork(
                 epoch++
             }
 
-            // 5. Восстанавливаем лучшие веса — не последнюю (возможно переобученную) версию
-            local.weights = bestWeights
-            local.biases = bestBiases
+            local.copyFrom(best)
 
-            // 6. Финальные метрики
             val finalTrain = evaluateNormalized(local, trainFeatures, trainLabels)
             val finalVal = evaluateNormalized(local, valFeatures, valLabels)
             val finalTest = evaluateNormalized(local, testFeatures, testLabels)
 
-            // 7. Публикуем test-holdout и веса вместе. Порядок важен:
-            // lastTestSet до snapshot.set, чтобы читатель, увидевший новые
-            // веса, гарантированно увидел и новый holdout. Обратный порядок
-            // допустил бы крохотное окно с новым test-сетом и старыми весами.
             lastTestSet = HoldoutSet(testFeatures, testLabels)
             snapshot.set(local)
 
@@ -383,18 +351,16 @@ class NeuralNetwork(
                 valAccuracy = finalVal.accuracy,
                 testLoss = finalTest.avgLoss,
                 testAccuracy = finalTest.accuracy,
-                split = indexSplit.summary
+                split = split.summary
             )
             lastTrainResult = result
             return result
-        } // mutationLock.withLock
+        }
     }
 
     /**
-     * Матрица ошибок при фиксированном пороге. Precision/recall/F1 — привычные
-     * метрики, но для античита критичнее FPR и FNR: FPR — доля легитных
-     * ударов, ошибочно помеченных как чит (то, за что банят невиновных),
-     * FNR — доля читов, которые проскочили.
+     * Матрица ошибок при фиксированном пороге. Для античита критичнее precision/recall:
+     * FPR — доля легитных окон, ошибочно помеченных как чит; FNR — доля пропущенных читов.
      */
     data class ThresholdMetrics(
         val threshold: Double,
@@ -425,34 +391,25 @@ class NeuralNetwork(
             if (totalCheat == 0) 0.0
             else falseNegatives.toDouble() / totalCheat
 
-        /**
-         * 95% доверительный интервал (Уилсон) для FPR. На малом числе legit-окон
-         * точечная оценка вводит в заблуждение: «0 ложных из 50» — это реальный
-         * FPR от 0% до ~7%, а не 0%.
-         */
+        /** 95% интервал Уилсона для FPR: на малой выборке точечная оценка вводит в заблуждение. */
         val falsePositiveRateInterval: Pair<Double, Double> get() =
             Stats.wilsonInterval(falsePositives, totalLegit)
 
-        /** 95% доверительный интервал (Уилсон) для recall (доли пойманных читов). */
+        /** 95% интервал Уилсона для recall. */
         val recallInterval: Pair<Double, Double> get() =
             Stats.wilsonInterval(truePositives, totalCheat)
     }
 
     /**
-     * Считает матрицу ошибок на TEST-сете последнего train() для каждого
-     * порога из [thresholds]. Test-сет не участвовал ни в обучении, ни в выборе
-     * лучшей эпохи. Forward pass выполняется один раз — вероятности
-     * не зависят от порога, меняется только решение.
-     *
-     * @return список метрик (в порядке [thresholds]) или null, если в этом
-     *         сеансе ещё не было train() — eval недоступен без holdout'а.
+     * Матрицы ошибок на test-сете последнего train() для каждого порога из [thresholds].
+     * @return null, если в этом сеансе ещё не было train()
      */
     fun evaluateThresholds(thresholds: DoubleArray): List<ThresholdMetrics>? {
         val testSet = lastTestSet ?: return null
         val state = snapshot.get()
 
-        // Один forward pass на весь набор — переиспользуем для всех порогов.
-        val probabilities = testSet.normalizedFeatures.map { forwardOnly(state, it) }
+        val buffers = newLayerBuffers()
+        val probabilities = testSet.normalizedFeatures.map { forwardOnly(state, it, buffers) }
 
         val totalLegit = testSet.labels.count { it < 0.5 }
         val totalCheat = testSet.labels.count { it >= 0.5 }
@@ -463,7 +420,7 @@ class NeuralNetwork(
                 val predictedCheat = probabilities[i] >= threshold
                 val actualCheat = testSet.labels[i] >= 0.5
                 when {
-                    predictedCheat && actualCheat  -> tp++
+                    predictedCheat && actualCheat -> tp++
                     predictedCheat && !actualCheat -> fp++
                     !predictedCheat && !actualCheat -> tn++
                     else -> fn++
@@ -483,14 +440,10 @@ class NeuralNetwork(
     /**
      * Делит индексы на train/val/test (60/20/20) отдельно по каждому классу.
      *
-     * Если у класса ≥ [MIN_GROUPS_PER_CLASS] разных групп, делит ЦЕЛЫМИ ГРУППАМИ:
-     * группы перемешиваются и раздаются в test, затем в val, остальные идут в train
-     * (в каждый сет попадает хотя бы одна группа). Строки без группы (старый формат
-     * датасета) считаются отдельными группами по одному окну.
-     *
-     * Если групп меньше — запасной вариант: случайное разбиение окон, как раньше.
-     * Это зафиксировано в [SplitSummary], чтобы админ видел, что метрики оптимистичны.
-     * Размеры сетов при разбиении по группам приблизительные: они зависят от размеров групп.
+     * Если у класса ≥ [MIN_GROUPS_PER_CLASS] групп, делит целыми группами: они перемешиваются
+     * и раздаются в test, затем в val, остальные идут в train (в каждом сете минимум одна группа).
+     * Строки без группы считаются отдельными группами по одному окну. Иначе — случайное
+     * разбиение окон, что отражено в [SplitSummary].
      */
     private fun splitIndices(labels: List<Double>, groups: List<String?>?, rng: Random): IndexSplit {
         val train = ArrayList<Int>()
@@ -514,15 +467,15 @@ class NeuralNetwork(
             if (byGroup.size >= MIN_GROUPS_PER_CLASS) {
                 grouped[c] = true
                 val units = ArrayList<List<Int>>(byGroup.values)
-                for (i in classIdx) if (groups?.get(i) == null) units.add(listOf(i)) // без группы — по одному окну
+                for (i in classIdx) if (groups?.get(i) == null) units.add(listOf(i))
                 units.shuffle(rng)
 
                 val classTest = ArrayList<Int>()
                 val classVal = ArrayList<Int>()
                 var next = 0
-                // test: минимум одна группа; берём ещё, пока не набрали цель и остаются ≥ 2 группы (val + train)
+                // test: минимум одна группа, затем добираем, пока остаются ≥ 2 группы (val + train)
                 do { classTest.addAll(units[next]); next++ } while (classTest.size < testTarget && units.size - next > 2)
-                // val: минимум одна группа; в train остаётся ≥ 1 группа
+                // val: минимум одна группа, в train остаётся ≥ 1
                 do { classVal.addAll(units[next]); next++ } while (classVal.size < valTarget && units.size - next > 1)
                 test.addAll(classTest)
                 validation.addAll(classVal)
@@ -543,138 +496,136 @@ class NeuralNetwork(
         return IndexSplit(train, validation, test, summary)
     }
 
-    /** He-инициализация (2015) — оптимальна для ReLU; bias нулями. */
+    /** He-инициализация весов (оптимальна для ReLU), bias и моменты Adam — нули. */
     private fun initWeights(state: Weights) {
         val rng = Random(seed)
         for (l in state.weights.indices) {
-            val scale = sqrt(2.0 / layerSizes[l]) // fan-in слоя l
+            val scale = sqrt(2.0 / layerSizes[l])
+            state.biases[l].fill(0.0)
+            state.mBiases[l].fill(0.0)
+            state.vBiases[l].fill(0.0)
             for (j in state.weights[l].indices) {
-                state.biases[l][j] = 0.0
-                for (k in state.weights[l][j].indices) {
-                    state.weights[l][j][k] = rng.nextGaussian() * scale
-                }
+                val row = state.weights[l][j]
+                for (k in row.indices) row[k] = rng.nextGaussian() * scale
+                state.mWeights[l][j].fill(0.0)
+                state.vWeights[l][j].fill(0.0)
             }
         }
     }
 
     /**
-     * Forward + backward + SGD-обновление по одному сэмплу.
-     * Дельта выходного слоя для BCE+Sigmoid упрощается до (ŷ − y).
-     * Градиент веса: δ_j · a_k; обновление: w -= lr · clip(δ·a + l2·w).
+     * Forward + backward + шаг Adam по одному сэмплу. Дельта выхода для BCE+Sigmoid — (ŷ − y).
+     * Градиент веса: clip(δ·a + l2·w).
      * @return предсказание до обновления (для подсчёта loss)
      */
-    private fun forwardAndBackprop(
-        state: Weights,
-        features: DoubleArray,
-        label: Double,
-        learningRate: Double,
-        l2Lambda: Double,
-        dropoutRate: Double, // НОВОЕ
-        rng: Random          // НОВОЕ
-    ): Double {
+    private fun trainStep(state: Weights, ctx: StepContext, features: DoubleArray, label: Double, rng: Random): Double {
         val layerCount = state.weights.size
-
-        // Forward: сохраняем pre-activation (z) и activation (a) для backward
-        val activations = arrayOfNulls<DoubleArray>(layerCount + 1)
-        val dropoutMasks = arrayOfNulls<DoubleArray>(layerCount) // НОВОЕ: маски dropout
-        activations[0] = features
+        val lastLayer = layerCount - 1
+        val activations = ctx.activations
+        val deltas = ctx.deltas
+        val dropoutRate = ctx.dropoutRate
+        val useDropout = dropoutRate > 0.0
+        val keepProbability = 1.0 - dropoutRate
 
         for (l in 0 until layerCount) {
-            val isLast = (l == layerCount - 1)
-            val z = DoubleArray(layerSizes[l + 1])
-            val a = DoubleArray(layerSizes[l + 1])
-            val prev = activations[l]!!
-            for (j in z.indices) {
-                var sum = state.biases[l][j]
-                val wj = state.weights[l][j]
-                for (k in prev.indices) {
-                    sum += wj[k] * prev[k]
-                }
-                z[j] = sum
-                a[j] = if (isLast) sigmoid(sum) else relu(sum)
-            }
+            val input = if (l == 0) features else activations[l - 1]
+            val output = activations[l]
+            forwardLayer(state, l, input, output, l == lastLayer)
 
-            // Применяем Inverted Dropout только к скрытым слоям
-            if (!isLast && dropoutRate > 0.0) {
-                val mask = DoubleArray(a.size)
-                for (j in a.indices) {
+            if (l != lastLayer && useDropout) {
+                val mask = ctx.masks[l]
+                for (j in output.indices) {
                     if (rng.nextDouble() < dropoutRate) {
-                        a[j] = 0.0
+                        output[j] = 0.0
                         mask[j] = 0.0
                     } else {
-                        a[j] /= (1.0 - dropoutRate) // Масштабируем активные нейроны
+                        output[j] /= keepProbability
                         mask[j] = 1.0
                     }
                 }
-                dropoutMasks[l] = mask
             }
-
-            activations[l + 1] = a
         }
 
-        val output = activations[layerCount]!![0]
+        val prediction = activations[lastLayer][0]
+        deltas[lastLayer][0] = prediction - label
 
-        // Backward: дельты по слоям (от последнего к первому)
-        val deltas = arrayOfNulls<DoubleArray>(layerCount)
-        val lastDeltas = DoubleArray(1)
-        lastDeltas[0] = output - label
-        deltas[layerCount - 1] = lastDeltas
-
-        for (l in layerCount - 2 downTo 0) {
-            val delta = DoubleArray(layerSizes[l + 1])
-            val nextDelta = deltas[l + 1]!!
+        for (l in lastLayer - 1 downTo 0) {
+            val delta = deltas[l]
+            val nextDelta = deltas[l + 1]
             val nextWeights = state.weights[l + 1]
-            val activation = activations[l + 1]!!
-            val mask = dropoutMasks[l] // Получаем маску для этого слоя
+            val activation = activations[l]
+            val mask = if (useDropout) ctx.masks[l] else null
 
+            delta.fill(0.0)
+            for (n in nextDelta.indices) {
+                val row = nextWeights[n]
+                val dn = nextDelta[n]
+                for (j in delta.indices) {
+                    delta[j] += row[j] * dn
+                }
+            }
             for (j in delta.indices) {
-                var sum = 0.0
-                for (n in nextDelta.indices) {
-                    sum += nextWeights[n][j] * nextDelta[n]
-                }
-                // ReLU': 1 если нейрон был активен (a > 0), иначе 0
-                var d = if (activation[j] > 0.0) sum else 0.0
-
-                // Если нейрон был выключен dropout'ом, градиент через него не течет
-                if (mask != null) {
-                    d *= mask[j]
-                }
+                var d = if (activation[j] > 0.0) delta[j] else 0.0
+                if (mask != null) d *= mask[j]
                 delta[j] = d
             }
-            deltas[l] = delta
         }
 
-        // SGD-обновление (остается без изменений)
+        val learningRate = ctx.learningRate
+        val l2Lambda = ctx.l2Lambda
+        val bias1 = ctx.biasCorrection1
+        val bias2 = ctx.biasCorrection2
+
         for (l in 0 until layerCount) {
-            val prev = activations[l]!!
-            val delta = deltas[l]!!
-            for (j in state.weights[l].indices) {
+            val prev = if (l == 0) features else activations[l - 1]
+            val delta = deltas[l]
+            val weights = state.weights[l]
+            val mWeights = state.mWeights[l]
+            val vWeights = state.vWeights[l]
+            val biases = state.biases[l]
+            val mBiases = state.mBiases[l]
+            val vBiases = state.vBiases[l]
+
+            for (j in weights.indices) {
                 val dj = delta[j]
-                val wj = state.weights[l][j]
+                val wj = weights[j]
+                val mj = mWeights[j]
+                val vj = vWeights[j]
+
                 for (k in wj.indices) {
-                    val grad = (dj * prev[k] + l2Lambda * wj[k]).coerceIn(-CLAMP, CLAMP)
-                    wj[k] -= learningRate * grad
+                    // min/max вместо coerceIn: без ветвлений JIT векторизует цикл
+                    val grad = Math.min(CLAMP, Math.max(-CLAMP, dj * prev[k] + l2Lambda * wj[k]))
+                    val m = BETA1 * mj[k] + (1.0 - BETA1) * grad
+                    val v = BETA2 * vj[k] + (1.0 - BETA2) * grad * grad
+                    mj[k] = m
+                    vj[k] = v
+                    wj[k] -= learningRate * (m / bias1) / (sqrt(v / bias2) + ADAM_EPS)
                 }
-                state.biases[l][j] -= learningRate * dj
+
+                val mb = BETA1 * mBiases[j] + (1.0 - BETA1) * dj
+                val vb = BETA2 * vBiases[j] + (1.0 - BETA2) * dj * dj
+                mBiases[j] = mb
+                vBiases[j] = vb
+                biases[j] -= learningRate * (mb / bias1) / (sqrt(vb / bias2) + ADAM_EPS)
             }
         }
 
-        return output
+        return prediction
     }
 
-    /** BCE для одного сэмпла. */
     private fun bceLoss(prediction: Double, label: Double): Double {
         val p = prediction.coerceIn(EPS, 1.0 - EPS)
         return -(label * ln(p) + (1.0 - label) * ln(1.0 - p))
     }
 
-    /** Оценка на уже нормализованных сэмплах: средний BCE и accuracy (порог 0.5). */
-    private fun evaluateNormalized(state: Weights, features: List<DoubleArray>, labels: List<Double>): Evaluation {
+    /** Средний BCE и accuracy (порог 0.5) на уже нормализованных сэмплах. */
+    private fun evaluateNormalized(state: Weights, features: List<DoubleArray>, labels: DoubleArray): Evaluation {
         if (features.isEmpty()) return Evaluation(0.0, 0.0)
+        val buffers = newLayerBuffers()
         var totalLoss = 0.0
         var correct = 0
         for (i in features.indices) {
-            val prediction = forwardOnly(state, features[i])
+            val prediction = forwardOnly(state, features[i], buffers)
             totalLoss += bceLoss(prediction, labels[i])
             val predictedClass = if (prediction >= 0.5) 1.0 else 0.0
             if (predictedClass == labels[i]) correct++
@@ -684,26 +635,7 @@ class NeuralNetwork(
 
     private data class Evaluation(val avgLoss: Double, val accuracy: Double)
 
-    /** Прямой проход по уже нормализованным признакам по заданному состоянию сети. */
-    private fun forwardOnly(state: Weights, normalizedFeatures: DoubleArray): Double {
-        var activation = normalizedFeatures
-        for (l in state.weights.indices) {
-            val next = DoubleArray(layerSizes[l + 1])
-            val isLast = (l == state.weights.size - 1)
-            for (j in next.indices) {
-                var z = state.biases[l][j]
-                val wj = state.weights[l][j]
-                for (k in activation.indices) {
-                    z += wj[k] * activation[k]
-                }
-                next[j] = if (isLast) sigmoid(z) else relu(z)
-            }
-            activation = next
-        }
-        return activation[0]
-    }
-
-    /** Z-score статистики по train-выборке. Константный признак получает std = 1.0. */
+    /** Z-score статистики по train-выборке; константный признак получает std = 1.0. */
     private fun computeNormStats(state: Weights, trainFeatures: List<DoubleArray>) {
         val n = trainFeatures.size
         for (i in 0 until inputSize) {
@@ -718,23 +650,11 @@ class NeuralNetwork(
             }
             variance /= n
 
+            val std = sqrt(variance)
             state.featureMean[i] = mean
-            state.featureStd[i] = if (sqrt(variance) < MIN_STD) 1.0 else sqrt(variance)
+            state.featureStd[i] = if (std < MIN_STD) 1.0 else std
         }
     }
-
-    // ------------------------------------------------------------------
-    // Снапшоты весов (для early stopping)
-    // ------------------------------------------------------------------
-
-    private fun copyWeights(state: Weights): Array<Array<DoubleArray>> =
-        state.weights.map { layer -> layer.map { it.copyOf() }.toTypedArray() }.toTypedArray()
-
-    private fun copyBiases(state: Weights): Array<DoubleArray> = state.biases.map { it.copyOf() }.toTypedArray()
-
-    // ------------------------------------------------------------------
-    // Сохранение / загрузка (бинарный формат, без Java Serialization)
-    // ------------------------------------------------------------------
 
     /** Проверяет, что модель в файле совместима с текущим [inputSize]. */
     fun isCompatibleWith(file: File): Boolean {
@@ -754,9 +674,8 @@ class NeuralNetwork(
 
     fun saveTo(file: File) {
         val state = snapshot.get()
-        // Пишем во временный файл и атомарно переименовываем: обрыв сервера
-        // посреди записи не должен оставлять model.dat с валидным заголовком
-        // и обрезанными весами.
+        // Пишем во временный файл и переименовываем: обрыв посреди записи
+        // не должен оставлять model.dat с валидным заголовком и обрезанными весами.
         val tmpFile = File(file.parentFile, file.name + ".tmp")
         try {
             DataOutputStream(tmpFile.outputStream().buffered()).use { output ->
@@ -778,7 +697,6 @@ class NeuralNetwork(
                 for (m in state.featureMean) output.writeDouble(m)
                 for (s in state.featureStd) output.writeDouble(s)
 
-                // v2: метрики обучения — /daynac info показывает их и после рестарта
                 val tr = lastTrainResult
                 if (tr != null) {
                     output.writeBoolean(true)
@@ -793,28 +711,13 @@ class NeuralNetwork(
                     output.writeBoolean(false)
                 }
             }
-            if (tmpFile.exists() && file.exists()) {
-                // ATOMIC_MOVE с REPLACE_EXISTING не поддерживается всеми ФС
-                // для замены существующего файла — fallback на delete + rename.
-                try {
-                    java.nio.file.Files.move(
-                        tmpFile.toPath(), file.toPath(),
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING
-                    )
-                } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-                    file.delete()
-                    if (!tmpFile.renameTo(file)) {
-                        throw java.io.IOException("Не удалось заменить файл модели: $file")
-                    }
-                }
+            if (file.exists()) {
+                Files.move(tmpFile.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
             } else {
-                java.nio.file.Files.move(
-                    tmpFile.toPath(), file.toPath(),
-                    java.nio.file.StandardCopyOption.ATOMIC_MOVE
-                )
+                Files.move(tmpFile.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE)
             }
         } catch (e: Exception) {
-            tmpFile.delete() // не оставляем мусорный tmp
+            tmpFile.delete()
             throw e
         }
     }
@@ -847,8 +750,7 @@ class NeuralNetwork(
                 for (i in loaded.featureMean.indices) loaded.featureMean[i] = input.readDouble()
                 for (i in loaded.featureStd.indices) loaded.featureStd[i] = input.readDouble()
 
-                // v2: блок метрик обучения. Файл может закончиться здесь (v1 после
-                // чистки версии — прочитанный ещё до bump'а) — тогда метрик нет.
+                // Блок метрик может отсутствовать, если файл закончился на весах.
                 lastTrainResult = if (input.available() > 0 && input.readBoolean()) {
                     TrainResult(
                         epochsRun = input.readInt(),
@@ -861,11 +763,31 @@ class NeuralNetwork(
                     )
                 } else null
 
-                // Публикуем атомарно: либо старая модель, либо полностью загруженная новая.
-                // Под mutationLock — параллельный train не сможет затереть её своим set().
                 lastTestSet = null
                 snapshot.set(loaded)
             }
         }
+    }
+}
+
+private fun Array<DoubleArray>.deepCopy() = Array(size) { this[it].copyOf() }
+
+private fun Array<Array<DoubleArray>>.deepCopy() = Array(size) { this[it].deepCopy() }
+
+private fun Array<DoubleArray>.copyFrom(src: Array<DoubleArray>) {
+    for (i in indices) src[i].copyInto(this[i])
+}
+
+private fun Array<Array<DoubleArray>>.copyFrom(src: Array<Array<DoubleArray>>) {
+    for (i in indices) this[i].copyFrom(src[i])
+}
+
+/** Тот же алгоритм, что у [java.util.Collections.shuffle], — порядок для одного seed не меняется. */
+private fun IntArray.shuffleInPlace(random: Random) {
+    for (i in size downTo 2) {
+        val j = random.nextInt(i)
+        val tmp = this[i - 1]
+        this[i - 1] = this[j]
+        this[j] = tmp
     }
 }
