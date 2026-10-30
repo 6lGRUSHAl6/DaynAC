@@ -102,6 +102,17 @@ class DetectionEngine(
     /** Банить ли одновременно по IP (punish-action: ban). true = бан профиля + бан IP. */
     val banWithIp: Boolean
 
+    /**
+     * Шаблоны сообщений наказанному игроку из detection.punish-message — то, что видит
+     * игрок на экране кика и в бан-листе. Каждый элемент списка — отдельная строка экрана;
+     * плейсхолдеры ({reason} {player} {score} {average} {action}) подставляются в
+     * [punishPlayer], &-коды (включая hex &#RRGGBB) переводятся в §-формат.
+     * Ключ ban-ip при отсутствии наследует текст ban (см. читателю config.yml).
+     */
+    val punishMessageKick: List<String>
+    val punishMessageBan: List<String>
+    val punishMessageBanIp: List<String>
+
     init {
         val config = plugin.config
         flagThreshold = config.getDouble("detection.flag-threshold", 0.65)
@@ -117,6 +128,13 @@ class DetectionEngine(
         punishAction = config.getString("detection.punish-action", "kick")?.lowercase() ?: "kick"
         punishReason = config.getString("detection.punish-reason", "KillAura (обнаружено нейросетью DaynAC)")!!
         banWithIp = config.getBoolean("detection.ban-with-ip", false)
+        punishMessageKick = readMessageTemplate(config, "detection.punish-message.kick")
+            ?: DEFAULT_PUNISH_MESSAGE_KICK
+        punishMessageBan = readMessageTemplate(config, "detection.punish-message.ban")
+            ?: DEFAULT_PUNISH_MESSAGE_BAN
+        // Наследование из config.yml: «Ключ ban-ip наследует ban, если не задан».
+        punishMessageBanIp = readMessageTemplate(config, "detection.punish-message.ban-ip")
+            ?: punishMessageBan
 
         require(punishAction in setOf("none", "kick", "ban")) {
             "detection.punish-action должен быть none/kick/ban, получено: \"$punishAction\""
@@ -656,11 +674,112 @@ class DetectionEngine(
     }
 
     /**
+     * Читает шаблон сообщения из detection.punish-message.<ключ>. Допустимы одна
+     * строка (переносы \n остаются внутри неё) и YAML-список строк (каждая — новая
+     * строка экрана, как описано в комментарии к конфигу). Отсутствующий или пустой
+     * ключ даёт null — вызывающий код берёт значение по умолчанию (для ban-ip это
+     * текст ban: наследование в конфиге описано).
+     */
+    private fun readMessageTemplate(
+        config: org.bukkit.configuration.file.FileConfiguration,
+        path: String,
+    ): List<String>? {
+        val value = config.get(path) ?: return null
+        val lines = when (value) {
+            is String -> listOf(value)
+            is List<*> -> value.map { it.toString() }
+            else -> null
+        } ?: return null
+        // Полностью пустой шаблон бессмысленен — считаем ключ не заданным (откат к
+        // дефолту или наследованию ban). Одиночные пустые строки внутри списка
+        // оставляем: это сознательные «пустые» строки на экране наказанного.
+        return if (lines.isEmpty() || lines.all { it.isBlank() }) null else lines
+    }
+
+    /**
+     * Собирает сообщение наказания из шаблона: подставляет плейсхолдеры, соединяет
+     * строки переносом и переводит &-коды в §-формат ([translateColorCodes]).
+     *
+     * Плейсхолдеры (см. комментарии к punish-message в config.yml):
+     *   {reason}  — punish-reason
+     *   {player}  — ник наказанного
+     *   {score}   — средняя вероятность с процентом, например 97.3%
+     *   {average} — она же числом, например 0.973
+     *   {action}  — kick | ban | ban-ip
+     *
+     * Подстановка идёт ДО перевода цветов: значения (например, свой punish-reason)
+     * могут сами содержать &-коды и после переподстановки тоже окрашиваются.
+     */
+    private fun renderPunishMessage(
+        template: List<String>,
+        player: Player,
+        average: Double,
+        action: String,
+    ): String {
+        val placeholders = mapOf(
+            "reason" to punishReason,
+            "player" to player.name,
+            "score" to String.format(Locale.US, "%.1f", average * 100) + "%",
+            "average" to String.format(Locale.US, "%.3f", average),
+            "action" to action,
+        )
+        val rendered = template.map { line ->
+            placeholders.entries.fold(line) { text, (key, value) -> text.replace("{$key}", value) }
+        }
+        return rendered.joinToString("\n") { translateColorCodes(it) }
+    }
+
+    /**
+     * Перевод цветовых кодов в legacy-формат, который принимает kickPlayer и бан-лист:
+     *   &[0-9a-fk-or] → §код (&-код допустим и в заглавных, вывод — строчные)
+     *   &#RRGGBB      → §x§R§R§G§G§B§B — ванильный способ записать hex-цвет
+     *                    семью обычными константами (клиенты с 1.16).
+     * Готовые §-коды не трогаются: конфиги со старым § работают как раньше.
+     */
+    private fun translateColorCodes(text: String): String {
+        if ('&' !in text) return text
+        val sb = StringBuilder(text.length)
+        var i = 0
+        while (i < text.length) {
+            val ch = text[i]
+            if (ch == '&' && i + 1 < text.length) {
+                val code = text[i + 1]
+                // &#RRGGBB — после '#' нужно ещё 6 символов.
+                if (code == '#' && i + 8 <= text.length) {
+                    val hex = text.substring(i + 2, i + 8)
+                    if (HEX_COLOR.matches(hex)) {
+                        sb.append("§x")
+                        hex.lowercase().forEach { c -> sb.append('§').append(c) }
+                        i += 8
+                        continue
+                    }
+                }
+                if (code.lowercaseChar() in LEGACY_CODE_CHARS) {
+                    sb.append('§').append(code.lowercaseChar())
+                    i += 2
+                    continue
+                }
+            }
+            // Не код — '&' идёт на экран как обычный символ; то же для '#' рядом
+            // с ним: "&#GGGGGG" (не шесть цифр) ключом не считается.
+            sb.append(ch)
+            i++
+        }
+        return sb.toString()
+    }
+
+    /**
      * Наказание согласно detection.punish-action из конфига:
      *  none — только запись в лог (полное бездействие)
      *  kick — кик с сообщением
      *  ban  — бан; при detection.ban-with-ip=true дополнительно бан по IP
      *         (banPlayerFull), иначе только профиль (UUID)
+     *
+     * Текст, который видит наказанный (и который хранится в бан-листе), собирается
+     * из шаблонов detection.punish-message через [renderPunishMessage]: kick —
+     * из punish-message.kick, ban — из punish-message.ban, ban + IP — из
+     * punish-message.ban-ip (наследует ban, если ключ не задан). Запасные
+     * консольные ban/kick по-прежнему передают punish-reason одной строкой.
      *
      * При "none" игрок остаётся на сервере, поэтому tracking-карты НЕ трогаем.
      * predictions — это та самая история, по которой handlePrediction считает
@@ -676,11 +795,6 @@ class DetectionEngine(
         if (!player.isOnline) return
         val average = getAveragePrediction(player) ?: 0.0
         val percent = String.format(Locale.US, "%.1f", average * 100)
-        val message = buildString {
-            append("§c[DaynAC] $punishReason\n")
-            append("§7Средняя вероятность: §f$percent%\n")
-            append("§7Если это ошибка — сообщите администрации.")
-        }
 
         when (punishAction) {
             "none" -> {
@@ -691,6 +805,14 @@ class DetectionEngine(
             }
             "ban" -> {
                 plugin.logger.warning("[DaynAC] БАН: ${player.name} (средний скор $average, IP-бан: ${if (banWithIp) "да" else "нет"})")
+                // ban + IP берёт свой шаблон (пустой ключ наследует ban) и подставляет
+                // {action} = ban-ip, чтобы текст мог отличить жёсткий бан от обычного.
+                val message = renderPunishMessage(
+                    if (banWithIp) punishMessageBanIp else punishMessageBan,
+                    player,
+                    average,
+                    if (banWithIp) "ban-ip" else "ban"
+                )
                 try {
                     if (banWithIp) {
                         // banPlayerFull = бан профиля + бан по IP адресу (и кик)
@@ -709,6 +831,7 @@ class DetectionEngine(
             }
             else -> { // "kick" и любое другое значение, прошедшее require
                 plugin.logger.warning("[DaynAC] Кик: ${player.name} (средний скор $average)")
+                val message = renderPunishMessage(punishMessageKick, player, average, "kick")
                 try {
                     player.kickPlayer(message)
                 } catch (e: LinkageError) {
@@ -819,5 +942,30 @@ class DetectionEngine(
 
     fun shutdown() {
         inferencePool.shutdownNow()
+    }
+
+    companion object {
+        /**
+         * Шаблоны по умолчанию — копия секции punish-message из config.yml. Раньше
+         * этот текст собирался жёстко в [punishPlayer], и правка конфига ничего
+         * не меняла: теперь они вшиты только как умолчание, а не как единственный
+         * источник текста.
+         */
+        private val DEFAULT_PUNISH_MESSAGE_KICK = listOf(
+            "&c[DaynAC] &f{reason}",
+            "&7Средняя вероятность: &f{score}",
+            "&7Если это ошибка — сообщите администрации."
+        )
+
+        private val DEFAULT_PUNISH_MESSAGE_BAN = listOf(
+            "&cВы были забанены на этом сервере.",
+            "&7Если это ошибка — обратитесь к администрации."
+        )
+
+        /** Кодовые символы, переводимые из &-формата: цвета, форматирование, сброс. */
+        private const val LEGACY_CODE_CHARS = "0123456789abcdefklmnor"
+
+        /** Hex-цвет &#RRGGBB — регистр цифр и букв не важен. */
+        private val HEX_COLOR = Regex("[0-9a-fA-F]{6}")
     }
 }

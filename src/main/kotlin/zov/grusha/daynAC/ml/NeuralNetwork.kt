@@ -41,7 +41,7 @@ import kotlin.math.sqrt
  */
 class NeuralNetwork(
     val inputSize: Int,   // без дефолта, размер входа диктует FeatureExtractor
-    hiddenSizes: IntArray = intArrayOf(128, 64, 32),
+    hiddenSizes: IntArray = intArrayOf(8, 16),
     private val seed: Long = 42L
 ) {
 
@@ -251,10 +251,11 @@ class NeuralNetwork(
     fun train(
         samples: List<DoubleArray>,
         labels: List<Double>,
-        learningRate: Double = 0.001,
-        maxEpochs: Int = 1000,
-        patience: Int = 15,
+        learningRate: Double = 0.002,
+        maxEpochs: Int = 2000,
+        patience: Int = 40,
         l2Lambda: Double = 1e-4,
+        dropoutRate: Double = 0.15,
         groups: List<String?>? = null,
         onProgress: ((epoch: Int, trainLoss: Double, valLoss: Double?, valAcc: Double?) -> Unit)? = null
     ): TrainResult {
@@ -319,14 +320,14 @@ class NeuralNetwork(
             var epoch = 0
             val epochOrder = ArrayList<Int>(trainFeatures.size)
             while (epoch < maxEpochs) {
-                // SGD: перемешиваем порядок сэмплов каждую эпоху
+                val epochRng = Random(seed + epoch + 1) // НОВОЕ: генератор для dropout на эту эпоху
                 epochOrder.clear()
                 for (i in trainFeatures.indices) epochOrder.add(i)
-                epochOrder.shuffle(Random(seed + epoch + 1))
+                epochOrder.shuffle(epochRng) // Используем его же для перемешивания
 
                 var epochLoss = 0.0
                 for (i in epochOrder) {
-                    val prediction = forwardAndBackprop(local, trainFeatures[i], trainLabels[i], learningRate, l2Lambda)
+                    val prediction = forwardAndBackprop(local, trainFeatures[i], trainLabels[i], learningRate, l2Lambda, dropoutRate, epochRng)
                     epochLoss += bceLoss(prediction, trainLabels[i])
                 }
                 val trainLoss = epochLoss / trainFeatures.size
@@ -567,13 +568,17 @@ class NeuralNetwork(
         features: DoubleArray,
         label: Double,
         learningRate: Double,
-        l2Lambda: Double
+        l2Lambda: Double,
+        dropoutRate: Double, // НОВОЕ
+        rng: Random          // НОВОЕ
     ): Double {
         val layerCount = state.weights.size
 
         // Forward: сохраняем pre-activation (z) и activation (a) для backward
         val activations = arrayOfNulls<DoubleArray>(layerCount + 1)
+        val dropoutMasks = arrayOfNulls<DoubleArray>(layerCount) // НОВОЕ: маски dropout
         activations[0] = features
+
         for (l in 0 until layerCount) {
             val isLast = (l == layerCount - 1)
             val z = DoubleArray(layerSizes[l + 1])
@@ -588,6 +593,22 @@ class NeuralNetwork(
                 z[j] = sum
                 a[j] = if (isLast) sigmoid(sum) else relu(sum)
             }
+
+            // Применяем Inverted Dropout только к скрытым слоям
+            if (!isLast && dropoutRate > 0.0) {
+                val mask = DoubleArray(a.size)
+                for (j in a.indices) {
+                    if (rng.nextDouble() < dropoutRate) {
+                        a[j] = 0.0
+                        mask[j] = 0.0
+                    } else {
+                        a[j] /= (1.0 - dropoutRate) // Масштабируем активные нейроны
+                        mask[j] = 1.0
+                    }
+                }
+                dropoutMasks[l] = mask
+            }
+
             activations[l + 1] = a
         }
 
@@ -604,20 +625,26 @@ class NeuralNetwork(
             val nextDelta = deltas[l + 1]!!
             val nextWeights = state.weights[l + 1]
             val activation = activations[l + 1]!!
+            val mask = dropoutMasks[l] // Получаем маску для этого слоя
+
             for (j in delta.indices) {
                 var sum = 0.0
                 for (n in nextDelta.indices) {
                     sum += nextWeights[n][j] * nextDelta[n]
                 }
                 // ReLU': 1 если нейрон был активен (a > 0), иначе 0
-                delta[j] = if (activation[j] > 0.0) sum else 0.0
+                var d = if (activation[j] > 0.0) sum else 0.0
+
+                // Если нейрон был выключен dropout'ом, градиент через него не течет
+                if (mask != null) {
+                    d *= mask[j]
+                }
+                delta[j] = d
             }
             deltas[l] = delta
         }
 
-        // SGD-обновление: w -= lr * clip(δ·a + l2·w) — клиппинг только здесь,
-        // на уровне градиента (стандартная схема); дельты не клиппируем —
-        // их отсечение затирает масштаб ошибки при обратном распространении
+        // SGD-обновление (остается без изменений)
         for (l in 0 until layerCount) {
             val prev = activations[l]!!
             val delta = deltas[l]!!

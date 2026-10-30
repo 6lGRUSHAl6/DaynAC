@@ -10,6 +10,8 @@ import org.bukkit.plugin.java.JavaPlugin
 import org.bukkit.scheduler.BukkitScheduler
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
+import com.destroystokyo.paper.profile.PlayerProfile
+import org.bukkit.BanEntry
 import org.mockito.ArgumentMatchers.contains
 import org.mockito.MockedStatic
 import org.mockito.Mockito
@@ -783,6 +785,168 @@ class DetectionEngineTest {
     }
 
     // --- Наказания ----------------------------------------------------------
+
+    @Test
+    fun `default kick message reproduces the previous hardcoded text`() {
+        val engine = createEngine(custom()) // punish-reason: test reason
+        val p = player("Victim")
+        verdicts(engine, p, 0.75) // средний = 0.75 → {score} = 75.0%
+
+        engine.punishPlayer(p)
+
+        val captor = argumentCaptor<String>()
+        verify(p).kickPlayer(captor.capture())
+        assertEquals(
+            "§c[DaynAC] §ftest reason\n" +
+                "§7Средняя вероятность: §f75.0%\n" +
+                "§7Если это ошибка — сообщите администрации.",
+            captor.firstValue,
+            "шаблон по умолчанию дублирует прежний собранный вручную текст",
+        )
+    }
+
+    @Test
+    fun `kick message uses punish-message template with placeholders`() {
+        val engine = createEngine(
+            """
+            detection:
+              punish-reason: test reason
+              punish-message:
+                kick: "&c{player} was {action}-ed: {reason} @{score}"
+            """.trimIndent()
+        )
+        val p = player("Victim")
+        verdicts(engine, p, 0.75)
+
+        engine.punishPlayer(p)
+
+        val captor = argumentCaptor<String>()
+        verify(p).kickPlayer(captor.capture())
+        assertEquals("§cVictim was kick-ed: test reason @75.0%", captor.firstValue)
+    }
+
+    @Test
+    fun `ban message uses punish-message list with one line per element`() {
+        val engine = createEngine(
+            """
+            detection:
+              punish-action: ban
+              punish-reason: test reason
+              punish-message:
+                ban:
+                  - "&6Line one {score}"
+                  - "&7Line two average {average}"
+                  - "&8[&n{action}&8]"
+            """.trimIndent()
+        )
+        val p = player("Victim")
+        verdicts(engine, p, 0.5)
+
+        engine.punishPlayer(p)
+
+        val captor = argumentCaptor<String>()
+        // ban-with-ip: false — бан идёт через четырёхаргументный ban() (только профиль),
+        // а не через banPlayerFull. E у ban()-method выведен из возвращаемого типа, поэтому
+        // его нужно назвать явно.
+        verify(p).ban<BanEntry<PlayerProfile>>(
+            captor.capture(),
+            Mockito.isNull<java.util.Date>(),
+            captor.capture(),
+            org.mockito.ArgumentMatchers.anyBoolean(),
+        )
+        assertEquals(
+            "§6Line one 50.0%\n" +
+                "§7Line two average 0.500\n" +
+                "§8[§nban§8]",
+            captor.firstValue,
+        )
+    }
+
+    @Test
+    fun `ban-ip message inherits ban template when key is absent`() {
+        val engine = createEngine(
+            """
+            detection:
+              punish-action: ban
+              ban-with-ip: true
+              punish-reason: test reason
+              punish-message:
+                ban:
+                  - "&aShared text {action}"
+            """.trimIndent()
+        )
+        val p = player("Victim")
+
+        engine.punishPlayer(p)
+
+        val captor = argumentCaptor<String>()
+        verify(p).banPlayerFull(captor.capture())
+        assertEquals("§aShared text ban-ip", captor.firstValue)
+    }
+
+    @Test
+    fun `ban-ip message overrides ban when key is present`() {
+        val base =
+            "  punish-action: ban\n" +
+            "  punish-reason: test reason\n" +
+            "  punish-message:\n" +
+            "    ban: \"&7plain ban {action}\"\n" +
+            "    ban-ip: \"&4hard ban {action}\""
+
+        val profileOnly = player("ProfileOnly")
+        createEngine("detection:\n$base").punishPlayer(profileOnly)
+
+        val profileCaptor = argumentCaptor<String>()
+        // ban-with-ip: false → профильный ban(), а не banPlayerFull.
+        verify(profileOnly).ban<BanEntry<PlayerProfile>>(
+            profileCaptor.capture(),
+            Mockito.isNull<java.util.Date>(),
+            profileCaptor.capture(),
+            org.mockito.ArgumentMatchers.anyBoolean(),
+        )
+        assertEquals("§7plain ban ban", profileCaptor.firstValue)
+
+        val withIp = player("WithIp")
+        createEngine("detection:\n  ban-with-ip: true\n$base").punishPlayer(withIp)
+
+        val ipCaptor = argumentCaptor<String>()
+        verify(withIp).banPlayerFull(ipCaptor.capture())
+        assertEquals("§4hard ban ban-ip", ipCaptor.firstValue)
+    }
+
+    @Test
+    fun `empty punish-message falls back to defaults`() {
+        val engine = createEngine("detection:\n  punish-message:\n    kick: \"\"\n    ban: []")
+        val p = player("Victim")
+
+        engine.punishPlayer(p)
+
+        val captor = argumentCaptor<String>()
+        verify(p).kickPlayer(captor.capture())
+        assertTrue(captor.firstValue.contains("сообщите администрации"))
+    }
+
+    @Test
+    fun `punish message translates ampersand hex colors and passthrough`() {
+        val engine = createEngine(
+            """
+            detection:
+              punish-message:
+                kick: "&#22761BHex&b&L&O K&#GGGGGG&#22761B"
+            """.trimIndent()
+        )
+        val p = player("Victim")
+
+        engine.punishPlayer(p)
+
+        val captor = argumentCaptor<String>()
+        verify(p).kickPlayer(captor.capture())
+        assertEquals(
+            "§x§2§2§7§6§1§bHex§b§l§o K&#GGGGGG§x§2§2§7§6§1§b",
+            captor.firstValue,
+            "hex-цвет переводится, невалидный &#GGGGGG остаётся текстом",
+        )
+    }
 
     @Test
     fun `offline player is not punished`() {
