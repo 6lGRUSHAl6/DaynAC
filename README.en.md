@@ -26,6 +26,7 @@ The target use case is **1.9+ no-cooldown PvP**, where legitimately high CPS is 
 - [Collecting a dataset](#collecting-a-dataset)
 - [Training and evaluating the model](#training-and-evaluating-the-model)
 - [How decisions are made](#how-decisions-are-made)
+- [Player monitoring (GUI)](#player-monitoring-gui)
 - [Configuration](#configuration)
 - [Plugin files](#plugin-files)
 - [Architecture](#architecture)
@@ -39,10 +40,12 @@ The target use case is **1.9+ no-cooldown PvP**, where legitimately high CPS is 
 
 - **A model tailored to your server.** No shipped signatures: the network learns from data you recorded yourself - both the legit and the cheat sessions are played by your people.
 - **Behavior, not clicks.** 343 features per window of 16 hits: aiming geometry, rotation entropy, timing predictability. Details in [How it works](#how-it-works).
-- **Zero ML dependencies.** The MLP 343→128→64→32→1 is written in pure Kotlin: neither Python nor PyTorch is needed on the server.
+- **Zero ML dependencies.** A compact MLP 343→8→16→1 is written in pure Kotlin: neither Python nor PyTorch is needed on the server.
 - **The main tick stays free.** Inference runs in separate daemon threads; model weights are an immutable snapshot behind an `AtomicReference`, so retraining on a live server never blocks detection.
 - **Everything stays local.** The dataset, model and config live in `plugins/DaynAC/`; there is no telemetry; player UUIDs never end up in CSV files - SHA-256 pseudonyms with a salt are used instead.
 - **Honest metrics.** Wilson confidence intervals in `/daynac eval`, session-based splitting against data leakage, and explicit warnings while there is not enough data yet.
+- **Cautious punishment.** Kick/ban only after several independent windows in a row, smooth damage reduction before that, and an inactivity reset that still remembers a suspicious score.
+- **Admin-friendly.** Alerts with a cooldown and aggregation, a customizable kick/ban screen, a monitoring GUI with teleport, and temporary exemptions for streamers and testers.
 
 ### Comparison of approaches
 
@@ -61,10 +64,10 @@ flowchart TB
     hit["Player hit<br/>ENTITY_ATTACK, both are players"] --> track["SnapshotTracker<br/>per-tick rotation and velocity snapshots"]
     track --> hitdata["HitData<br/>21 features per hit"]
     hitdata --> feat["FeatureExtractor<br/>window of 16 hits<br/>16 × 21 + 7 aggregates = 343 features"]
-    feat --> nn["NeuralNetwork<br/>343 → 128 → 64 → 32 → 1<br/>pure Kotlin"]
+    feat --> nn["NeuralNetwork<br/>343 → 8 → 16 → 1<br/>pure Kotlin"]
     nn --> score["Cheat probability 0…1<br/>on every hit"]
     score --> rule{"Thresholds"}
-    rule -->|"score ≥ 0.65"| alert["Admin alert"]
+    rule -->|"score ≥ 0.65"| alert["Admin alert<br/>(with cooldown)"]
     rule -->|"average ≥ 0.70"| reduce["Damage reduction<br/>multiplier ≈ 0.83 → 0.67"]
     rule -->|"average ≥ 0.90"| cancel["Damage cancel"]
     rule -->|"≥ 0.95 in 2 independent windows"| punish["Kick / ban"]
@@ -75,6 +78,8 @@ flowchart TB
 **Window aggregates:** mean angle, coefficients of variation, angle-distribution entropy, lag-1 autocorrelations (mechanical predictability of timing and aim), R² of the angle's linear trend (monotonic final adjustment of the aim).
 
 CPS is deliberately not used as a feature: in no-cooldown PvP, legitimate players click fast and steadily. Mechanical regularity is captured by the autocorrelation of hit intervals, not by their absolute speed.
+
+If the pause between hits exceeds 2 seconds, the interval history is reset: it counts as a new fight, and the old timing statistics are no longer relevant.
 
 > [!NOTE]
 > Only **landed** `ENTITY_ATTACK` hits between players are recorded. Hits cancelled by other plugins and sword sweep attacks never enter the history.
@@ -89,6 +94,8 @@ CPS is deliberately not used as a feature: in no-cooldown PvP, legitimate player
 |---|---|
 | Server | **Paper 1.21.11 or newer** (the same jar; tested on 1.21.11 and up to 26.3) |
 | Java | **21+** for 1.21.11 and **25+** for Paper 26.1+ (a server requirement; the plugin is built for Java 21 and runs on both) |
+
+The plugin is built against the 1.21.11 API, but auxiliary calls (action bar, kick/ban) have fallback paths in case the API turns out to be incompatible on newer Paper versions, so the hit handler does not crash because of it.
 
 ### Prebuilt JAR
 
@@ -123,39 +130,39 @@ gradle runServer -PmcVersion=26.1.2    # same, on another Minecraft version
 1. Record **several legit sessions** and **several cheat sessions** (see [Collecting a dataset](#collecting-a-dataset)).
 2. Run `/daynac train`.
 3. Run `/daynac eval` and look at the false-positive rate on your data.
-4. Start with alerts only (see the note on damage modification in [Known limitations](#known-limitations)) and watch `/daynac allinfo`.
+4. Start with alerts only: `punish-enabled: false` or `punish-action: none` (kick/ban disabled), and watch `/daynac allinfo`. Note that damage reduction stays active (see [Known limitations](#known-limitations)).
 5. Enable kick first, and ban only once you trust the model.
 
 ---
 
 ## Commands
 
-Each command requires its own permission (see [Permissions](#permissions)); `daynac.admin` (ops by default) has all of them.
+Each command requires its own permission (see [Permissions](#permissions)); `daynac.admin` (ops by default) has all of them. Tab completion only offers the subcommands and player names available to the sender.
 
 | Command | What it does | Permission |
 |---|---|---|
 | `/daynac record <player> <legit\|cheat\|off>` | Record dataset samples for a player | `daynac.record` |
 | `/daynac train` | Train the model on the collected dataset | `daynac.train` |
 | `/daynac eval` | Test-set metrics across a range of thresholds | `daynac.train` |
-| `/daynac info` | Dataset, sessions, model state, thresholds | `daynac.view` |
-| `/daynac ver [player]` | Without a name: plugin status; with a name: the player's scores and hit count in the current window | `daynac.view` |
+| `/daynac info` | Dataset, sessions, training metrics, model state, thresholds, punishment mode, number of exemptions | `daynac.view` |
+| `/daynac ver [player]` | Without a name: plugin status; with a name: the player's last and average score and hit count in the current window | `daynac.view` |
 | `/daynac allinfo` | Player-monitoring GUI (teleporting from it needs `daynac.spectate`) | `daynac.view` |
 | `/daynac reset` | Return from observation to where it started (location and game mode) | `daynac.spectate` |
-| `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` | `daynac.config` |
-| `/daynac clearflags <player>` | Manually reset a player's flags and current window | `daynac.config` |
+| `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` and to the console; the value is saved to `config.yml` | `daynac.config` |
+| `/daynac clearflags <player>` | Manually reset a player's flags and current window (also works for offline players) | `daynac.config` |
 | `/daynac exempt <player> [time\|off]` | Grant a temporary exemption from detection (`30s`, `5m`, `2h`, `1d`); without time - permanent; `off` - remove | `daynac.exempt.manage` |
-| `/daynac reload` | Reload `config.yml` (threshold changes need a restart) | `daynac.config` |
+| `/daynac reload` | Reload `config.yml` (only `hit-logging` is applied; everything else needs a restart) | `daynac.config` |
 
 ---
 
 ## Permissions
 
-Permissions are checked per subcommand, so access can be granted in parts (for example via LuckPerms). `daynac.admin` (ops by default) includes all permissions below **except** `daynac.exempt`.
+Permissions are checked per subcommand, so access can be granted in parts (for example via LuckPerms). `daynac.admin` (ops by default) includes all permissions below **except** `daynac.exempt`. The list must match `plugin.yml`.
 
 | Permission | Grants |
 |---|---|
 | `daynac.view` | `/daynac ver`, `info`, `allinfo` (read-only) |
-| `daynac.alerts` | suspicious-hit alerts and the per-hit log (`/daynac debug`) in chat |
+| `daynac.alerts` | suspicious-hit alerts, punishment notices and the per-hit log (`/daynac debug`) in chat |
 | `daynac.spectate` | teleport to a player from `/daynac allinfo` in spectator mode and return via `/daynac reset` |
 | `daynac.record` | `/daynac record` |
 | `daynac.train` | `/daynac train`, `eval` |
@@ -180,6 +187,7 @@ LuckPerms example:
 - `daynac.exempt` is deliberately separate from `daynac.admin`: otherwise a stolen admin account would be immune to the anti-cheat, and admins could not test the plugin on themselves. Grant it explicitly, and only to people you trust.
 - `daynac.exempt.manage` is part of `daynac.admin`: an operator can grant temporary exemptions to other players. By itself it does not provide immunity - the exemption must be activated via `/daynac exempt`.
 - Temporary exemptions are stored in `exemptions.yml` and expire automatically; permanent immunity (`daynac.exempt`) does not expire.
+- A player with any kind of exemption (permission, temporary exemption, active recording) is neither analyzed nor subject to damage reduction.
 - `daynac.spectate` is re-checked on every click in the GUI, and `daynac.view` while it is open: a revoked permission takes effect immediately.
 
 </details>
@@ -197,14 +205,16 @@ LuckPerms example:
    /daynac record <player> off      # stop recording
    ```
 
-3. A feature vector is recorded every 16 hits (non-overlapping windows) in `plugins/DaynAC/legit_vectors.csv` and `cheat_vectors.csv`. Players in recording mode are not checked by detection: they are exempt while data is being collected (permanent exemption is granted by `daynac.exempt`).
+3. A feature vector is recorded every 16 hits (non-overlapping windows) in `plugins/DaynAC/legit_vectors.csv` and `cheat_vectors.csv`. The hit counter is local to the session: the first window fills in exactly 16 recorded hits. Players in recording mode are not checked by detection: they are exempt while data is being collected (permanent exemption is granted by `daynac.exempt`).
+
+While recording, the player sees in the action bar how many vectors have been written and how many hits remain until the next one; on `off`, the command reports how many vectors the session produced.
 
 Two metadata columns are appended to each vector:
 
-- `session_id`: one recording, from `record <player> legit|cheat` until `off`;
+- `session_id`: one recording, from `record <player> legit|cheat` until `off` (format `20261010-174225-3fa9`);
 - `player_hash`: a pseudonym for the player, the SHA-256 of the UUID with the salt from `dataset.salt`. The UUID itself is never written to the CSV.
 
-These columns are not used for training; they are used to split the dataset. Files in the old format are upgraded automatically, with a `*.bak` backup created first; old rows remain ungrouped. Do not lose or publish `dataset.salt`: without it, hashes for new recordings will not match the old ones.
+These columns are not used for training; they are used to split the dataset. Files in the old format are upgraded automatically, with a `*.bak` backup created first; old rows remain ungrouped. Do not lose or publish `dataset.salt`: without it, hashes for new recordings will not match the old ones. Malformed CSV rows are skipped during training with a warning in the console.
 
 > [!TIP]
 > **Data quality is what it all comes down to:**
@@ -214,7 +224,7 @@ These columns are not used for training; they are used to split the dataset. Fil
 > - record **at least 3 separate sessions per class**, preferably with different players; otherwise a proper group-based split is impossible;
 > - include "hard" legit players (high DPI, low sensitivity, fast aim): they are where the model most often makes mistakes.
 
-**Feature versioning.** If you change what any feature means, bump `FeatureExtractor.FEATURE_VERSION`. On startup the plugin compares it with `dataset.featver`: incompatible datasets are renamed to `<name>.featv<N>.bak` (nothing is deleted), and an incompatible model is renamed to `model.dat.old`.
+**Feature versioning.** If you change what any feature means, bump `FeatureExtractor.FEATURE_VERSION` (currently **2**: the signed entropy uses 11 bins, ±20° for yaw and ±10° for pitch). On startup the plugin compares it with `dataset.featver`: incompatible datasets are renamed to `<name>.featv<N>.bak` (nothing is deleted), and an incompatible model is renamed to `model.dat.old`.
 
 ---
 
@@ -222,21 +232,22 @@ These columns are not used for training; they are used to split the dataset. Fil
 
 ### `/daynac train`
 
-- Splits the dataset 60/20/20 into train/validation/test (stratified by class) and normalizes features using the training portion only.
+- Splits the dataset 60/20/20 into train/validation/test (stratified by class) and normalizes features (z-score) using the training portion only.
 - If there are ≥ 3 groups per class, it splits by **whole groups** (`training.split-by: session` or `player`), so windows from the same player never end up in both training and testing. With fewer groups, the split is random by window, and the plugin warns that the metrics are likely inflated.
 - Trains with early stopping on validation loss and restores the best weights. The test set is not used for training or epoch selection.
-- At least 5 vectors per class are required (in practice, hundreds are recommended).
-- Progress is shown in real time: a live progress bar in the action bar (for the player) and progress updates in chat every 10% of the epochs.
-- On completion: a report with train/validation/test metrics and the train/validation gap (overfitting); the model is saved to `model.dat` and detection is enabled automatically.
+- Parameters: Adam (lr 0.001), one sample at a time, BCE, L2 `1e-4`, dropout 0.15 on hidden layers, up to 1000 epochs; validation loss is checked every 5 epochs, and training stops after 15 checks without improvement.
+- At least 10 vectors in total and at least 5 per class are required (in practice, hundreds are recommended).
+- Training runs in a background thread, and only one run can be active at a time. Progress is shown in real time: a live progress bar in the action bar (for the player, at most twice a second) and progress updates in chat every 10% of the epochs.
+- On completion: a report with train/validation/test metrics, a description of the split, and the train/validation gap (overfitting, warning threshold 5 percentage points); the model is saved to `model.dat` and detection is enabled automatically.
 
 A large gap between train and validation accuracy means the data is insufficient or too uniform.
 
 ### `/daynac eval`
 
-Shows precision, recall, F1 and FPR on the test set for a range of thresholds, with 95% Wilson confidence intervals. A threshold is recommended only if the **upper bound** of the FPR is ≤ 1%. Even with zero errors, this requires ≥ 381 legit windows in the test set (roughly 1,900 legit vectors in the whole dataset). Until you have that much data, the plugin will tell you plainly that a low FPR is not statistically confirmed.
+Shows precision, recall, F1 and FPR on the test set for a range of thresholds (0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99), with 95% Wilson confidence intervals; the current `reduce-threshold` is marked in the table. A threshold is recommended only if the **upper bound** of the FPR is ≤ 1%. Even with zero errors, this requires ≥ 381 legit windows in the test set (roughly 1,900 legit vectors in the whole dataset). Until you have that much data, the plugin will tell you plainly that a low FPR is not statistically confirmed.
 
 > [!IMPORTANT]
-> `eval` only works in the same server run in which training happened: the test set is not stored in `model.dat`.
+> `eval` only works in the same server run in which training happened: the test set is not stored in `model.dat`. After a restart, `/daynac info` shows train/validation metrics, but no test metrics.
 
 ---
 
@@ -246,7 +257,7 @@ A cheat probability is computed on **every** hit from the last 16 hits, so neigh
 
 | What | Rule |
 |---|---|
-| Alert (players with `daynac.alerts`) | the current hit's score ≥ `flag-threshold` (0.65) |
+| Alert (players with `daynac.alerts`) | the current hit's score ≥ `flag-threshold` (0.65), at most once per `alert-cooldown-seconds` (5 s) per player |
 | Damage reduction | the average of the last `max-recent-predictions` (10) predictions ≥ `reduce-threshold` (0.70): the multiplier falls smoothly from ≈0.83 to ≈0.67 |
 | Damage cancel | the same average ≥ `cancel-threshold` (0.90) |
 | Kick / ban | score ≥ `punish-threshold` (0.95) in `punish-confirm-windows` (2) **independent** windows in a row |
@@ -255,20 +266,67 @@ False-positive safeguards:
 
 - the damage multiplier is calculated from **previous** predictions, so a player with no history always deals full damage on the first hit;
 - a window counts as independent only if it arrives at least 16 hits after the previously counted one (no hits in common). By default, punishment therefore needs roughly 32 consecutive hits at ≥ 0.95. An independent window gets up to 8 extra hits (half a window) to reach the threshold; if it is still below, the streak is broken;
-- after a punishment the streak is consumed: a repeat requires a fresh full streak;
+- after a punishment the streak is consumed: a repeat requires a fresh full streak (this also applies to modes without kick/ban);
 - inference runs asynchronously, so the server's main tick is never blocked.
 
-**Inactivity reset.** If a player has not hit anyone for longer than `inactivity-reset-seconds`, their flags are cleared: active predictions and the hit window are discarded, and the next 16 hits fill a new window. So that a cheater does not get a clean slate after 30 seconds of silence, the plugin remembers their average score (if it was ≥ `reduce-threshold`) for another `carry-over-seconds`: the score decays linearly to zero, and until a new window is filled, damage is calculated from it.
+### Alerts and cooldown
 
-The log is not cleared by the reset: the player stays in `/daynac allinfo` with "Recent hits" and their all-time maximum, and the card shows progress of the new window (`Hits: n/16`) and the verdict "Flags cleared after inactivity". The reset affects only online players; flags of players who have left are kept until TTL cleanup (1 hour), giving admins time to review them.
+Verdicts arrive on every hit, so without limits a suspicious player would flood the admins' chat. The first suspicious hit alerts immediately, and hits inside the cooldown are not lost: their count and maximum score arrive as an aggregate in the next message. The cooldown affects messages only - damage reduction and punishment work unchanged.
 
-**Manual reset.** The command `/daynac clearflags <player>` clears flags and resets the window immediately, without waiting for inactivity. Unlike the inactivity reset, the manual reset **does not** preserve the carry-over score: damage goes back to full from the first hit. The log and hit counter are also not cleared.
+The following bypass the cooldown:
+
+- the alert that counts the last window of a streak right before a real kick/ban (only if `punish-enabled: true` and `punish-action` is not `none`; in observation modes the cooldown applies to every message);
+- the notice about the punishment itself - everyone with `daynac.alerts` receives it, even if regular alerts had been suppressed;
+- the final aggregate when a fight ends (inactivity reset or `/daynac clearflags`): the accumulated suppressed hits go out in one message, after which the cooldown is lifted and the first suspicious hit of the next fight alerts immediately.
+
+`alert-cooldown-seconds: 0` restores an alert on every hit. Alerts are mirrored to the console without color codes.
+
+### Inactivity reset
+
+If a player has not hit anyone for longer than `inactivity-reset-seconds`, their flags are cleared: active predictions and the hit window are discarded, and the next 16 hits fill a new window. The check runs once a second and additionally on every hit. So that a cheater does not get a clean slate after 30 seconds of silence, the plugin remembers their average score (if it was ≥ `reduce-threshold`) for another `carry-over-seconds`: the score decays linearly to zero, and until a new window is filled, damage is calculated from it.
+
+The log is not cleared by the reset: the player stays in `/daynac allinfo` with "Recent hits" and their maximum, and the card shows progress of the new window (`Hits: n/16`) and the verdict "Flags cleared after inactivity". The reset affects only online players. The data of players who have left is kept until TTL cleanup (1 hour, checked every 15 minutes), giving admins time to review it.
+
+### Manual reset
+
+The command `/daynac clearflags <player>` clears flags and resets the window immediately, without waiting for inactivity. Unlike the inactivity reset, the manual reset **does not** preserve the carry-over score: damage goes back to full from the first hit. The log and hit counter are also not cleared.
+
+### Punishment
+
+When a streak is confirmed, `punish-action` is executed:
+
+| Value | What happens |
+|---|---|
+| `none` | nothing but a console log entry (the streak is still consumed) |
+| `kick` | kick with the screen from `punish-message.kick` |
+| `ban` | profile ban with the message from `punish-message.ban`; with `ban-with-ip: true`, a profile and IP ban with the message from `punish-message.ban-ip` |
+
+If the kick/ban API is unavailable on your server version, the plugin runs the console command instead (`kick`, `ban` or `ban-ip` with `punish-reason`). After a punishment the player is removed from the tracking maps and from the GUI. The text on the punished player's screen is customized with templates, see [Configuration](#configuration).
 
 ### Example chat alert
 
 ```
-[DaynAC] Steve: unusual hit 0.871 > threshold 0.65 - recent hits: 0.31 0.44 0.61 0.87 (average: 0.54)
+[DaynAC] Steve: unusual hit 0.971 > threshold 0.65 - recent hits: 0.93 0.95 0.97 0.97 (average: 0.953) [punishment windows: 1/2, next window in 9 hits] [6 more hits in 5 s, max 0.98]
 ```
+
+The `[punishment windows ...]` block appears once a confirmation streak is open, and `[N more hits ...]` when hits suppressed by the cooldown are included in the message. The notice about a punishment looks like this:
+
+```
+[DaynAC] Steve: auto-kick - average score 97.3%
+```
+
+---
+
+## Player monitoring (GUI)
+
+`/daynac allinfo` opens a menu with all tracked players (including those who have already left, until TTL cleanup):
+
+- **Sorting:** online players first, then by descending maximum score over the last window of 16 hits (old spikes do not lift a player in the list), then by name. The order is stable between openings.
+- **Pages:** 45 players per page with navigation buttons at the bottom; the page is remembered, so reopening the menu brings you back to the same one.
+- **Player card:** online status, window progress (`Hits: n/16`), recent scores, maximum, average, ping, and a verdict (`Most likely legit` → `Needs observation` → `Suspicious` → `Dangerous cheater`; after an inactivity reset - `Flags cleared after inactivity`). If there are no predictions, the card explains why: the window is not yet filled, the player is in recording mode, or detection is disabled.
+- **Observation:** left-clicking a card (permission `daynac.spectate`) switches the admin to spectator mode and teleports them to the player. The return point is remembered on the first click, and you can switch between players; `/daynac reset` takes you back to the original place and game mode. Changing your game mode manually ends the observation and drops the return point.
+
+Menu items cannot be taken out of the inventory.
 
 ---
 
@@ -277,7 +335,7 @@ The log is not cleared by the reset: the player stays in `/daynac allinfo` with 
 `plugins/DaynAC/config.yml`:
 
 ```yaml
-hit-logging: false           # log every hit
+hit-logging: false           # log every hit (toggled by /daynac debug)
 
 detection:
   flag-threshold: 0.65       # threshold for admin alerts
@@ -290,15 +348,37 @@ detection:
   ban-with-ip: false         # ban: also ban by IP (NAT networks may affect innocent players)
   punish-reason: "KillAura (detected by DaynAC neural network)"
   max-recent-predictions: 10 # averaging window for damage and punishment
+  alert-cooldown-seconds: 5  # at most one alert per player per this period (0 = every hit)
   inactivity-reset-seconds: 30  # after this long without hits, flags are cleared (0 = disabled)
   carry-over-seconds: 600    # how long to remember the score after an inactivity reset (0 = don't)
+
+  # Text on the punished player's screen. A string or a list of strings (each is a new line).
+  # Colors: &-codes and hex &#RRGGBB. The ban-ip key is optional: if unset, ban is used.
+  punish-message:
+    kick:
+      - "&c[DaynAC] &f{reason}"
+      - "&7Average probability: &f{score}"
+      - "&7If this is a mistake, contact the staff."
+    ban:
+      - "&cYou have been banned from this server."
+      - "&7If this is a mistake, contact the staff."
 
 training:
   split-by: session          # session | player: what to split train/val/test by
 ```
 
+Placeholders in `punish-message`:
+
+| Placeholder | Value |
+|---|---|
+| `{reason}` | `punish-reason` |
+| `{player}` | the punished player's name |
+| `{score}` | average probability as a percentage, for example `97.3%` |
+| `{average}` | the same as a number, for example `0.973` |
+| `{action}` | `kick`, `ban` or `ban-ip` |
+
 > [!IMPORTANT]
-> Threshold ordering is validated at startup: `flag ≤ reduce < cancel ≤ punish`. Thresholds are read once when the plugin starts, so after `/daynac reload` a restart is needed for threshold changes to take effect.
+> Threshold ordering is validated at startup: `flag ≤ reduce < cancel ≤ punish`; also `punish-confirm-windows ≥ 1`, `max-recent-predictions ≥ 1`, and `alert-cooldown-seconds`, `inactivity-reset-seconds` and `carry-over-seconds` cannot be negative. If the settings are invalid, the plugin will not start. Thresholds, punishment messages and the other `detection` options are read once when the plugin starts, so after `/daynac reload` a restart is needed for them to take effect (only `hit-logging` applies immediately).
 
 ---
 
@@ -312,9 +392,9 @@ Everything is stored locally in `plugins/DaynAC/`. There is no telemetry.
 | `legit_vectors.csv`, `cheat_vectors.csv` | the dataset (vectors + `session_id`, `player_hash`) |
 | `dataset.salt` | salt for `player_hash`; do not lose or publish it |
 | `dataset.featver` | the feature version the dataset was collected with |
-| `model.dat` | the trained model |
+| `model.dat` | the trained model (weights, normalization, feature version, train/validation metrics) |
 | `exemptions.yml` | temporary exemptions from detection (UUID + expiration time) |
-| `*.bak`, `model.dat.old` | backups made on a format or feature-version change |
+| `*.bak`, `*.featv<N>.bak`, `model.dat.old` | backups made on a format or feature-version change |
 
 ---
 
@@ -325,7 +405,7 @@ Everything is stored locally in `plugins/DaynAC/`. There is no telemetry.
 
 ```text
 src/main/kotlin/zov/grusha/daynAC/
-├── DaynAC.kt              # entry point: events, commands, dataset recording
+├── DaynAC.kt              # entry point: events, commands, dataset recording, training
 ├── compat/
 │   └── Compat.kt          # Paper version compatibility (action bar)
 ├── permissions/
@@ -342,20 +422,23 @@ src/main/kotlin/zov/grusha/daynAC/
 │   ├── FeatureExtractor.kt# hit window → 343-feature vector
 │   ├── DatasetManager.kt  # CSV datasets, sessions, feature version
 │   ├── NeuralNetwork.kt   # MLP + backprop, lock-free inference
-│   └── Stats.kt           # confidence intervals for /daynac eval
+│   └── Stats.kt           # Wilson intervals and sample-size estimate for /daynac eval
 ├── detection/
-│   └── DetectionEngine.kt # asynchronous inference, thresholds, punishments
+│   └── DetectionEngine.kt # asynchronous inference, thresholds, alerts, punishments
 └── gui/
     └── AllInfoGUI.kt      # player monitoring GUI
 ```
 
 Key engineering decisions:
 
-- **Dependency-free neural network.** MLP 343→128→64→32→1 in pure Kotlin (BCE + SGD + He initialization + L2 + gradient clipping). Neither PyTorch nor Python is needed.
-- **Lock-free inference.** Weights live in an immutable snapshot behind an `AtomicReference`: `predict()` takes no locks, and retraining on a live server does not block detection.
+- **Dependency-free neural network.** MLP 343→8→16→1 in pure Kotlin (ReLU + sigmoid, BCE, Adam, He initialization, L2, dropout, gradient clipping). Neither PyTorch nor Python is needed.
+- **Lock-free inference.** Weights live in an immutable snapshot behind an `AtomicReference`: `predict()` takes no locks, and retraining on a live server does not block detection. Inference runs in two daemon threads.
 - **Atomic model publishing.** `train` and `loadFrom` are serialized with a mutex, and the model file is written via tmp+rename, so a server crash cannot corrupt `model.dat`.
 - **Data-leakage protection.** Non-overlapping windows when recording, session/player-based splitting, class stratification, and normalization from the training portion only.
 - **Feature versioning.** Old datasets and models are never silently mixed with new ones.
+- **Bounded memory growth.** Per-player state maps are cleaned by TTL (1 hour), the score log is capped at 100 entries, and expired exemptions are removed lazily and on a schedule.
+- **Single-threaded data.** `HitTracker` and the detection handlers run only on the Bukkit main thread; only `predict` is computed asynchronously.
+- **Version compatibility.** Cosmetic and auxiliary calls (action bar, kick/ban) have a fallback path on `LinkageError`.
 
 </details>
 
@@ -364,21 +447,23 @@ Key engineering decisions:
 ## Known limitations
 
 - Only **landed** hits are analyzed. Misses and arm swings are not considered.
-- **Ping is not accounted for.** The aim angle is computed against the victim's current server-side position, without latency compensation.
+- **Ping is not accounted for.** The aim angle is computed against the victim's current server-side position, without latency compensation. Ping is shown in the GUI but is not fed into the model.
 - No pretrained model is shipped: the model is only as good as your dataset.
 - Output probabilities are not calibrated: 0.70 does not necessarily mean "70% cheater". Rely on `/daynac eval`, not on absolute numbers.
-- `punish-enabled: false` disables only kick/ban. Damage reduction and cancellation stay active; there is no separate switch yet.
+- `punish-enabled: false` and `punish-action: none` disable only kick/ban. Damage reduction and cancellation stay active; there is no separate switch yet. To exclude a player from detection entirely, use exemptions (`/daynac exempt` or the `daynac.exempt` permission).
+- `detection` settings take effect only after a server restart.
+- Detection state (scores, carry-over, confirmation streaks) is kept in memory and does not survive a restart.
 
 ---
 
 ## Development
 
 ```bash
-gradle test          # unit tests (detection, tracking, ML module, permissions; ~200 tests)
-gradle build         # tests + shadowJar
+gradle build         # build the shadowJar
+gradle runServer     # local test server
 ```
 
-`PermissionsTest` checks `Permissions.kt` against `plugin.yml`: when adding a permission, update both files.
+The permission list in `Permissions.kt` must match `plugin.yml`: when adding a permission, update both files. If you change what any feature means, bump `FeatureExtractor.FEATURE_VERSION` (see [Collecting a dataset](#collecting-a-dataset)).
 
 Found a bug, a false positive, or have an idea - open an [Issue](https://github.com/6lGRUSHAl6/DaynAC/issues).
 
