@@ -107,11 +107,6 @@ class AllInfoGUI(
         return true
     }
 
-    /**
-     * Снимок всего, что нужно и для отрисовки, и для сортировки.
-     * Собирается один раз за рендер — engine.getScoreHistory не дёргается
-     * повторно из разных мест.
-     */
     private data class Card(
         val uuid: UUID,
         val name: String,
@@ -120,7 +115,13 @@ class AllInfoGUI(
         val hitCount: Int,
         val windowFill: Int
     ) {
-        val maxScore: Double get() = history.maxOrNull() ?: 0.0
+        /**
+         * Максимум не за всю историю, а только за последнее окно
+         * в [DaynAC.WINDOW_SIZE] ударов: старые всплески, давно
+         * вытесненные из окна признаков, не должны читаться как
+         * текущий максимум и не должны поднимать игрока в сортировке.
+         */
+        val maxScore: Double get() = history.takeLast(DaynAC.WINDOW_SIZE).maxOrNull() ?: 0.0
     }
 
     /**
