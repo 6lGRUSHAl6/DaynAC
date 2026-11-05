@@ -172,17 +172,74 @@ class FeatureExtractorAggregatesTest {
     }
 
     @Test
-    fun `aim angle autocorrelation is zero for constant series`() {
-        // Делитель нулевой -> агрегат не определён -> sanitize -> 0.0.
+    fun `aim angle autocorrelation is one for constant series`() {
+        // Нулевая дисперсия: корреляция формально 0/0, но каждое следующее значение
+        // полностью предсказуемо — кодируем 1.0, а не 0.0 («шум без корреляции»).
         val history = List(windowSize) { hit(aimAngle = 5.0) }
+        assertEquals(1.0, agg(history, aimAutocorr), 1e-9)
+    }
+
+    @Test
+    fun `aim angle autocorrelation is one for constant series that is not exact in binary`() {
+        // 0.1 не представимо точно: суммы накапливают ошибку, и без порога вместо «нулевой
+        // дисперсии» вышло бы ±1e-20 (вплоть до NaN из sqrt отрицательного).
+        val history = List(windowSize) { hit(aimAngle = 0.1) }
+        assertEquals(1.0, agg(history, aimAutocorr), 1e-9)
+    }
+
+    @Test
+    fun `aim angle autocorrelation is one for all-zero series`() {
+        val history = List(windowSize) { hit(aimAngle = 0.0) }
+        assertEquals(1.0, agg(history, aimAutocorr), 1e-9)
+    }
+
+    @Test
+    fun `aim angle autocorrelation is zero when only one side is constant`() {
+        // Пары (5,5), (5,5), (5,7): левая сторона константна, правая нет -> корреляция не определена.
+        val history = List(windowSize - 4) { hit(aimAngle = null) } +
+                listOf(5.0, 5.0, 5.0, 7.0).map { hit(aimAngle = it) }
         assertEquals(0.0, agg(history, aimAutocorr), 1e-9)
     }
 
     @Test
-    fun `aim angle autocorrelation needs at least three values`() {
+    fun `aim angle autocorrelation is zero when both sides are constant at different levels`() {
+        // Пары (5,7) и (5,7): обе стороны константны, но это не «повтор значения».
+        val history = List(windowSize - 5) { hit(aimAngle = null) } +
+                listOf(5.0, 7.0, null, 5.0, 7.0).map { hit(aimAngle = it) }
+        assertEquals(0.0, agg(history, aimAutocorr), 1e-9)
+    }
+
+    @Test
+    fun `aim angle autocorrelation needs at least two adjacent pairs`() {
+        // Два значения подряд -> одна пара.
         val history = List(windowSize - 2) { hit(aimAngle = null) } +
                 listOf(hit(aimAngle = 1.0), hit(aimAngle = 2.0))
         assertEquals(0.0, agg(history, aimAutocorr), 1e-9)
+    }
+
+    @Test
+    fun `aim angle autocorrelation is defined for three adjacent values`() {
+        // [1, 2, 3] -> пары (1,2), (2,3): идеальная линейная связь.
+        val history = List(windowSize - 3) { hit(aimAngle = null) } +
+                listOf(1.0, 2.0, 3.0).map { hit(aimAngle = it) }
+        assertEquals(1.0, agg(history, aimAutocorr), 1e-9)
+    }
+
+    @Test
+    fun `aim angle autocorrelation ignores values that are not adjacent`() {
+        // Три значения, но между ними пропуски: ни одной соседней пары.
+        val history = List(windowSize) { hit(aimAngle = if (it % 5 == 0) it.toDouble() else null) }
+        assertEquals(0.0, agg(history, aimAutocorr), 1e-9)
+    }
+
+    @Test
+    fun `aim angle autocorrelation does not stitch values across a gap`() {
+        // 1..8, разрыв (NaN), 1..7. Пары берутся внутри сегментов: везде y = x + 1 -> ровно 1.0.
+        // Если бы ряд склеивался, пара (8, 1) через разрыв сильно снизила бы корреляцию.
+        val angles = (1..8).map { it.toDouble() } + listOf(Double.NaN) + (1..7).map { it.toDouble() }
+        val history = angles.map { hit(aimAngle = it) }
+        assertEquals(windowSize, history.size)
+        assertEquals(1.0, agg(history, aimAutocorr), 1e-9)
     }
 
     // --- aggHitTimingAutocorrLag1 -----------------------------------------
@@ -194,9 +251,20 @@ class FeatureExtractorAggregatesTest {
     }
 
     @Test
-    fun `hit timing autocorrelation is undefined for constant timing`() {
+    fun `hit timing autocorrelation is one for constant timing`() {
+        // Метроном (таймер-чит с одинаковым интервалом в мс) — самый механический паттерн.
         val history = List(windowSize) { hit(hitTimeDelta = 200) }
-        assertEquals(0.0, agg(history, timingAutocorr), 1e-9)
+        assertEquals(1.0, agg(history, timingAutocorr), 1e-9)
+    }
+
+    @Test
+    fun `hit timing autocorrelation does not stitch series across a reset gap`() {
+        // После resetHitTiming первый удар новой серии имеет hitTimeDelta = null.
+        // 1..8, разрыв, 1..7: пары только внутри серий -> y = x + 1 -> 1.0.
+        val deltas: List<Long?> = (1L..8L).toList() + listOf(null) + (1L..7L).toList()
+        val history = deltas.map { hit(hitTimeDelta = it) }
+        assertEquals(windowSize, history.size)
+        assertEquals(1.0, agg(history, timingAutocorr), 1e-9)
     }
 
     // --- aggAimAngleTrendR2 -----------------------------------------------
@@ -209,8 +277,27 @@ class FeatureExtractorAggregatesTest {
 
     @Test
     fun `aim angle trend is undefined for flat angles`() {
+        // Константный угол не «сходится»: тренда нет -> 0.0 (а не 1.0).
         val history = List(windowSize) { hit(aimAngle = 10.0) }
         assertEquals(0.0, agg(history, trendR2), 1e-9)
+    }
+
+    @Test
+    fun `aim angle trend is undefined for flat angles that are not exact in binary`() {
+        // Ошибка округления сумм не должна давать «тренд» из шума размером 1e-34.
+        val history = List(windowSize) { hit(aimAngle = 0.1) }
+        assertEquals(0.0, agg(history, trendR2), 1e-9)
+    }
+
+    @Test
+    fun `aim angle trend uses real hit positions when some angles are missing`() {
+        // Линейное схождение 100 - 2*i с пропусками на позициях 3 и 7. По реальным позициям
+        // это идеальная прямая (R2 = 1). По индексам отфильтрованного списка шаг был бы
+        // то 2, то 4, и R2 вышел бы ниже единицы.
+        val history = List(windowSize) { i ->
+            hit(aimAngle = if (i == 3 || i == 7) null else 100.0 - 2.0 * i)
+        }
+        assertEquals(1.0, agg(history, trendR2), 1e-9)
     }
 
     @Test
