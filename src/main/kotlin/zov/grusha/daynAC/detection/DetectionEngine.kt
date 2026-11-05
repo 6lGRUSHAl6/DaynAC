@@ -183,11 +183,12 @@ class DetectionEngine(
     private val colorCodes = Regex("§[0-9a-f]")
 
     /**
-     * АКТИВНЫЕ предсказания по игрокам — то, чем движок реально руководствуется:
-     * множитель урона, оповещения, автонаказание. Сбрасываются по простою
-     * ([resetFlags]), наказанием и TTL-чисткой.
+     * АКТИВНЫЕ предсказания по игрокам — ... Сбрасываются по простою ...
+     *
+     * kotlin.collections.ArrayDeque, а не java.util: у него есть доступ по индексу,
+     * и getAveragePrediction обходит окно без итератора (на каждый удар).
      */
-    private val predictions = ConcurrentHashMap<UUID, ArrayDeque<PlayerVerdict>>()
+    private val predictions = ConcurrentHashMap<UUID, kotlin.collections.ArrayDeque<PlayerVerdict>>()
 
     /**
      * Журнал ВСЕХ скоров игрока — то, что видит админ в /daynac allinfo
@@ -328,13 +329,18 @@ class DetectionEngine(
      * Асинхронный анализ удара. Вектор признаков уже извлечён на главном потоке
      * (это дёшево), тяжёлый predict уходит в пул, результат возвращается на
      * главный поток для оповещения/наказания.
+     *
+     * Массив `vector.features` передаётся в пул как есть, без копии: [FeatureExtractor.extract]
+     * создаёт новый массив на каждый удар, а вызывающий после этого вызова его не меняет
+     * и не переиспользует. Если когда-нибудь extract начнёт отдавать общий буфер или
+     * вызывающий начнёт править вектор после вызова, здесь снова понадобится copyOf().
      */
     fun analyzeHitAsync(attacker: Player, vector: FeatureExtractor.FeatureVector, onVerdict: (Player, Double) -> Unit) {
-        val featuresCopy = vector.features.copyOf() //snapshot для асинхронного потока
+        val features = vector.features // раньше было vector.features.copyOf()
 
         inferencePool.execute {
             val probability = try {
-                network.predict(featuresCopy)
+                network.predict(features)
             } catch (e: Exception) {
                 plugin.logger.warning("Inference failed: ${e.message}")
                 return@execute
@@ -358,7 +364,7 @@ class DetectionEngine(
     private fun recordVerdict(attacker: Player, probability: Double) {
         val verdict = PlayerVerdict(probability, clock())
 
-        val deque = predictions.computeIfAbsent(attacker.uniqueId) { ArrayDeque() }
+        val deque = predictions.computeIfAbsent(attacker.uniqueId) { kotlin.collections.ArrayDeque() }
         synchronized(deque) {
             if (deque.size >= maxRecentPredictions) deque.removeFirst()
             deque.addLast(verdict)
@@ -414,9 +420,19 @@ class DetectionEngine(
     /** Среднее по последним предсказаниям игрока (или null, если их ещё нет). */
     fun getAveragePrediction(player: Player): Double? {
         val deque = predictions[player.uniqueId] ?: return null
-        val snapshot = synchronized(deque) { deque.toList() }
-        if (snapshot.isEmpty()) return null
-        return snapshot.sumOf { it.probability } / snapshot.size
+        // Суммируем прямо под локом (≤ max-recent-predictions элементов): копия deque
+        // на каждый удар не нужна, а лок держится на несколько сложений. Индексный цикл
+        // вместо for-in/forEach: итератор тоже был бы аллокацией.
+        return synchronized(deque) {
+            val n = deque.size
+            if (n == 0) {
+                null
+            } else {
+                var sum = 0.0
+                for (i in 0 until n) sum += deque[i].probability
+                sum / n
+            }
+        }
     }
 
     /** Последнее предсказание (для /daynac ver). */
@@ -547,7 +563,9 @@ class DetectionEngine(
      * консольная строка уже есть (наказание логируется ветками punishPlayer).
      */
     private fun sendAlert(message: String, log: Boolean = true) {
-        Bukkit.getOnlinePlayers().filter { it.hasPermission(Permissions.ALERTS) }.forEach { it.sendMessage(message) }
+        for (player in Bukkit.getOnlinePlayers()) {
+            if (player.hasPermission(Permissions.ALERTS)) player.sendMessage(message)
+        }
         if (log) plugin.logger.warning(message.replace(colorCodes, ""))
     }
 

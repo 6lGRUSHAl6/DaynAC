@@ -30,6 +30,13 @@ class FeatureExtractor(
     private val windowSize: Int = 16
 ) {
 
+    init {
+        // Иначе windowSize = 0 дал бы «вектор» из одних агрегатов-нулей (не null) и детекция
+        // молча анализировала бы мусор, а windowSize < 0 упал бы с NegativeArraySizeException
+        // уже на первом ударе, а не при старте плагина.
+        require(windowSize >= 1) { "windowSize должен быть ≥ 1, получено $windowSize" }
+    }
+
     data class FeatureVector(
         val features: DoubleArray,
         val hitCount: Int
@@ -59,8 +66,12 @@ class FeatureExtractor(
          *
          *  1 — исходная версия (signed-энтропия: 10 бинов на ±180°)
          *  2 — signed-энтропия: 11 бинов, ±20° (yaw) и ±10° (pitch)
+         *  3 — автокорреляция lag-1: константный ряд = 1.0 (раньше 0.0), пары считаются
+         *      только по соседним ударам (null в середине окна не склеивает края разрыва);
+         *      R² тренда считается по реальным позициям ударов в окне; признак
+         *      reachDistance переименован в reachNorm (значение и раньше было нормированным)
          */
-        const val FEATURE_VERSION = 2
+        const val FEATURE_VERSION = 3
 
         /** Сколько числовых признаков берётся из каждого HitData (timestamp не считается). */
         const val PER_HIT_FEATURES = 21
@@ -93,7 +104,7 @@ class FeatureExtractor(
             "microAdjustPitch",
             "jerkValue",
             "straightLineRatio",
-            "reachDistance"
+            "reachNorm" // reach, нормированный normalizeReach() в [-1, 1]; не метры
         )
 
         val AGGREGATE_NAMES: List<String> = listOf(
@@ -105,6 +116,25 @@ class FeatureExtractor(
             "aggHitTimingAutocorrLag1",// автокорреляция интервалов между ударами (lag-1): механическая регулярность
             "aggAimAngleTrendR2"       // R² линейного тренда угла: убывает ли угол к концу окна (дожатие прицела)
         )
+
+        init {
+            // Длина вектора и CSV-заголовок строятся из разных источников (константы и списки
+            // имён). Рассинхрон не падает сразу, а молча превращает все старые датасеты в мусор
+            // (FEATURE_VERSION при этом не меняется, архивация не срабатывает) — ловим при загрузке класса.
+            check(PER_HIT_NAMES.size == PER_HIT_FEATURES) {
+                "PER_HIT_NAMES (${PER_HIT_NAMES.size}) не совпадает с PER_HIT_FEATURES ($PER_HIT_FEATURES)"
+            }
+            check(AGGREGATE_NAMES.size == AGGREGATE_FEATURES) {
+                "AGGREGATE_NAMES (${AGGREGATE_NAMES.size}) не совпадает с AGGREGATE_FEATURES ($AGGREGATE_FEATURES)"
+            }
+        }
+
+        /**
+         * Относительный порог «дисперсия равна нулю». Точное сравнение с 0.0 не работает:
+         * у константного ряда суммы накапливают ошибку округления, и дисперсия выходит
+         * не 0, а ±1e-20 — вплоть до sqrt от отрицательного (NaN).
+         */
+        private const val FLAT_EPS = 1e-12
 
         /** Полный заголовок CSV для вектора. */
         fun csvHeader(windowSize: Int): String =
@@ -257,76 +287,92 @@ class FeatureExtractor(
     }
 
     /**
-     * Автокорреляция lag-1 произвольной числовой последовательности: корреляция
-     * ряда с самим собой, сдвинутым на одну позицию. Высокое значение = следующий
-     * элемент предсказуем из предыдущего (машинный/механический паттерн).
-     * Используется и для угла прицеливания, и для интервалов между ударами —
-     * логика идентична, различается только входная последовательность.
+     * Автокорреляция lag-1 поля [selector] по окну: корреляция ряда с самим собой, сдвинутым
+     * на один удар. Высокое значение = следующий элемент предсказуем из предыдущего
+     * (машинный/механический паттерн). Используется и для угла прицеливания, и для
+     * интервалов между ударами.
+     *
+     * Пары (x[i], x[i+1]) берутся только у СОСЕДНИХ ударов с конечными значениями: null
+     * в середине окна (например, hitTimeDelta первого удара после сброса по простою)
+     * разрывает ряд, а не склеивает удары по обе стороны разрыва.
+     *
+     * Константный ряд (идеально ровный аим, таймер-чит с одинаковым интервалом) даёт 1.0:
+     * корреляция формально 0/0, но «следующее значение полностью предсказуемо» — это как
+     * раз то, что признак должен отличать от шума (0.0).
      */
-    private fun autocorrLag1(values: List<Double>): Double? {
-        if (values.size < 3) return null
-
-        val n = values.size - 1 // число пар (x[i], x[i+1])
+    private fun autocorrLag1(window: List<HitData>, selector: (HitData) -> Double?): Double? {
+        var n = 0
         var sumX = 0.0; var sumY = 0.0; var sumXY = 0.0
         var sumX2 = 0.0; var sumY2 = 0.0
-        for (i in 0 until n) {
-            val x = values[i]
-            val y = values[i + 1]
+        for (i in 0 until window.size - 1) {
+            val x = selector(window[i])?.takeIf { it.isFinite() } ?: continue
+            val y = selector(window[i + 1])?.takeIf { it.isFinite() } ?: continue
+            n++
             sumX += x; sumY += y
             sumXY += x * y
             sumX2 += x * x; sumY2 += y * y
         }
+        if (n < 2) return null
+
+        val varX = n * sumX2 - sumX * sumX
+        val varY = n * sumY2 - sumY * sumY
+        val xFlat = varX <= FLAT_EPS * n * sumX2
+        val yFlat = varY <= FLAT_EPS * n * sumY2
+        if (xFlat && yFlat) {
+            // Обе стороны константны; «идеальный повтор» только если это одна и та же константа
+            val sameLevel = kotlin.math.abs(sumX - sumY) <= 1e-9 * (kotlin.math.abs(sumX) + kotlin.math.abs(sumY))
+            return if (sameLevel) 1.0 else null
+        }
+        if (xFlat || yFlat) return null // корреляция с константой не определена
 
         val numerator = n * sumXY - sumX * sumY
-        val denominator = sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY))
-        if (denominator <= 0.0) return null
-        return (numerator / denominator).coerceIn(-1.0, 1.0)
+        return (numerator / sqrt(varX * varY)).coerceIn(-1.0, 1.0)
     }
 
     /** Автокорреляция lag-1 угла прицеливания: плавно и предсказуемо ли меняется аим от удара к удару. */
-    private fun aimAngleAutocorrLag1(window: List<HitData>): Double? {
-        val values = finiteValues(window) { it.aimAngle }
-        return autocorrLag1(values)
-    }
+    private fun aimAngleAutocorrLag1(window: List<HitData>): Double? =
+        autocorrLag1(window) { it.aimAngle }
 
     /**
      * Автокорреляция lag-1 интервалов между ударами: насколько текущий hitTimeDelta
      * предсказывается предыдущим. Высокое значение — механическая регулярность
      * тайминга (например, таймер-чит), даже если сам по себе CPS не аномален.
      */
-    private fun hitTimingAutocorrLag1(window: List<HitData>): Double? {
-        val values = finiteValues(window) { it.hitTimeDelta?.toDouble() }
-        return autocorrLag1(values)
-    }
+    private fun hitTimingAutocorrLag1(window: List<HitData>): Double? =
+        autocorrLag1(window) { it.hitTimeDelta?.toDouble() }
 
     /**
      * R² линейной регрессии угла прицеливания по номеру удара в окне.
      * R² ~ 1 означает монотонное схождение прицела (каждый удар точнее
      * предыдущего на одну и ту же величину) — так люди не наводятся.
+     *
+     * x — реальная позиция удара в окне, а не индекс в отфильтрованном списке: пропущенные
+     * (null/нечисловые) значения не сдвигают соседей. Для константного угла тренда нет
+     * (ряд не «сходится»), поэтому возвращается null → 0.0.
      */
     private fun aimAngleTrendR2(window: List<HitData>): Double? {
-        val values = finiteValues(window) { it.aimAngle }
-        if (values.size < 3) return null
-
-        val n = values.size
-        var sumX = 0.0; var sumY = 0.0; var sumXY = 0.0; var sumX2 = 0.0
-        for (i in 0 until n) {
+        var n = 0
+        var sumX = 0.0; var sumY = 0.0; var sumXY = 0.0; var sumX2 = 0.0; var sumY2 = 0.0
+        for (i in window.indices) {
+            val y = window[i].aimAngle?.takeIf { it.isFinite() } ?: continue
             val x = i.toDouble()
-            val y = values[i]
+            n++
             sumX += x; sumY += y
             sumXY += x * y
-            sumX2 += x * x
+            sumX2 += x * x; sumY2 += y * y
         }
+        if (n < 3) return null
 
         val meanX = sumX / n
         val meanY = sumY / n
 
         var ssTot = 0.0
-        for (v in values) {
-            val d = v - meanY
+        for (i in window.indices) {
+            val y = window[i].aimAngle?.takeIf { it.isFinite() } ?: continue
+            val d = y - meanY
             ssTot += d * d
         }
-        if (ssTot == 0.0) return null // все углы одинаковы -> тренд не определён
+        if (ssTot <= FLAT_EPS * sumY2) return null // все углы (почти) одинаковы -> тренд не определён
 
         val denominator = n * sumX2 - sumX * sumX
         if (denominator == 0.0) return null
@@ -334,8 +380,9 @@ class FeatureExtractor(
         val a = meanY - b * meanX
 
         var ssRes = 0.0
-        for (i in 0 until n) {
-            val diff = values[i] - (a + b * i)
+        for (i in window.indices) {
+            val y = window[i].aimAngle?.takeIf { it.isFinite() } ?: continue
+            val diff = y - (a + b * i)
             ssRes += diff * diff
         }
 

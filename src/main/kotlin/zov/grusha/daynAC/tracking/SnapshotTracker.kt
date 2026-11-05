@@ -143,10 +143,13 @@ class SnapshotTracker(
 
     fun recordSnapshot(player: Player): PlayerSnapshot? {
         val uuid = player.uniqueId
-        val currentYaw = player.location.yaw
-        val currentPitch = player.location.pitch
-        val currentX = player.location.x
-        val currentZ = player.location.z
+        // player.location каждый раз создаёт новый Location — берём один раз за вызов
+        // (как в registerHitWithAngle), а не по разу на каждое поле.
+        val loc = player.location
+        val currentYaw = loc.yaw
+        val currentPitch = loc.pitch
+        val currentX = loc.x
+        val currentZ = loc.z
         val state = playerStates[uuid]
 
         if (state == null) {
@@ -493,14 +496,19 @@ class SnapshotTracker(
     }
 
     /**
-     * Сбрасывает тайминг ударов игрока, не трогая снимки поворотов: они пишутся
-     * каждый тик и после простоя и так свежие, а вот последний удар остался в
-     * прошлом — без сброса первый удар новой серии получил бы hitTimeDelta
-     * в десятки секунд, которого сеть на реальных боях не видела.
-     * После сброса первый удар серии даёт delta = null → в вектор идёт 0.0,
-     * как и у самого первого удара игрока за сессию.
+     * Сбрасывает «память о прошлом бое»: тайминг ударов и последний угол прицеливания.
+     * Снимки поворотов не трогаем: они пишутся каждый тик и после простоя и так свежие,
+     * а вот последний удар остался в прошлом.
+     *
+     * Без сброса первый удар новой серии получил бы hitTimeDelta в десятки секунд и
+     * snapFactor от угла многосекундной давности — сеть на реальных боях такого не видела.
+     * После сброса первый удар серии даёт delta = null (в вектор идёт 0.0) и
+     * prevAimAngle = null (snapFactor = null), как и у самого первого удара игрока
+     * за сессию.
      */
     fun resetHitTiming(playerId: UUID) {
+        // Угол чистим до проверки состояния: lastAimAngles живёт отдельно от playerStates.
+        lastAimAngles.remove(playerId)
         val state = playerStates[playerId] ?: return
         state.lastHitTime = null
         state.hitDeltas.clear()
@@ -511,9 +519,11 @@ class SnapshotTracker(
     }
 
     fun buildHitData(attacker: Player, victim: Player): HitData {
-        val aimAngle = CombatMath.getAimAngle(attacker, victim)
-        val distance = CombatMath.getDistance(attacker, victim)
-        val reachDistance = CombatMath.getReachDistance(attacker, victim)
+        // Один проход: eyeLocation/boundingBox запрашиваются по разу, а не в каждой из трёх функций
+        val geometry = CombatMath.measure(attacker, victim)
+        val aimAngle = geometry.aimAngle
+        val distance = geometry.distance
+        val reachDistance = geometry.reachDistance
 
         val (hitTimeDelta, prevAimAngle) = registerHitWithAngle(attacker, aimAngle)
 

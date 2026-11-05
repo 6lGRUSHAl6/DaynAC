@@ -12,6 +12,7 @@ import org.bukkit.event.Listener
 import org.bukkit.event.inventory.InventoryAction
 import org.bukkit.event.inventory.InventoryClickEvent
 import org.bukkit.event.inventory.InventoryCloseEvent
+import org.bukkit.event.inventory.InventoryDragEvent
 import org.bukkit.event.player.PlayerGameModeChangeEvent
 import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.inventory.Inventory
@@ -25,6 +26,7 @@ import zov.grusha.daynAC.permissions.Permissions
 import zov.grusha.daynAC.tracking.HitTracker
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 class AllInfoGUI(
     private val plugin: Plugin,
@@ -83,6 +85,20 @@ class AllInfoGUI(
      */
     private val spectateReturnPoints = ConcurrentHashMap<UUID, SpectateReturnPoint>()
 
+    /**
+     * UUID → имя. Заполняется из онлайн-игроков (и при выходе игрока), а для остальных —
+     * асинхронно в [resolveNamesAsync]. Главный поток имя оффлайн-игрока по UUID не ищет:
+     * `Bukkit.getOfflinePlayer(uuid).name` для записи вне usercache может уйти в сетевой
+     * запрос, а collectCards вызывается на каждое открытие и каждый клик по страницам.
+     * Если имя найти не удалось, кешируется короткий UUID — повторно не запрашиваем.
+     */
+    private val nameCache = ConcurrentHashMap<UUID, String>()
+
+    /** UUID, имён которых ещё нет в [nameCache]; ждут ближайшего [resolveNamesAsync]. */
+    private val unresolvedNames = ConcurrentHashMap.newKeySet<UUID>()
+
+    private val resolvingNames = AtomicBoolean(false)
+
     /** Собирает и открывает GUI для администратора. */
     fun open(admin: Player): Inventory {
         val inventory = Bukkit.createInventory(null, GUI_SIZE, TITLE)
@@ -136,11 +152,12 @@ class AllInfoGUI(
      */
     private fun collectCards(): List<Card> {
         val ids = engine.getTrackedPlayerIds() + engine.hitCounts.keys
-        return ids.asSequence().map { uuid ->
+        val cards = ids.asSequence().map { uuid ->
+            val onlinePlayer = Bukkit.getPlayer(uuid)
             Card(
                 uuid = uuid,
-                name = Bukkit.getOfflinePlayer(uuid).name ?: uuid.toString().take(8),
-                online = Bukkit.getPlayer(uuid) != null,
+                name = displayName(uuid, onlinePlayer),
+                online = onlinePlayer != null,
                 history = engine.getScoreHistory(uuid),
                 hitCount = engine.getHitCount(uuid),
                 windowFill = hitTracker.getWindowFill(uuid)
@@ -150,6 +167,57 @@ class AllInfoGUI(
                 .thenByDescending { it.maxScore }
                 .thenBy { it.name.lowercase() }
         ).toList()
+        if (unresolvedNames.isNotEmpty()) resolveNamesAsync()
+        return cards
+    }
+
+    /**
+     * Имя для карточки без блокирующих обращений: онлайн-игрок — его имя, оффлайн — из
+     * [nameCache], иначе временно короткий UUID, а настоящее имя подтянет [resolveNamesAsync].
+     */
+    private fun displayName(uuid: UUID, online: Player?): String {
+        if (online != null) {
+            nameCache[uuid] = online.name
+            return online.name
+        }
+        nameCache[uuid]?.let { return it }
+        unresolvedNames.add(uuid)
+        return uuid.toString().take(8)
+    }
+
+    /**
+     * Ищет недостающие имена вне главного потока (поиск по UUID может быть сетевым),
+     * затем один раз перерисовывает открытые GUI — уже с найденными именами.
+     *
+     * Использует Bukkit.getOfflinePlayer(UUID) из async-потока. На Paper 1.21+
+     * это разрешено (читается usercache, для отсутствующих — сетевой запрос к Mojang).
+     * На старых версиях Spigot/Paper может кинуть IllegalStateException — тогда
+     * имя не резолвится, карточка остаётся с fallback (UUID-префикс).
+     */
+    private fun resolveNamesAsync() {
+        if (!plugin.isEnabled || !resolvingNames.compareAndSet(false, true)) return
+        val batch = unresolvedNames.toList()
+        unresolvedNames.removeAll(batch.toSet())
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, Runnable {
+            for (uuid in batch) {
+                val name = try {
+                    Bukkit.getOfflinePlayer(uuid).name
+                } catch (_: Exception) {
+                    null
+                }
+                nameCache[uuid] = name ?: uuid.toString().take(8)
+            }
+            if (!plugin.isEnabled) return@Runnable
+            Bukkit.getScheduler().runTask(plugin, Runnable {
+                resolvingNames.set(false)
+                for ((adminId, gui) in openGuis) {
+                    val admin = Bukkit.getPlayer(adminId) ?: continue
+                    if (admin.openInventory.topInventory === gui) {
+                        populate(admin, gui, openPages[adminId] ?: 0)
+                    }
+                }
+            })
+        })
     }
 
     /**
@@ -417,6 +485,26 @@ class AllInfoGUI(
         player.sendMessage("§7[DaynAC] Наблюдение за §c${target.name}§7. Вернуться обратно: /daynac reset")
     }
 
+    /**
+     * Drag-протаскивание предмета по слотам. Клик-обработчик его не видит, поэтому без
+     * этого админ мог бы разложить предметы из своего инвентаря в GUI (перезаписав
+     * карточки и навигацию) или вытащить стрелки/компасы. Raw-слоты с индексом меньше
+     * размера верхнего инвентаря принадлежат GUI: если затронут хоть один — отменяем
+     * весь drag. Перетаскивание только по своему инвентарю не трогаем.
+     */
+    @EventHandler
+    fun onInventoryDrag(event: InventoryDragEvent) {
+        val player = event.whoClicked as? Player ?: return
+        val gui = openGuis[player.uniqueId] ?: return
+        if (event.view.topInventory !== gui) return
+
+        val topSize = gui.size
+        if (event.rawSlots.any { it < topSize }) {
+            event.isCancelled = true
+            if (!player.hasPermission(Permissions.VIEW)) player.closeInventory()
+        }
+    }
+
     /** Чистка при закрытии GUI. Страницу не трогаем — переоткрытие вернёт админа туда же. */
     @EventHandler
     fun onClose(event: InventoryCloseEvent) {
@@ -437,6 +525,8 @@ class AllInfoGUI(
     /** Полная очистка при выходе админа — состояние страницы больше не нужно. */
     @EventHandler
     fun onQuit(event: PlayerQuitEvent) {
+        // Игрок уходит оффлайн — запоминаем имя, чтобы карточка не ходила за ним по UUID
+        nameCache[event.player.uniqueId] = event.player.name
         openGuis.remove(event.player.uniqueId)
         openPages.remove(event.player.uniqueId)
         spectateReturnPoints.remove(event.player.uniqueId)

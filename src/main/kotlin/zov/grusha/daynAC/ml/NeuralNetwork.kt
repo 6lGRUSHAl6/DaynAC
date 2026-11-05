@@ -108,6 +108,19 @@ class NeuralNetwork(
     private val snapshot = AtomicReference(emptyWeights())
 
     /**
+     * Рабочие буферы [predict]: нормализованный вход и активации слоёв. Размеры зависят
+     * только от архитектуры (она неизменна), а не от весов, поэтому буферы переживают
+     * смену [snapshot]. Свои на каждый поток: predict вызывается без блокировок из
+     * разных потоков и не реентерабелен, так что общий буфер был бы гонкой данных.
+     */
+    private class Scratch(inputSize: Int, layerSizes: IntArray) {
+        val input = DoubleArray(inputSize)
+        val layers = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
+    }
+
+    private val scratch = ThreadLocal.withInitial { Scratch(inputSize, layerSizes) }
+
+    /**
      * Сериализует train и loadFrom: иначе train, стартовавший до loadFrom, затёр бы
      * загруженную модель своим set(). Читатели (predict, saveTo) лок не берут.
      */
@@ -146,16 +159,20 @@ class NeuralNetwork(
             "Ожидался вектор из $inputSize признаков, получен ${rawFeatures.size}"
         }
         val state = snapshot.get()
-        return forwardOnly(state, normalize(rawFeatures, state))
+        val buf = scratch.get()
+        normalizeInto(rawFeatures, state, buf.input)
+        return forwardOnly(state, buf.input, buf.layers)
     }
 
-    private fun normalize(features: DoubleArray, state: Weights): DoubleArray {
-        val out = DoubleArray(features.size)
+    private fun normalizeInto(features: DoubleArray, state: Weights, out: DoubleArray) {
         for (i in features.indices) {
             out[i] = (features[i] - state.featureMean[i]) / state.featureStd[i]
         }
-        return out
     }
+
+    /** Новый массив: для train, где нормализованные сэмплы живут весь цикл обучения. */
+    private fun normalize(features: DoubleArray, state: Weights): DoubleArray =
+        DoubleArray(features.size).also { normalizeInto(features, state, it) }
 
     private fun newLayerBuffers() = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
 
@@ -175,7 +192,7 @@ class NeuralNetwork(
     private fun forwardOnly(
         state: Weights,
         normalizedFeatures: DoubleArray,
-        buffers: Array<DoubleArray> = newLayerBuffers()
+        buffers: Array<DoubleArray>
     ): Double {
         var activation = normalizedFeatures
         val lastLayer = state.weights.size - 1
