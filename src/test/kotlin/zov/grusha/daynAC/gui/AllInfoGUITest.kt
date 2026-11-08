@@ -6,13 +6,13 @@ import org.bukkit.GameMode
 import org.bukkit.Location
 import org.bukkit.Material
 import org.bukkit.NamespacedKey
-import org.bukkit.entity.Player
 import org.bukkit.event.inventory.ClickType
 import org.bukkit.event.inventory.InventoryAction
 import org.bukkit.event.inventory.InventoryClickEvent
 import org.bukkit.event.inventory.InventoryCloseEvent
 import org.bukkit.event.inventory.InventoryType
 import org.bukkit.event.player.PlayerGameModeChangeEvent
+import org.bukkit.event.player.PlayerGameModeChangeEvent.Cause
 import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.inventory.Inventory
 import org.bukkit.inventory.ItemStack
@@ -453,16 +453,31 @@ class AllInfoGUITest {
     }
 
     @Test
-    fun `leaving spectator manually drops the return point`() {
+    fun `leaving spectator via command drops the return point`() {
         val target = server.addPlayer("Cheater")
         track(target.uniqueId, listOf(0.9))
         val admin = admin(Permissions.VIEW, Permissions.SPECTATE)
         val inventory = gui.open(admin)
         gui.onInventoryClick(click(admin, compassSlot(inventory, target.uniqueId)))
 
-        gui.onGameModeChange(PlayerGameModeChangeEvent(admin, GameMode.SURVIVAL))
+        gui.onGameModeChange(PlayerGameModeChangeEvent(admin, GameMode.SURVIVAL, Cause.COMMAND, null))
 
-        assertFalse(gui.resetSpectate(admin), "после ручного выхода из spectator reset не должен телепортировать")
+        assertFalse(gui.resetSpectate(admin), "после ручного /gamemode reset не должен телепортировать")
+    }
+
+    @Test
+    fun `gamemode change by another plugin keeps the return point`() {
+        val target = server.addPlayer("Cheater")
+        track(target.uniqueId, listOf(0.9))
+        val admin = admin(Permissions.VIEW, Permissions.SPECTATE)
+        val inventory = gui.open(admin)
+        gui.onInventoryClick(click(admin, compassSlot(inventory, target.uniqueId)))
+
+        for (cause in listOf(Cause.PLUGIN, Cause.UNKNOWN, Cause.DEFAULT_GAMEMODE)) {
+            gui.onGameModeChange(PlayerGameModeChangeEvent(admin, GameMode.SURVIVAL, cause, null))
+        }
+
+        assertTrue(gui.resetSpectate(admin), "смена режима плагином не должна стирать точку возврата")
     }
 
     @Test
