@@ -24,6 +24,7 @@ import zov.grusha.daynAC.DaynAC
 import zov.grusha.daynAC.detection.DetectionEngine
 import zov.grusha.daynAC.permissions.Permissions
 import zov.grusha.daynAC.tracking.HitTracker
+import org.bukkit.event.player.PlayerGameModeChangeEvent.Cause
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -44,6 +45,8 @@ class AllInfoGUI(
         private const val NAV_PREV_SLOT = 45
         private const val NAV_INFO_SLOT = 49
         private const val NAV_NEXT_SLOT = 53
+
+        private const val NAME_CACHE_MAX = 10_000
 
         /** Иконка по величине скора */
         fun scoreIcon(score: Double): String = when {
@@ -78,11 +81,6 @@ class AllInfoGUI(
     /** Куда и в каком режиме вернуть админа после наблюдения. */
     private data class SpectateReturnPoint(val location: Location, val gameMode: GameMode)
 
-    /**
-     * Админ → точка, из которой он начал наблюдение. Хранится, пока админ находится
-     * в spectator: смена режима вручную означает, что наблюдение закончено, и точка
-     * удаляется, чтобы `/daynac reset` не телепортировал игрока неожиданно позже.
-     */
     private val spectateReturnPoints = ConcurrentHashMap<UUID, SpectateReturnPoint>()
 
     /**
@@ -152,6 +150,7 @@ class AllInfoGUI(
      */
     private fun collectCards(): List<Card> {
         val ids = engine.getTrackedPlayerIds() + engine.hitCounts.keys
+        nameCache.keys.retainAll(ids)   // имена игроков, которых больше нет в tracking
         val cards = ids.asSequence().map { uuid ->
             val onlinePlayer = Bukkit.getPlayer(uuid)
             Card(
@@ -514,10 +513,14 @@ class AllInfoGUI(
         }
     }
 
-    /** Смена режима вручную завершает наблюдение — точка возврата больше не актуальна. */
+    /**
+     * Ручная смена режима командой /gamemode завершает наблюдение: точка возврата
+     * снимается. Смены от плагинов (Multiverse, WorldGuard и т.п.) не считаются
+     * решением админа, точка сохраняется, и /daynac reset вернёт его как обычно.
+     */
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     fun onGameModeChange(event: PlayerGameModeChangeEvent) {
-        if (event.newGameMode != GameMode.SPECTATOR) {
+        if (event.newGameMode != GameMode.SPECTATOR && event.cause == Cause.COMMAND) {
             spectateReturnPoints.remove(event.player.uniqueId)
         }
     }
@@ -525,7 +528,7 @@ class AllInfoGUI(
     /** Полная очистка при выходе админа — состояние страницы больше не нужно. */
     @EventHandler
     fun onQuit(event: PlayerQuitEvent) {
-        // Игрок уходит оффлайн — запоминаем имя, чтобы карточка не ходила за ним по UUID
+        if (nameCache.size >= NAME_CACHE_MAX) nameCache.clear()
         nameCache[event.player.uniqueId] = event.player.name
         openGuis.remove(event.player.uniqueId)
         openPages.remove(event.player.uniqueId)

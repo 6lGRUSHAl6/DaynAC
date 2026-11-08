@@ -8,7 +8,9 @@ import java.nio.file.StandardCopyOption
 import java.util.Random
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
+import java.io.EOFException
 import kotlin.concurrent.withLock
+import java.nio.file.AtomicMoveNotSupportedException
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
@@ -728,10 +730,13 @@ class NeuralNetwork(
                     output.writeBoolean(false)
                 }
             }
-            if (file.exists()) {
+            try {
+                Files.move(
+                    tmpFile.toPath(), file.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
                 Files.move(tmpFile.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            } else {
-                Files.move(tmpFile.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE)
             }
         } catch (e: Exception) {
             tmpFile.delete()
@@ -741,47 +746,58 @@ class NeuralNetwork(
 
     fun loadFrom(file: File) {
         mutationLock.withLock {
-            DataInputStream(file.inputStream().buffered()).use { input ->
-                check(input.readInt() == MAGIC) { "Файл модели повреждён (неверный маркер)" }
-                check(input.readInt() == FORMAT_VERSION) { "Неподдерживаемая версия формата модели" }
-                val modelFeatureVersion = input.readInt()
-                check(modelFeatureVersion == FeatureExtractor.FEATURE_VERSION) {
-                    "Модель обучена на версии признаков $modelFeatureVersion, текущая — ${FeatureExtractor.FEATURE_VERSION}. Переобучите: /daynac train"
-                }
-                check(input.readInt() == inputSize) { "Размер входа модели не совпадает с текущим ($inputSize)" }
-                val layerCount = input.readInt()
-                check(layerCount == layerSizes.size) { "Структура слоёв модели не совпадает" }
-                for (l in layerSizes.indices) {
-                    check(input.readInt() == layerSizes[l]) { "Размер слоя $l не совпадает" }
-                }
-
-                val loaded = emptyWeights()
-                for (layer in loaded.weights) {
-                    for (neuron in layer) {
-                        for (k in neuron.indices) neuron[k] = input.readDouble()
+            try {
+                DataInputStream(file.inputStream().buffered()).use { input ->
+                    check(input.readInt() == MAGIC) { "Файл модели повреждён (неверный маркер)" }
+                    check(input.readInt() == FORMAT_VERSION) { "Неподдерживаемая версия формата модели" }
+                    val modelFeatureVersion = input.readInt()
+                    check(modelFeatureVersion == FeatureExtractor.FEATURE_VERSION) {
+                        "Модель обучена на версии признаков $modelFeatureVersion, текущая — ${FeatureExtractor.FEATURE_VERSION}. Переобучите: /daynac train"
                     }
-                }
-                for (layer in loaded.biases) {
-                    for (j in layer.indices) layer[j] = input.readDouble()
-                }
-                for (i in loaded.featureMean.indices) loaded.featureMean[i] = input.readDouble()
-                for (i in loaded.featureStd.indices) loaded.featureStd[i] = input.readDouble()
+                    check(input.readInt() == inputSize) { "Размер входа модели не совпадает с текущим ($inputSize)" }
+                    val layerCount = input.readInt()
+                    check(layerCount == layerSizes.size) { "Структура слоёв модели не совпадает" }
+                    for (l in layerSizes.indices) {
+                        check(input.readInt() == layerSizes[l]) { "Размер слоя $l не совпадает" }
+                    }
 
-                // Блок метрик может отсутствовать, если файл закончился на весах.
-                lastTrainResult = if (input.available() > 0 && input.readBoolean()) {
-                    TrainResult(
-                        epochsRun = input.readInt(),
-                        bestEpoch = input.readInt(),
-                        earlyStopped = input.readBoolean(),
-                        trainLoss = input.readDouble(),
-                        valLoss = input.readDouble(),
-                        trainAccuracy = input.readDouble(),
-                        valAccuracy = input.readDouble()
-                    )
-                } else null
+                    val loaded = emptyWeights()
+                    for (layer in loaded.weights) {
+                        for (neuron in layer) {
+                            for (k in neuron.indices) neuron[k] = input.readDouble()
+                        }
+                    }
+                    for (layer in loaded.biases) {
+                        for (j in layer.indices) layer[j] = input.readDouble()
+                    }
+                    for (i in loaded.featureMean.indices) loaded.featureMean[i] = input.readDouble()
+                    for (i in loaded.featureStd.indices) loaded.featureStd[i] = input.readDouble()
 
-                lastTestSet = null
-                snapshot.set(loaded)
+                    // Блок метрик может отсутствовать, если файл закончился на весах.
+                    val metricsFlag = input.read()
+                    val trainResult: TrainResult? = when (metricsFlag) {
+                        -1, 0 -> null
+                        else -> try {
+                            TrainResult(
+                                epochsRun = input.readInt(),
+                                bestEpoch = input.readInt(),
+                                earlyStopped = input.readBoolean(),
+                                trainLoss = input.readDouble(),
+                                valLoss = input.readDouble(),
+                                trainAccuracy = input.readDouble(),
+                                valAccuracy = input.readDouble()
+                            )
+                        } catch (e: EOFException) {
+                            throw IllegalStateException("Файл модели обрезан: блок метрик обучения неполный", e)
+                        }
+                    }
+
+                    lastTrainResult = trainResult
+                    lastTestSet = null
+                    snapshot.set(loaded)
+                }
+            } catch (e: EOFException) {
+                throw IllegalStateException("Файл модели обрезан или повреждён (неожиданный конец данных)", e)
             }
         }
     }

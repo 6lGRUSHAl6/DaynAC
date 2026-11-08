@@ -20,6 +20,7 @@ import zov.grusha.daynAC.ml.NeuralNetwork
 import zov.grusha.daynAC.compat.Compat
 import zov.grusha.daynAC.detection.DetectionEngine
 import zov.grusha.daynAC.exemptions.ExemptionManager
+import org.bukkit.plugin.IllegalPluginAccessException
 import zov.grusha.daynAC.gui.AllInfoGUI
 import zov.grusha.daynAC.permissions.Permissions
 import java.io.File
@@ -202,12 +203,19 @@ class DaynAC : JavaPlugin(), Listener {
                     sender.sendMessage("§a[DaynAC] Обучение запущено...")
 
                     thread(name = "DaynAC-Training", isDaemon = true) {
+                        val senderPlayerId = (sender as? Player)?.uniqueId
                         // Отчёты отправляем на главный поток — Bukkit API из async-потока нельзя.
                         fun report(message: String) {
-                            if (isEnabled) {
-                                Bukkit.getScheduler().runTask(this@DaynAC, Runnable { sender.sendMessage(message) })
-                            } else {
-                                logger.info(message.replace("§[0-9a-f]".toRegex(), ""))
+                            val plain = message.replace("§[0-9a-fk-or]".toRegex(), "")
+                            if (!isEnabled) { logger.info(plain); return }
+                            try {
+                                Bukkit.getScheduler().runTask(this@DaynAC, Runnable {
+                                    val target: CommandSender? =
+                                        if (senderPlayerId != null) Bukkit.getPlayer(senderPlayerId) else sender
+                                    if (target != null) target.sendMessage(message) else logger.info(plain)
+                                })
+                            } catch (_: IllegalPluginAccessException) {
+                                logger.info(plain) // плагин выключили между проверкой isEnabled и runTask
                             }
                         }
 
@@ -253,10 +261,12 @@ class DaynAC : JavaPlugin(), Listener {
                             }
 
                             fun actionBar(text: String) {
-                                if (senderPlayer == null || !isEnabled) return
-                                Bukkit.getScheduler().runTask(this@DaynAC, Runnable {
-                                    Compat.actionBar(senderPlayer, text)
-                                })
+                                if (senderPlayerId == null || !isEnabled) return
+                                try {
+                                    Bukkit.getScheduler().runTask(this@DaynAC, Runnable {
+                                        Bukkit.getPlayer(senderPlayerId)?.let { Compat.actionBar(it, text) }
+                                    })
+                                } catch (_: IllegalPluginAccessException) { }
                             }
 
                             try {
