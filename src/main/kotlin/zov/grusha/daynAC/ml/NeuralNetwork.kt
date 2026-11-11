@@ -29,7 +29,7 @@ import kotlin.math.sqrt
  */
 class NeuralNetwork(
     val inputSize: Int,
-    hiddenSizes: IntArray = intArrayOf(8, 16),
+    hiddenSizes: IntArray = intArrayOf(64, 32, 16),
     private val seed: Long = 42L
 ) {
 
@@ -265,7 +265,7 @@ class NeuralNetwork(
         samples: List<DoubleArray>,
         labels: List<Double>,
         learningRate: Double = 0.002,
-        maxEpochs: Int = 2000,
+        maxEpochs: Int = 1000,
         patience: Int = 40,
         l2Lambda: Double = 1e-4,
         dropoutRate: Double = 0.15,
