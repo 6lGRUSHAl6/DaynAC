@@ -1,6 +1,7 @@
 package zov.grusha.daynAC.detection
 
 import org.bukkit.Bukkit
+import org.bukkit.configuration.file.FileConfiguration
 import org.bukkit.entity.Player
 import zov.grusha.daynAC.permissions.Permissions
 import zov.grusha.daynAC.ml.FeatureExtractor
@@ -51,22 +52,55 @@ class DetectionEngine(
 ) {
 
     /**
-     * Пороги детекции — читаются из config.yml (секция detection), значения
-     * по умолчанию соответствуют daynac.md. Публичные val, чтобы /daynac info
-     * и GUI показывали актуальные значения.
+     * Immutable снапшот секции detection из config.yml: пороги и настройки
+     * наказаний. Меняется только целиком — одной ссылкой в [settings].
      */
-    val flagThreshold: Double
-    val reduceThreshold: Double
-    val cancelThreshold: Double
-    val punishThreshold: Double
-    val maxRecentPredictions: Int
+    private data class Settings(
+        val flagThreshold: Double,
+        val reduceThreshold: Double,
+        val cancelThreshold: Double,
+        val punishThreshold: Double,
+        val maxRecentPredictions: Int,
+        val punishConfirmWindows: Int,
+        val alertCooldownSeconds: Int,
+        val inactivityResetSeconds: Int,
+        val carryOverSeconds: Int,
+        val punishEnabled: Boolean,
+        val punishAction: String,
+        val punishReason: String,
+        val banWithIp: Boolean,
+        val punishMessageKick: List<String>,
+        val punishMessageBan: List<String>,
+        val punishMessageBanIp: List<String>,
+    )
+
+    /**
+     * Единственная изменяемая ссылка на настройки. reload() из главного потока
+     * присваивает новый снапшот целиком, а inference-потоки читают старые или
+     * новые — но никогда смесь: @Volatile гарантирует видимость и атомарность
+     * замены ссылки.
+     */
+    @Volatile
+    private lateinit var settings: Settings
+
+    /**
+     * Пороги детекции — читаются из config.yml (секция detection), значения
+     * по умолчанию соответствуют daynac.md. Публичные геттеры, чтобы /daynac info
+     * и GUI показывали актуальные значения; запись — только через [reload]
+     * после успешной валидации нового конфига.
+     */
+    val flagThreshold: Double get() = settings.flagThreshold
+    val reduceThreshold: Double get() = settings.reduceThreshold
+    val cancelThreshold: Double get() = settings.cancelThreshold
+    val punishThreshold: Double get() = settings.punishThreshold
+    val maxRecentPredictions: Int get() = settings.maxRecentPredictions
 
     /**
      * Сколько независимых (непересекающихся) окон подряд должны дать скор ≥ [punishThreshold],
      * чтобы сработало автонаказание. 1 = достаточно одного окна. Читается из
      * detection.punish-confirm-windows.
      */
-    val punishConfirmWindows: Int
+    val punishConfirmWindows: Int get() = settings.punishConfirmWindows
 
     /**
      * Кулдаун оповещений об одном игроке, секунды (0 = оповещение на каждый удар
@@ -75,32 +109,32 @@ class DetectionEngine(
      * не теряются — суммируются в следующее оповещение. Кулдаун трогает только
      * сообщения: снижение урона, punish-progress и наказание работают без изменений.
      */
-    val alertCooldownSeconds: Int
+    val alertCooldownSeconds: Int get() = settings.alertCooldownSeconds
 
     /**
      * Простой в секундах, после которого с игрока снимаются флаги и окно ударов
      * начинается заново (0 = сброс выключен). См. [isIdle] и [resetFlags].
      */
-    val inactivityResetSeconds: Int
+    val inactivityResetSeconds: Int get() = settings.inactivityResetSeconds
 
     /**
      * Сколько секунд после сброса по простою помнить подозрительный скор игрока
      * (0 = не помнить). Пока новое окно ударов не набралось, урон считается по этому
      * затухающему скору, а не по «чистому листу». Читается из detection.carry-over-seconds.
      */
-    val carryOverSeconds: Int
+    val carryOverSeconds: Int get() = settings.carryOverSeconds
 
     /** Автонаказание (кик) включено? false = режим наблюдения: только оповещения и снижение урона. */
-    val punishEnabled: Boolean
+    val punishEnabled: Boolean get() = settings.punishEnabled
 
     /** Тип наказания: "none" | "kick" | "ban". */
-    val punishAction: String
+    val punishAction: String get() = settings.punishAction
 
     /** Причина наказания для кика/бана. */
-    val punishReason: String
+    val punishReason: String get() = settings.punishReason
 
     /** Банить ли одновременно по IP (punish-action: ban). true = бан профиля + бан IP. */
-    val banWithIp: Boolean
+    val banWithIp: Boolean get() = settings.banWithIp
 
     /**
      * Шаблоны сообщений наказанному игроку из detection.punish-message — то, что видит
@@ -109,59 +143,99 @@ class DetectionEngine(
      * [punishPlayer], &-коды (включая hex &#RRGGBB) переводятся в §-формат.
      * Ключ ban-ip при отсутствии наследует текст ban (см. читателю config.yml).
      */
-    val punishMessageKick: List<String>
-    val punishMessageBan: List<String>
-    val punishMessageBanIp: List<String>
+    val punishMessageKick: List<String> get() = settings.punishMessageKick
+    val punishMessageBan: List<String> get() = settings.punishMessageBan
+    val punishMessageBanIp: List<String> get() = settings.punishMessageBanIp
 
     init {
-        val config = plugin.config
-        flagThreshold = config.getDouble("detection.flag-threshold", 0.65)
-        reduceThreshold = config.getDouble("detection.reduce-threshold", 0.70)
-        cancelThreshold = config.getDouble("detection.cancel-threshold", 0.90)
-        punishThreshold = config.getDouble("detection.punish-threshold", 0.95)
-        maxRecentPredictions = config.getInt("detection.max-recent-predictions", 10)
-        punishConfirmWindows = config.getInt("detection.punish-confirm-windows", 2)
-        alertCooldownSeconds = config.getInt("detection.alert-cooldown-seconds", 5)
-        inactivityResetSeconds = config.getInt("detection.inactivity-reset-seconds", 30)
-        carryOverSeconds = config.getInt("detection.carry-over-seconds", 600)
-        punishEnabled = config.getBoolean("detection.punish-enabled", true)
-        punishAction = config.getString("detection.punish-action", "kick")?.lowercase() ?: "kick"
-        punishReason = config.getString("detection.punish-reason", "KillAura (обнаружено нейросетью DaynAC)")!!
-        banWithIp = config.getBoolean("detection.ban-with-ip", false)
-        punishMessageKick = readMessageTemplate(config, "detection.punish-message.kick")
+        settings = parseSettings(plugin.config)
+    }
+
+    /**
+     * Перезагружает пороги и настройки наказаний из текущего config.yml плагина
+     * (перед вызовом сделайте plugin.reloadConfig()). Новый конфиг сначала
+     * полностью читается и валидируется в новый снапшот [Settings], и только
+     * при успехе снапшот атомарно подменяет рабочий: потоки inference видят
+     * либо целиком старые, либо целиком новые настройки. При ошибке валидации
+     * ничего не меняется, а исключение уходит вызывающему коду для сообщения
+     * пользователю /daynac reload.
+     */
+    fun reload() {
+        settings = parseSettings(plugin.config)
+    }
+
+    /** Читает и валидирует секцию detection из конфига, собирая снапшот. */
+    private fun parseSettings(config: FileConfiguration): Settings {
+        // Снапшот + валидация на локальных значениях: при ошибке require()
+        // исключение вылетает до возврата, и рабочий [settings] не трогается.
+        val flag = config.getDouble("detection.flag-threshold", 0.65)
+        val reduce = config.getDouble("detection.reduce-threshold", 0.70)
+        val cancel = config.getDouble("detection.cancel-threshold", 0.90)
+        val punish = config.getDouble("detection.punish-threshold", 0.95)
+        val maxRecent = config.getInt("detection.max-recent-predictions", 10)
+        val confirmWindows = config.getInt("detection.punish-confirm-windows", 2)
+        val cooldown = config.getInt("detection.alert-cooldown-seconds", 5)
+        val inactivity = config.getInt("detection.inactivity-reset-seconds", 30)
+        val carryOver = config.getInt("detection.carry-over-seconds", 600)
+        val enabled = config.getBoolean("detection.punish-enabled", true)
+        val action = config.getString("detection.punish-action", "kick")?.lowercase() ?: "kick"
+        val reason = config.getString("detection.punish-reason", "KillAura (обнаружено нейросетью DaynAC)")!!
+        val withIp = config.getBoolean("detection.ban-with-ip", false)
+        val msgKick = readMessageTemplate(config, "detection.punish-message.kick")
             ?: DEFAULT_PUNISH_MESSAGE_KICK
-        punishMessageBan = readMessageTemplate(config, "detection.punish-message.ban")
+        val msgBan = readMessageTemplate(config, "detection.punish-message.ban")
             ?: DEFAULT_PUNISH_MESSAGE_BAN
         // Наследование из config.yml: «Ключ ban-ip наследует ban, если не задан».
-        punishMessageBanIp = readMessageTemplate(config, "detection.punish-message.ban-ip")
-            ?: punishMessageBan
+        val msgBanIp = readMessageTemplate(config, "detection.punish-message.ban-ip")
+            ?: msgBan
 
-        require(punishAction in setOf("none", "kick", "ban")) {
-            "detection.punish-action должен быть none/kick/ban, получено: \"$punishAction\""
+        require(action in setOf("none", "kick", "ban")) {
+            "detection.punish-action должен быть none/kick/ban, получено: \"$action\""
         }
 
         // Санитарная проверка: пороги вне (0, 1) или в абсурдном порядке ломают логику.
         // Инвариант из config.yml: flag ≤ reduce < cancel ≤ punish — без него,
         // например, punish < flag означал бы автокик без единого оповещения админам.
-        require(flagThreshold in 0.0..1.0) { "detection.flag-threshold должен быть в (0, 1), получено $flagThreshold" }
-        require(reduceThreshold in 0.0..1.0) { "detection.reduce-threshold должен быть в (0, 1), получено $reduceThreshold" }
-        require(cancelThreshold in 0.0..1.0) { "detection.cancel-threshold должен быть в (0, 1), получено $cancelThreshold" }
-        require(punishThreshold in 0.0..1.0) { "detection.punish-threshold должен быть в (0, 1), получено $punishThreshold" }
-        require(flagThreshold <= reduceThreshold) {
-            "detection.flag-threshold ($flagThreshold) должен быть ≤ reduce-threshold ($reduceThreshold), иначе наказание срабатывает без оповещения"
+        require(flag in 0.0..1.0) { "detection.flag-threshold должен быть в (0, 1), получено $flag" }
+        require(reduce in 0.0..1.0) { "detection.reduce-threshold должен быть в (0, 1), получено $reduce" }
+        require(cancel in 0.0..1.0) { "detection.cancel-threshold должен быть в (0, 1), получено $cancel" }
+        require(punish in 0.0..1.0) { "detection.punish-threshold должен быть в (0, 1), получено $punish" }
+        require(flag <= reduce) {
+            "detection.flag-threshold ($flag) должен быть ≤ reduce-threshold ($reduce), иначе наказание срабатывает без оповещения"
         }
-        require(cancelThreshold > reduceThreshold) {
-            "detection.cancel-threshold ($cancelThreshold) должен быть больше reduce-threshold ($reduceThreshold)"
+        require(cancel > reduce) {
+            "detection.cancel-threshold ($cancel) должен быть больше reduce-threshold ($reduce)"
         }
-        require(cancelThreshold <= punishThreshold) {
-            "detection.cancel-threshold ($cancelThreshold) должен быть ≤ punish-threshold ($punishThreshold)"
+        require(cancel <= punish) {
+            "detection.cancel-threshold ($cancel) должен быть ≤ punish-threshold ($punish)"
         }
-        require(carryOverSeconds >= 0) { "detection.carry-over-seconds должен быть ≥ 0 (0 = выключен), получено $carryOverSeconds" }
-        require(punishConfirmWindows >= 1) { "detection.punish-confirm-windows должен быть ≥ 1, получено $punishConfirmWindows" }
-        require(alertCooldownSeconds >= 0) { "detection.alert-cooldown-seconds должен быть ≥ 0 (0 = без кулдауна), получено $alertCooldownSeconds" }
+        require(carryOver >= 0) { "detection.carry-over-seconds должен быть ≥ 0 (0 = выключен), получено $carryOver" }
+        require(confirmWindows >= 1) { "detection.punish-confirm-windows должен быть ≥ 1, получено $confirmWindows" }
+        require(cooldown >= 0) { "detection.alert-cooldown-seconds должен быть ≥ 0 (0 = без кулдауна), получено $cooldown" }
         require(windowSize >= 1) { "windowSize должен быть ≥ 1, получено $windowSize" }
-        require(maxRecentPredictions >= 1) { "detection.max-recent-predictions должен быть ≥ 1, получено $maxRecentPredictions" }
-        require(inactivityResetSeconds >= 0) { "detection.inactivity-reset-seconds должен быть ≥ 0 (0 = выключен), получено $inactivityResetSeconds" }
+        require(maxRecent >= 1) { "detection.max-recent-predictions должен быть ≥ 1, получено $maxRecent" }
+        require(inactivity >= 0) { "detection.inactivity-reset-seconds должен быть ≥ 0 (0 = выключен), получено $inactivity" }
+
+        // Валидация пройдена — возвращаем снапшот целиком; вызывающий код
+        // подменяет им рабочий [settings] одной @Volatile-ссылкой.
+        return Settings(
+            flagThreshold = flag,
+            reduceThreshold = reduce,
+            cancelThreshold = cancel,
+            punishThreshold = punish,
+            maxRecentPredictions = maxRecent,
+            punishConfirmWindows = confirmWindows,
+            alertCooldownSeconds = cooldown,
+            inactivityResetSeconds = inactivity,
+            carryOverSeconds = carryOver,
+            punishEnabled = enabled,
+            punishAction = action,
+            punishReason = reason,
+            banWithIp = withIp,
+            punishMessageKick = msgKick,
+            punishMessageBan = msgBan,
+            punishMessageBanIp = msgBanIp,
+        )
     }
 
     private data class PlayerVerdict(

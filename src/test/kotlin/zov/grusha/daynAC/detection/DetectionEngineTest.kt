@@ -207,6 +207,34 @@ class DetectionEngineTest {
     }
 
     @Test
+    fun `reload applies new thresholds without recreating engine`() {
+        val config = YamlConfiguration()
+        whenever(plugin.config).thenReturn(config)
+        val engine = DetectionEngine(plugin, network, 4, clock = { now }, inferencePool = DirectExecutorService())
+        assertEquals(0.70, engine.reduceThreshold)
+
+        config.set("detection.reduce-threshold", 0.80)
+        engine.reload()
+
+        assertEquals(0.80, engine.reduceThreshold)
+    }
+
+    @Test
+    fun `reload with invalid config keeps previous thresholds`() {
+        val config = YamlConfiguration()
+        whenever(plugin.config).thenReturn(config)
+        val engine = DetectionEngine(plugin, network, 4, clock = { now }, inferencePool = DirectExecutorService())
+        assertEquals(0.90, engine.cancelThreshold)
+
+        // cancel ≤ reduce ломает инвариант: reload должен упасть, не тронув пороги
+        config.set("detection.reduce-threshold", 0.95)
+        assertFailsWith<IllegalArgumentException> { engine.reload() }
+
+        assertEquals(0.70, engine.reduceThreshold)
+        assertEquals(0.90, engine.cancelThreshold)
+    }
+
+    @Test
     fun `invalid punish action is rejected`() {
         assertFailsWith<IllegalArgumentException> { createEngine(custom(action = "explode")) }
     }

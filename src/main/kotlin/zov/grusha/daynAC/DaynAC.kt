@@ -10,6 +10,8 @@ import org.bukkit.event.entity.EntityDamageByEntityEvent
 import org.bukkit.event.entity.EntityDamageEvent
 import org.bukkit.event.player.PlayerQuitEvent
 import org.bukkit.plugin.java.JavaPlugin
+import org.bukkit.configuration.file.FileConfiguration
+import org.bukkit.configuration.file.YamlConfiguration
 import zov.grusha.daynAC.tracking.SnapshotTracker
 import java.util.Locale
 import java.util.UUID
@@ -417,13 +419,38 @@ class DaynAC : JavaPlugin(), Listener {
                     )
                 }
                 args.isNotEmpty() && args[0] == "reload" -> {
-                    // Перезагрузка config.yml. Пороги зашиты в DetectionEngine на момент
-                    // конструирования, поэтому после reload требуется перезапуск сервера —
-                    // предупреждаем об этом честно.
+                    // reloadConfig() при синтаксической ошибке в YAML не бросает
+                    // исключение: он логирует её и подставляет пустой конфиг, после
+                    // чего пороги молча сбросились бы к умолчаниям. Поэтому файл
+                    // сначала читаем отдельно: если не парсится — прежние настройки
+                    // остаются в памяти нетронутыми.
+                    val configFile = File(dataFolder, "config.yml")
+                    try {
+                        YamlConfiguration().load(configFile)
+                    } catch (e: Exception) {
+                        sender.sendMessage("§c[DaynAC] config.yml не читается — прежние настройки остались в силе: ${e.message}")
+                        logger.warning("[DaynAC] ${sender.name}: reload отклонён, YAML-ошибка в config.yml: ${e.message}")
+                        return true
+                    }
+
                     reloadConfig()
                     hitLogging = config.getBoolean("hit-logging", hitLogging)
-                    sender.sendMessage("§a[DaynAC] config.yml перезагружен (hit-logging: $hitLogging).")
-                    sender.sendMessage("§eПороги детекции читаются при старте плагина — для их применения перезапустите сервер.")
+                    try {
+                        detectionEngine.reload()
+                        sender.sendMessage(
+                            "§a[DaynAC] config.yml перезагружен (hit-logging: $hitLogging).\n" +
+                                    "§aПороги применены: flag ${detectionEngine.flagThreshold} / reduce ${detectionEngine.reduceThreshold}" +
+                                    " / cancel ${detectionEngine.cancelThreshold} / punish ${detectionEngine.punishThreshold}" +
+                                    " / окно усреднения ${detectionEngine.maxRecentPredictions}" +
+                                    " / кулдаун алертов ${detectionEngine.alertCooldownSeconds} с"
+                        )
+                        logger.info("[DaynAC] ${sender.name} перезагрузил config.yml — пороги детекции применены.")
+                    } catch (e: Exception) {
+                        // Снапшот Settings применяется одной @Volatile-ссылкой только
+                        // после успешной валидации — рабочие пороги не пострадали.
+                        sender.sendMessage("§c[DaynAC] Ошибка в секции detection — применены прежние пороги: ${e.message}")
+                        logger.warning("[DaynAC] Перезагрузка config.yml отклонена: ${e.message}")
+                    }
                 }
                 args.isNotEmpty() && args[0] == "record" -> {
                     if (args.size < 3) {
