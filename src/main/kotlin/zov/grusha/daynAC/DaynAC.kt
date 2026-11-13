@@ -497,7 +497,7 @@ class DaynAC : JavaPlugin(), Listener {
                     val thresholds = doubleArrayOf(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
                     val metrics = neuralNetwork.evaluateThresholds(thresholds)
                     if (metrics == null) {
-                        sender.sendMessage("§c[DaynAC] Test-сет недоступен. Модель не обучалась в этом сеансе или загружена с диска — запустите /daynac train.")
+                        sender.sendMessage("§c[DaynAC] Test-сет недоступен: model.dat сохранён старой версией плагина (без test-сета). Один раз запустите /daynac train — дальше сводка будет работать и после рестарта.")
                         return true
                     }
 

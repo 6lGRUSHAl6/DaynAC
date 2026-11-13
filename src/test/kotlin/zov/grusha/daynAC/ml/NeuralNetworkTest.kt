@@ -258,4 +258,53 @@ class NeuralNetworkTest {
         assertTrue(metrics.falsePositiveRate in 0.0..1.0)
         assertTrue(metrics.falseNegativeRate in 0.0..1.0)
     }
+
+    // --- eval после рестарта (test-сет в model.dat) ----------------------
+
+    @Test
+    fun `evaluateThresholds works after save-load cycle`(@TempDir tmp: Path) {
+        val file = tmp.resolve("model.dat").toFile()
+
+        val nn1 = tinyNetwork()
+        val (samples, labels) = tinyDataset()
+        nn1.train(samples, labels, maxEpochs = 20, patience = 5)
+        nn1.saveTo(file)
+
+        // «Рестарт»: сеть с диска, train() в этом сеансе не вызывался.
+        val nn2 = tinyNetwork()
+        nn2.loadFrom(file)
+
+        val before = nn1.evaluateThresholds(doubleArrayOf(0.5))!!.first()
+        val after = nn2.evaluateThresholds(doubleArrayOf(0.5))!!.first()
+
+        // Test-сет тот же и веса те же — матрицы ошибок обязаны совпасть байт в байт.
+        assertEquals(before.totalLegit, after.totalLegit)
+        assertEquals(before.totalCheat, after.totalCheat)
+        assertEquals(before.truePositives, after.truePositives)
+        assertEquals(before.falsePositives, after.falsePositives)
+        assertEquals(before.trueNegatives, after.trueNegatives)
+        assertEquals(before.falseNegatives, after.falseNegatives)
+    }
+
+    @Test
+    fun `loadFrom restores test metrics and split summary`(@TempDir tmp: Path) {
+        val file = tmp.resolve("model.dat").toFile()
+
+        val nn1 = tinyNetwork()
+        val (samples, labels) = tinyDataset()
+        nn1.train(samples, labels, maxEpochs = 20, patience = 5)
+        val before = nn1.lastTrainResult!!
+        nn1.saveTo(file)
+
+        val nn2 = tinyNetwork()
+        nn2.loadFrom(file)
+        val after = nn2.lastTrainResult!!
+
+        assertNotNull(after.testLoss)
+        assertNotNull(after.testAccuracy)
+        assertNotNull(after.split)
+        assertEquals(before.testLoss!!, after.testLoss!!, 1e-12)
+        assertEquals(before.testAccuracy!!, after.testAccuracy!!, 1e-12)
+        assertEquals(before.split, after.split)
+    }
 }

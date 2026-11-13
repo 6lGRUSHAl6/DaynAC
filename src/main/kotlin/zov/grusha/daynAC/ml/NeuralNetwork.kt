@@ -82,7 +82,8 @@ class NeuralNetwork(
 
     /**
      * Нормализованный test-сет последнего train(): модель на нём не училась и эпоха по нему
-     * не выбиралась. В model.dat не сохраняется — после рестарта eval недоступен до train().
+     * не выбиралась. Сохраняется в model.dat дополнительным блоком после весов, поэтому
+     * /daynac eval работает и после рестарта сервера (см. saveTo/loadFrom).
      */
     private class HoldoutSet(
         val normalizedFeatures: List<DoubleArray>,
@@ -137,7 +138,9 @@ class NeuralNetwork(
         private const val BETA2 = 0.999
         private const val ADAM_EPS = 1e-8
         private const val MAGIC = 0x44414E41
-        private const val FORMAT_VERSION = 3   // v2: + метрики обучения; v3: + версия признаков
+        private const val FORMAT_VERSION = 3   // v2: + метрики обучения; v3: + версия признаков.
+        // Блок test-сета добавлен ниже метрик как необязательный хвост (версию не меняли,
+        // чтобы старые model.dat оставались совместимы и не требовали переобучения).
 
         /** Доли validation (early stopping) и test (финальная оценка) на класс; остальное — train. */
         private const val VAL_FRACTION = 0.2
@@ -222,7 +225,8 @@ class NeuralNetwork(
         val fullyGrouped: Boolean get() = legitGrouped && cheatGrouped
     }
 
-    /** Результат обучения. Поля test* и [split] равны null, если результат загружен из model.dat. */
+    /** Результат обучения. Поля test* и [split] могут быть null, если модель загружена
+     *  из старого model.dat без блока test-сета (см. loadFrom). */
     data class TrainResult(
         val epochsRun: Int,
         val bestEpoch: Int,
@@ -729,6 +733,37 @@ class NeuralNetwork(
                 } else {
                     output.writeBoolean(false)
                 }
+
+                // --- Необязательный блок test-сета --------------------------------
+                // Сохраняем нормализованные окна (те же данные, по которым считались
+                // test-метрики во время train), чтобы /daynac eval и /daynac info
+                // показывали сводку и после рестарта сервера, без переобучения.
+                val ts = lastTestSet
+                if (ts != null) {
+                    output.writeBoolean(true)
+                    output.writeInt(ts.normalizedFeatures.size)
+                    for (i in ts.normalizedFeatures.indices) {
+                        for (d in ts.normalizedFeatures[i]) output.writeDouble(d)
+                        output.writeDouble(ts.labels[i])
+                    }
+                    // Разбиение датасета — для честного предупреждения в eval о
+                    // случайном (не по группам) split после рестарта.
+                    val sp = tr?.split
+                    if (sp != null) {
+                        output.writeBoolean(true)
+                        output.writeBoolean(sp.legitGrouped)
+                        output.writeBoolean(sp.cheatGrouped)
+                        output.writeInt(sp.legitGroups)
+                        output.writeInt(sp.cheatGroups)
+                        output.writeInt(sp.trainSize)
+                        output.writeInt(sp.valSize)
+                        output.writeInt(sp.testSize)
+                    } else {
+                        output.writeBoolean(false)
+                    }
+                } else {
+                    output.writeBoolean(false)
+                }
             }
             try {
                 Files.move(
@@ -741,6 +776,43 @@ class NeuralNetwork(
         } catch (e: Exception) {
             tmpFile.delete()
             throw e
+        }
+    }
+
+    /**
+     * Читает необязательный блок test-сета из model.dat (см. saveTo).
+     * Возвращает Pair(testSet, splitSummary); для старых файлов без блока — (null, null).
+     * EOF внутри блока трактует как отсутствие блока: обрыв посреди записи в
+     * model.dat невозможен (saveTo пишет во временный файл и атомарно
+     * переименовывает), значит файл просто сохранён старой версией плагина.
+     */
+    private fun readTestSetBlock(input: DataInputStream): Pair<HoldoutSet?, SplitSummary?> {
+        if (input.read() != 1) return null to null
+        return try {
+            val count = input.readInt()
+            check(count >= 0) { "Повреждённый блок test-сета (отрицательный размер: $count)" }
+            val features = ArrayList<DoubleArray>(count)
+            val labels = DoubleArray(count)
+            for (i in 0 until count) {
+                val sample = DoubleArray(inputSize)
+                for (k in sample.indices) sample[k] = input.readDouble()
+                features.add(sample)
+                labels[i] = input.readDouble()
+            }
+            val split = if (input.read() == 1) {
+                SplitSummary(
+                    legitGrouped = input.readBoolean(),
+                    cheatGrouped = input.readBoolean(),
+                    legitGroups = input.readInt(),
+                    cheatGroups = input.readInt(),
+                    trainSize = input.readInt(),
+                    valSize = input.readInt(),
+                    testSize = input.readInt()
+                )
+            } else null
+            HoldoutSet(features, labels) to split
+        } catch (_: EOFException) {
+            null to null
         }
     }
 
@@ -793,7 +865,27 @@ class NeuralNetwork(
                     }
 
                     lastTrainResult = trainResult
-                    lastTestSet = null
+
+                    // --- Необязательный блок test-сета ------------------------------
+                    // Есть в файлах, сохранённых текущей версией; старые файлы
+                    // (FORMAT_VERSION 3 без test-блока) заканчиваются после блока
+                    // метрик — read() вернёт -1, и это не ошибка. Восстанавливаем
+                    // lastTestSet, чтобы /daynac eval работал после рестарта.
+                    val (testSet, testSplit) = readTestSetBlock(input)
+                    lastTestSet = testSet
+
+                    // testLoss/testAccuracy/split не писались в файл: пересчитываем
+                    // по восстановленным весам и test-сету (в model.dat лежат те же
+                    // лучшие веса, при которых train считал финальные метрики) —
+                    // /daynac info показывает полную сводку и после рестарта.
+                    lastTrainResult = trainResult?.let { tr ->
+                        val eval = testSet?.let { evaluateNormalized(loaded, it.normalizedFeatures, it.labels) }
+                        tr.copy(
+                            testLoss = eval?.avgLoss,
+                            testAccuracy = eval?.accuracy,
+                            split = testSplit ?: tr.split
+                        )
+                    }
                     snapshot.set(loaded)
                 }
             } catch (e: EOFException) {
