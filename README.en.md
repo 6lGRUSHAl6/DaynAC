@@ -40,7 +40,7 @@ The target use case is **1.9+ no-cooldown PvP**, where legitimately high CPS is 
 
 - **A model tailored to your server.** No shipped signatures: the network learns from data you recorded yourself - both the legit and the cheat sessions are played by your people.
 - **Behavior, not clicks.** 343 features per window of 16 hits: aiming geometry, rotation entropy, timing predictability. Details in [How it works](#how-it-works).
-- **Zero ML dependencies.** A compact MLP 343→8→16→1 is written in pure Kotlin: neither Python nor PyTorch is needed on the server.
+- **Zero ML dependencies.** A compact MLP 343→64→32→16 is written in pure Kotlin: neither Python nor PyTorch is needed on the server.
 - **The main tick stays free.** Inference runs in separate daemon threads; model weights are an immutable snapshot behind an `AtomicReference`, so retraining on a live server never blocks detection.
 - **Everything stays local.** The dataset, model and config live in `plugins/DaynAC/`; there is no telemetry; player UUIDs never end up in CSV files - SHA-256 pseudonyms with a salt are used instead.
 - **Honest metrics.** Wilson confidence intervals in `/daynac eval`, session-based splitting against data leakage, and explicit warnings while there is not enough data yet.
