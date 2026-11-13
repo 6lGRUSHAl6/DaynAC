@@ -40,8 +40,9 @@ The target use case is **1.9+ no-cooldown PvP**, where legitimately high CPS is 
 
 - **A model tailored to your server.** No shipped signatures: the network learns from data you recorded yourself - both the legit and the cheat sessions are played by your people.
 - **Behavior, not clicks.** 343 features per window of 16 hits: aiming geometry, rotation entropy, timing predictability. Details in [How it works](#how-it-works).
-- **Zero ML dependencies.** A compact MLP 343→64→32→16 is written in pure Kotlin: neither Python nor PyTorch is needed on the server.
+- **Zero ML dependencies.** A compact pure-Kotlin MLP (343→64→32→16 by default; hidden layer sizes are configurable via `hidden-layers` in config.yml): neither Python nor PyTorch is needed on the server.
 - **The main tick stays free.** Inference runs in separate daemon threads; model weights are an immutable snapshot behind an `AtomicReference`, so retraining on a live server never blocks detection.
+- **Configuration without a restart.** `/daynac reload` applies thresholds, punishment settings and even the network architecture on the fly; an invalid config applies nothing - the previous values keep working.
 - **Everything stays local.** The dataset, model and config live in `plugins/DaynAC/`; there is no telemetry; player UUIDs never end up in CSV files - SHA-256 pseudonyms with a salt are used instead.
 - **Honest metrics.** Wilson confidence intervals in `/daynac eval`, session-based splitting against data leakage, and explicit warnings while there is not enough data yet.
 - **Cautious punishment.** Kick/ban only after several independent windows in a row, smooth damage reduction before that, and an inactivity reset that still remembers a suspicious score.
@@ -64,7 +65,7 @@ flowchart TB
     hit["Player hit<br/>ENTITY_ATTACK, both are players"] --> track["SnapshotTracker<br/>per-tick rotation and velocity snapshots"]
     track --> hitdata["HitData<br/>21 features per hit"]
     hitdata --> feat["FeatureExtractor<br/>window of 16 hits<br/>16 × 21 + 7 aggregates = 343 features"]
-    feat --> nn["NeuralNetwork<br/>343 → 8 → 16 → 1<br/>pure Kotlin"]
+    feat --> nn["NeuralNetwork<br/>343 → 64 → 32 → 16 → 1<br/>pure Kotlin"]
     nn --> score["Cheat probability 0…1<br/>on every hit"]
     score --> rule{"Thresholds"}
     rule -->|"score ≥ 0.65"| alert["Admin alert<br/>(with cooldown)"]
@@ -84,6 +85,8 @@ If the pause between hits exceeds 2 seconds, the interval history is reset: it c
 > [!NOTE]
 > Only **landed** `ENTITY_ATTACK` hits between players are recorded. Hits cancelled by other plugins and sword sweep attacks never enter the history.
 
+The hidden layer sizes are set in config.yml (`hidden-layers`, `[64, 32, 16]` by default); the input and output are fixed (343 features and 1 probability).
+
 ---
 
 ## Installation
@@ -102,7 +105,7 @@ The plugin is built against the 1.21.11 API, but auxiliary calls (action bar, ki
 1. Download `DaynAC-<version>-all.jar` from [Releases](https://github.com/6lGRUSHAl6/DaynAC/releases) (every push to `main` publishes a new build), or build it yourself (see below).
 2. Copy the jar into the server's `plugins/` folder.
 3. Start the server. The plugin creates `plugins/DaynAC/` with `config.yml`.
-4. Adjust the thresholds for your server and restart.
+4. Adjust the thresholds for your server and apply them with `/daynac reload`.
 5. Grant permissions to your staff (see [Permissions](#permissions)): ops only need `daynac.admin`, everyone else gets what they need from the list.
 
 > [!IMPORTANT]
@@ -144,14 +147,14 @@ Each command requires its own permission (see [Permissions](#permissions)); `day
 | `/daynac record <player> <legit\|cheat\|off>` | Record dataset samples for a player | `daynac.record` |
 | `/daynac train` | Train the model on the collected dataset | `daynac.train` |
 | `/daynac eval` | Test-set metrics across a range of thresholds | `daynac.train` |
-| `/daynac info` | Dataset, sessions, training metrics, model state, thresholds, punishment mode, number of exemptions | `daynac.view` |
+| `/daynac info` | Dataset, sessions, training metrics, model state and architecture, thresholds, punishment mode, number of exemptions | `daynac.view` |
 | `/daynac ver [player]` | Without a name: plugin status; with a name: the player's last and average score and hit count in the current window | `daynac.view` |
 | `/daynac allinfo` | Player-monitoring GUI (teleporting from it needs `daynac.spectate`) | `daynac.view` |
 | `/daynac reset` | Return from observation to where it started (location and game mode) | `daynac.spectate` |
 | `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` and to the console; the value is saved to `config.yml` | `daynac.config` |
 | `/daynac clearflags <player>` | Manually reset a player's flags and current window (also works for offline players) | `daynac.config` |
 | `/daynac exempt <player> [time\|off]` | Grant a temporary exemption from detection (`30s`, `5m`, `2h`, `1d`); without time - permanent; `off` - remove | `daynac.exempt.manage` |
-| `/daynac reload` | Reload `config.yml` (only `hit-logging` is applied; everything else needs a restart) | `daynac.config` |
+| `/daynac reload` | Reload `config.yml` on the fly: thresholds, punishment settings and `hidden-layers` are applied immediately; on an error (broken YAML, invalid values) the previous settings stay in force. While `/daynac train` is running, an architecture change is postponed until it finishes | `daynac.config` |
 
 ---
 
@@ -238,7 +241,7 @@ These columns are not used for training; they are used to split the dataset. Fil
 - Parameters: Adam (lr 0.001), one sample at a time, BCE, L2 `1e-4`, dropout 0.15 on hidden layers, up to 1000 epochs; validation loss is checked every 5 epochs, and training stops after 15 checks without improvement.
 - At least 10 vectors in total and at least 5 per class are required (in practice, hundreds are recommended).
 - Training runs in a background thread, and only one run can be active at a time. Progress is shown in real time: a live progress bar in the action bar (for the player, at most twice a second) and progress updates in chat every 10% of the epochs.
-- On completion: a report with train/validation/test metrics, a description of the split, and the train/validation gap (overfitting, warning threshold 5 percentage points); the model is saved to `model.dat` and detection is enabled automatically.
+- On completion: a report with train/validation/test metrics, a description of the split, and the train/validation gap (overfitting, warning threshold 5 percentage points); the model is saved to `model.dat` together with the test set and the split (so the `/daynac eval` report survives a restart), and detection is enabled automatically.
 
 A large gap between train and validation accuracy means the data is insufficient or too uniform.
 
@@ -247,7 +250,7 @@ A large gap between train and validation accuracy means the data is insufficient
 Shows precision, recall, F1 and FPR on the test set for a range of thresholds (0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99), with 95% Wilson confidence intervals; the current `reduce-threshold` is marked in the table. A threshold is recommended only if the **upper bound** of the FPR is ≤ 1%. Even with zero errors, this requires ≥ 381 legit windows in the test set (roughly 1,900 legit vectors in the whole dataset). Until you have that much data, the plugin will tell you plainly that a low FPR is not statistically confirmed.
 
 > [!IMPORTANT]
-> `eval` only works in the same server run in which training happened: the test set is not stored in `model.dat`. After a restart, `/daynac info` shows train/validation metrics, but no test metrics.
+> The threshold report survives a server restart: the test set and the split are saved into `model.dat` at training time, so `/daynac eval` and the test metrics in `/daynac info` keep working after a restart, without retraining. For a `model.dat` created by an older plugin version (without a test set), run `/daynac train` once.
 
 ---
 
@@ -337,6 +340,13 @@ Menu items cannot be taken out of the inventory.
 ```yaml
 hit-logging: false           # log every hit (toggled by /daynac debug)
 
+# Hidden layer sizes of the network. A single number means one layer (hidden-layers: 32).
+# Limits: 1..8 layers, each sized 1..512. Changing the architecture makes the current
+# model.dat incompatible: after /daynac reload detection stays disabled until
+# /daynac train (model.dat is kept - restore the previous value and the model
+# works again without retraining).
+hidden-layers: [64, 32, 16]
+
 detection:
   flag-threshold: 0.65       # threshold for admin alerts
   reduce-threshold: 0.70     # start reducing damage
@@ -378,7 +388,7 @@ Placeholders in `punish-message`:
 | `{action}` | `kick`, `ban` or `ban-ip` |
 
 > [!IMPORTANT]
-> Threshold ordering is validated at startup: `flag ≤ reduce < cancel ≤ punish`; also `punish-confirm-windows ≥ 1`, `max-recent-predictions ≥ 1`, and `alert-cooldown-seconds`, `inactivity-reset-seconds` and `carry-over-seconds` cannot be negative. If the settings are invalid, the plugin will not start. Thresholds, punishment messages and the other `detection` options are read once when the plugin starts, so after `/daynac reload` a restart is needed for them to take effect (only `hit-logging` applies immediately).
+> Threshold ordering is validated at startup and at `/daynac reload`: `flag ≤ reduce < cancel ≤ punish`; also `punish-confirm-windows ≥ 1`, `max-recent-predictions ≥ 1`, and `alert-cooldown-seconds`, `inactivity-reset-seconds` and `carry-over-seconds` cannot be negative. The `detection` options, `hidden-layers` and `hit-logging` are applied by `/daynac reload` without a server restart: thresholds and punishment settings are applied atomically (either fully new or fully previous), and after a `hidden-layers` change detection only works with a model of the new architecture. A YAML syntax error or an invalid value applies nothing.
 
 ---
 
@@ -392,7 +402,7 @@ Everything is stored locally in `plugins/DaynAC/`. There is no telemetry.
 | `legit_vectors.csv`, `cheat_vectors.csv` | the dataset (vectors + `session_id`, `player_hash`) |
 | `dataset.salt` | salt for `player_hash`; do not lose or publish it |
 | `dataset.featver` | the feature version the dataset was collected with |
-| `model.dat` | the trained model (weights, normalization, feature version, train/validation metrics) |
+| `model.dat` | the trained model (weights, normalization, feature version, train/validation/test metrics, test set and split) |
 | `exemptions.yml` | temporary exemptions from detection (UUID + expiration time) |
 | `*.bak`, `*.featv<N>.bak`, `model.dat.old` | backups made on a format or feature-version change |
 
@@ -431,9 +441,10 @@ src/main/kotlin/zov/grusha/daynAC/
 
 Key engineering decisions:
 
-- **Dependency-free neural network.** MLP 343→8→16→1 in pure Kotlin (ReLU + sigmoid, BCE, Adam, He initialization, L2, dropout, gradient clipping). Neither PyTorch nor Python is needed.
+- **Dependency-free neural network.** MLP 343→64→32→16→1 in pure Kotlin (ReLU + sigmoid, BCE, Adam, He initialization, L2, dropout, gradient clipping). Neither PyTorch nor Python is needed. Hidden layer sizes change on the fly via `hidden-layers` + `/daynac reload`: the network is rebuilt atomically under a mutex, and inference buffers are tied to the weight snapshot, not to a global architecture.
 - **Lock-free inference.** Weights live in an immutable snapshot behind an `AtomicReference`: `predict()` takes no locks, and retraining on a live server does not block detection. Inference runs in two daemon threads.
 - **Atomic model publishing.** `train` and `loadFrom` are serialized with a mutex, and the model file is written via tmp+rename, so a server crash cannot corrupt `model.dat`.
+- **Atomic settings swap.** Thresholds live in an immutable snapshot behind a single `@Volatile` reference: `/daynac reload` validates the whole config and swaps the settings in one reference assignment. Every property read returns either the fully old or the fully new snapshot; briefly mixing values from the two sets within a single hit is safe because each set is validated on its own.
 - **Data-leakage protection.** Non-overlapping windows when recording, session/player-based splitting, class stratification, and normalization from the training portion only.
 - **Feature versioning.** Old datasets and models are never silently mixed with new ones.
 - **Bounded memory growth.** Per-player state maps are cleaned by TTL (1 hour), the score log is capped at 100 entries, and expired exemptions are removed lazily and on a schedule.
@@ -451,7 +462,7 @@ Key engineering decisions:
 - No pretrained model is shipped: the model is only as good as your dataset.
 - Output probabilities are not calibrated: 0.70 does not necessarily mean "70% cheater". Rely on `/daynac eval`, not on absolute numbers.
 - `punish-enabled: false` and `punish-action: none` disable only kick/ban. Damage reduction and cancellation stay active; there is no separate switch yet. To exclude a player from detection entirely, use exemptions (`/daynac exempt` or the `daynac.exempt` permission).
-- `detection` settings take effect only after a server restart.
+- Changing `hidden-layers` makes the current `model.dat` incompatible: after `/daynac reload` detection stays disabled until `/daynac train` (unless a model.dat matching the new architecture is already in place).
 - Detection state (scores, carry-over, confirmation streaks) is kept in memory and does not survive a restart.
 
 ---

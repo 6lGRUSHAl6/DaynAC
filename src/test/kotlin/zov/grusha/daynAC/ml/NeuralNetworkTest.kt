@@ -8,6 +8,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class NeuralNetworkTest {
@@ -58,6 +59,39 @@ class NeuralNetworkTest {
         val nn = tinyNetwork()
         nn.saveTo(file)
         assertTrue(nn.isCompatibleWith(file))
+    }
+
+    @Test
+    fun `isCompatibleWith true for an identical architecture file`(@TempDir tmp: Path) {
+        val file = tmp.resolve("model.dat").toFile()
+        // Порядок полей заголовка saveTo: magic, format, feature version,
+        // inputSize, число слоёв, размеры слоёв. Та же архитектура — true.
+        NeuralNetwork(inputSize = 3, hiddenSizes = intArrayOf(4)).saveTo(file)
+        assertTrue(NeuralNetwork(inputSize = 3, hiddenSizes = intArrayOf(4)).isCompatibleWith(file))
+    }
+
+    @Test
+    fun `isCompatibleWith compares layer order not just count`(@TempDir tmp: Path) {
+        val file = tmp.resolve("model.dat").toFile()
+        // [3, 8, 4, 1] и [3, 4, 8, 1]: одинаковое число слоёв, разный порядок.
+        NeuralNetwork(inputSize = 3, hiddenSizes = intArrayOf(8, 4)).saveTo(file)
+        assertFalse(NeuralNetwork(inputSize = 3, hiddenSizes = intArrayOf(4, 8)).isCompatibleWith(file))
+    }
+
+    @Test
+    fun `isArchitectureMismatch distinguishes layer change from feature change`(@TempDir tmp: Path) {
+        val file = tmp.resolve("model.dat").toFile()
+        val nn = tinyNetwork()
+        nn.saveTo(file)
+
+        // Та же архитектура — не mismatch.
+        assertFalse(nn.isArchitectureMismatch(file))
+
+        // Другая архитектура (тот же вход и версия признаков) — mismatch:
+        // файл нельзя переименовывать в .old, он совместим со старыми слоями.
+        val changed = tinyNetwork()
+        changed.setArchitecture(intArrayOf(8))
+        assertTrue(changed.isArchitectureMismatch(file))
     }
 
     @Test
@@ -257,6 +291,68 @@ class NeuralNetworkTest {
         assertTrue(metrics.f1 in 0.0..1.0)
         assertTrue(metrics.falsePositiveRate in 0.0..1.0)
         assertTrue(metrics.falseNegativeRate in 0.0..1.0)
+    }
+
+    // --- setArchitecture() ----------------------------------------------
+
+    @Test
+    fun `setArchitecture rebuilds network and invalidates model`() {
+        val nn = tinyNetwork() // inputSize 3, один скрытый слой 4
+
+        val changed = nn.setArchitecture(intArrayOf(8, 4))
+
+        assertTrue(changed)
+        assertEquals(listOf(8, 4), nn.hiddenLayerSizes.toList())
+    }
+
+    @Test
+    fun `setArchitecture with same layers returns false`() {
+        val nn = tinyNetwork()
+        assertFalse(nn.setArchitecture(intArrayOf(4)))
+    }
+
+    @Test
+    fun `predict works with new architecture after setArchitecture`() {
+        val nn = tinyNetwork()
+        nn.setArchitecture(intArrayOf(8, 4))
+
+        // Нулевые веса — это корректная сеть, а не мусор: предсказание должно
+        // быть валидной вероятностью, а не исключением/NaN.
+        val p = nn.predict(doubleArrayOf(0.3, 0.7, 0.5))
+        assertTrue(p in 0.0..1.0)
+        assertEquals(nn.predict(doubleArrayOf(0.3, 0.7, 0.5)), p, 1e-12)
+    }
+
+    @Test
+    fun `isCompatibleWith false after architecture change`(@TempDir tmp: Path) {
+        val file = tmp.resolve("model.dat").toFile()
+        val nn = tinyNetwork()
+        nn.saveTo(file)
+
+        nn.setArchitecture(intArrayOf(8))
+
+        assertFalse(nn.isCompatibleWith(file))
+    }
+
+    @Test
+    fun `evaluateThresholds returns null after architecture change`() {
+        val nn = tinyNetwork()
+        val (samples, labels) = tinyDataset()
+        nn.train(samples, labels, maxEpochs = 20, patience = 5)
+        assertNotNull(nn.evaluateThresholds(doubleArrayOf(0.5)))
+
+        nn.setArchitecture(intArrayOf(6, 3))
+
+        // test-сет от прежней архитектуры сброшен: сводку нельзя считать по
+        // окнам другого размера.
+        assertNull(nn.evaluateThresholds(doubleArrayOf(0.5)))
+    }
+
+    @Test
+    fun `setArchitecture rejects empty and non-positive layers`() {
+        val nn = tinyNetwork()
+        assertFailsWith<IllegalArgumentException> { nn.setArchitecture(intArrayOf()) }
+        assertFailsWith<IllegalArgumentException> { nn.setArchitecture(intArrayOf(0, 4)) }
     }
 
     // --- eval после рестарта (test-сет в model.dat) ----------------------

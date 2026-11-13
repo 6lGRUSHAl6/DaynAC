@@ -122,26 +122,76 @@ class DaynAC : JavaPlugin(), Listener {
             }
         }, 20L, 20L)
 
+        // Применяем архитектуру из конфига до загрузки модели: если hidden-layers
+        // отличается от умолчания, сеть перестроится и совместимость model.dat
+        // проверится уже против новой архитектуры.
+        neuralNetwork.setArchitecture(readHiddenLayers())
+
         // Загрузка обученной модели, если она совместима с текущей структурой признаков
+        loadModelFromFile()
+    }
+
+    /**
+     * Загружает модель из model.dat, если она совместима с текущей архитектурой
+     * (hidden-layers + версия признаков). Вызывается из onEnable; /daynac reload
+     * при смене архитектуры делает загрузку сам — там модель не переименовывается.
+     *
+     * При несовместимости детекция отключается. Переименование в model.dat.old —
+     * только для модели, которая совместимой уже не станет (другая версия
+     * признаков/формата). Если слои в файле не совпали с текущими (isArchitectureMismatch),
+     * файл остаётся на месте: вернёте прежнее hidden-layers — и модель заработает
+     * без переобучения.
+     */
+    private fun loadModelFromFile() {
         if (neuralNetwork.isCompatibleWith(modelFile)) {
             try {
                 neuralNetwork.loadFrom(modelFile)
                 detectionEngine.enableDetection()
                 logger.info("Модель загружена из model.dat — детекция активна.")
+                return
             } catch (e: Exception) {
                 logger.warning("Не удалось загрузить модель: ${e.message} — детекция отключена.")
             }
-        } else {
-            if (modelFile.exists()) {
-                // Модель от другой версии признаков/формата: не удаляем, но убираем с дороги,
-                // чтобы её нельзя было принять за актуальную.
-                val old = File(dataFolder, "model.dat.old")
-                if (!old.exists() && modelFile.renameTo(old)) {
-                    logger.warning("model.dat несовместима с текущей версией признаков (v${FeatureExtractor.FEATURE_VERSION}) — переименована в model.dat.old.")
-                }
+        } else if (modelFile.exists() && !neuralNetwork.isArchitectureMismatch(modelFile)) {
+            // Причина — версия признаков/формата/входа: не удаляем, но убираем с дороги,
+            // чтобы её нельзя было принять за актуальную.
+            val old = File(dataFolder, "model.dat.old")
+            if (!old.exists() && modelFile.renameTo(old)) {
+                logger.warning("model.dat несовместима с текущей версией признаков (v${FeatureExtractor.FEATURE_VERSION}) — переименована в model.dat.old.")
             }
-            logger.info("Модель не найдена или несовместима (вход $inputSize, версия признаков ${FeatureExtractor.FEATURE_VERSION}) — детекция отключена до /daynac train.")
         }
+        detectionEngine.disableDetection()
+        logger.info("Модель не найдена или несовместима (вход $inputSize, версия признаков ${FeatureExtractor.FEATURE_VERSION}) — детекция отключена до /daynac train.")
+    }
+
+    /**
+     * Читает размеры скрытых слоёв из переданного конфига: hidden-layers: [64, 32, 16].
+     * Отсутствие ключа — умолчание [64, 32, 16]; число вместо списка — один слой.
+     * Бросает IllegalArgumentException с человекочитаемым текстом — /daynac reload
+     * показывает его админу и оставляет прежнюю архитектуру.
+     */
+    private fun readHiddenLayers(source: FileConfiguration = config): IntArray {
+        val raw = source.get("hidden-layers") ?: return intArrayOf(64, 32, 16)
+        val layers: List<Int> = when (raw) {
+            is Number -> listOf(raw.toInt())
+            is List<*> -> raw.map {
+                (it as? Number)?.toInt()
+                    ?: throw IllegalArgumentException("hidden-layers должен быть списком целых чисел, например [64, 32, 16]; элемент \"$it\" не число")
+            }
+            else -> throw IllegalArgumentException("hidden-layers должен быть списком чисел, например [64, 32, 16], а не \"$raw\"")
+        }
+        if (layers.isEmpty()) {
+            throw IllegalArgumentException("hidden-layers не может быть пустым — укажите хотя бы один скрытый слой, например [32]")
+        }
+        if (layers.size > 8) {
+            throw IllegalArgumentException("Скрытых слоёв не может быть больше 8, получено ${layers.size}")
+        }
+        for (size in layers) {
+            if (size !in 1..512) {
+                throw IllegalArgumentException("Размер скрытого слоя должен быть в диапазоне 1..512, получено $size")
+            }
+        }
+        return layers.toIntArray()
     }
 
     override fun onDisable() {
@@ -385,7 +435,8 @@ class DaynAC : JavaPlugin(), Listener {
                             appendLine("[DaynAC] Сессий записи: $legitSessions легит / $cheatSessions чит " +
                                     "(для разбиения по сессиям нужно ≥ ${NeuralNetwork.MIN_GROUPS_PER_CLASS} на класс)")
                             appendLine("[DaynAC] Модель: " + (if (detectionEngine.detectionEnabled) "активна" else "не обучена") +
-                                    ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)")
+                                    ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)" +
+                                    ", скрытые слои: ${neuralNetwork.hiddenLayerSizes.toList()}")
                             appendLine("[DaynAC] Временных исключений: ${exemptionManager.size()}")
                             if (trainInfo != null) {
                                 fun num(v: Double) = String.format(Locale.US, "%.4f", v)
@@ -422,35 +473,87 @@ class DaynAC : JavaPlugin(), Listener {
                     // reloadConfig() при синтаксической ошибке в YAML не бросает
                     // исключение: он логирует её и подставляет пустой конфиг, после
                     // чего пороги молча сбросились бы к умолчаниям. Поэтому файл
-                    // сначала читаем отдельно: если не парсится — прежние настройки
-                    // остаются в памяти нетронутыми.
+                    // читаем отдельно и валидируем из него всё, до того как менять
+                    // хоть что-то в живом состоянии.
                     val configFile = File(dataFolder, "config.yml")
+                    val fileConfig = YamlConfiguration()
                     try {
-                        YamlConfiguration().load(configFile)
+                        fileConfig.load(configFile)
                     } catch (e: Exception) {
                         sender.sendMessage("§c[DaynAC] config.yml не читается — прежние настройки остались в силе: ${e.message}")
                         logger.warning("[DaynAC] ${sender.name}: reload отклонён, YAML-ошибка в config.yml: ${e.message}")
                         return true
                     }
 
+                    // 1. Валидация всего нового конфига до каких-либо изменений.
+                    // Любое исключение здесь — полный откат: ни reloadConfig(),
+                    // ни hit-logging, ни архитектура, ни пороги не тронуты,
+                    // как и обещано в README.
+                    val newLayers: IntArray
+                    try {
+                        newLayers = readHiddenLayers(fileConfig)
+                        detectionEngine.validate(fileConfig)
+                    } catch (e: Exception) {
+                        sender.sendMessage("§c[DaynAC] Перезагрузка отклонена — прежние настройки полностью в силе: ${e.message}")
+                        logger.warning("[DaynAC] Перезагрузка config.yml отклонена: ${e.message}")
+                        return true
+                    }
+
+                    // 2. Конфиг валиден целиком — применяем.
                     reloadConfig()
                     hitLogging = config.getBoolean("hit-logging", hitLogging)
+
+                    // Смена hidden-layers требует перестройки сети; во время
+                    // обучения этого делать нельзя — train держит mutationLock,
+                    // и setArchitecture заблокировал бы главный поток. Гонки нет:
+                    // и проверка training.get(), и запуск train через
+                    // compareAndSet происходят на главном потоке Bukkit.
+                    var architectureNote: String? = null
+                    if (training.get()) {
+                        architectureNote = "§eОбучение идёт — hidden-layers не изменены, повторите /daynac reload после его завершения."
+                    } else if (neuralNetwork.setArchitecture(newLayers)) {
+                        detectionEngine.disableDetection()
+                        if (neuralNetwork.isCompatibleWith(modelFile)) {
+                            try {
+                                neuralNetwork.loadFrom(modelFile)
+                                detectionEngine.enableDetection()
+                                logger.info("[DaynAC] ${sender.name} сменил архитектуру на ${newLayers.toList()} — модель из model.dat загружена.")
+                                architectureNote = "§aСкрытые слои изменены на ${newLayers.toList()}, модель из model.dat загружена — детекция активна."
+                            } catch (e: Exception) {
+                                logger.warning("Смена архитектуры: model.dat не загрузился: ${e.message} — детекция отключена.")
+                                architectureNote = "§eСкрытые слои изменены на ${newLayers.toList()}, но model.dat не загрузился (${e.message}) — детекция отключена до /daynac train."
+                            }
+                        } else {
+                            // model.dat оставляем на месте: если архитектуру
+                            // вернуть назад, модель снова заработает без переобучения.
+                            logger.info("[DaynAC] ${sender.name} сменил архитектуру на ${newLayers.toList()} — модель несовместима, детекция отключена.")
+                            architectureNote = "§eСкрытые слои изменены на ${newLayers.toList()}: текущая модель обучена для другой архитектуры — детекция отключена до /daynac train (model.dat сохранён)."
+                        }
+                    }
+
+                    // 3. Пороги применяем из перезагруженного plugin.config.
+                    // Валидация уже прошла на fileConfig (то же содержимое), так
+                    // что здесь ошибка возможна только в теории — но если всё же
+                    // случится, честно сообщаем вместо зелёной строки.
+                    var thresholdsError: String? = null
                     try {
                         detectionEngine.reload()
-                        sender.sendMessage(
-                            "§a[DaynAC] config.yml перезагружен (hit-logging: $hitLogging).\n" +
-                                    "§aПороги применены: flag ${detectionEngine.flagThreshold} / reduce ${detectionEngine.reduceThreshold}" +
-                                    " / cancel ${detectionEngine.cancelThreshold} / punish ${detectionEngine.punishThreshold}" +
-                                    " / окно усреднения ${detectionEngine.maxRecentPredictions}" +
-                                    " / кулдаун алертов ${detectionEngine.alertCooldownSeconds} с"
-                        )
                         logger.info("[DaynAC] ${sender.name} перезагрузил config.yml — пороги детекции применены.")
                     } catch (e: Exception) {
-                        // Снапшот Settings применяется одной @Volatile-ссылкой только
-                        // после успешной валидации — рабочие пороги не пострадали.
-                        sender.sendMessage("§c[DaynAC] Ошибка в секции detection — применены прежние пороги: ${e.message}")
+                        thresholdsError = "§cПороги из config.yml не применены (${e.message}) — работают прежние."
                         logger.warning("[DaynAC] Перезагрузка config.yml отклонена: ${e.message}")
                     }
+
+                    sender.sendMessage(
+                        "§a[DaynAC] config.yml перезагружен (hit-logging: $hitLogging).\n" +
+                                (if (thresholdsError == null)
+                                    "§aПороги применены: flag ${detectionEngine.flagThreshold} / reduce ${detectionEngine.reduceThreshold}" +
+                                            " / cancel ${detectionEngine.cancelThreshold} / punish ${detectionEngine.punishThreshold}" +
+                                            " / окно усреднения ${detectionEngine.maxRecentPredictions}" +
+                                            " / кулдаун алертов ${detectionEngine.alertCooldownSeconds} с"
+                                else thresholdsError) +
+                                (architectureNote?.let { "\n$it" } ?: "")
+                    )
                 }
                 args.isNotEmpty() && args[0] == "record" -> {
                     if (args.size < 3) {

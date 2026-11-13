@@ -33,7 +33,43 @@ class NeuralNetwork(
     private val seed: Long = 42L
 ) {
 
-    val layerSizes: IntArray = intArrayOf(inputSize, *hiddenSizes, 1)
+    /**
+     * Размеры всех слоёв, включая вход и выход. Может меняться на лету через
+     * [setArchitecture] — тогда состояние сети сбрасывается, а model.dat с другой
+     * архитектурой считается несовместимым (см. isCompatibleWith).
+     */
+    @Volatile
+    private var layerSizes: IntArray = intArrayOf(inputSize, *hiddenSizes, 1)
+
+    /** Скрытые слои без входа и выхода — для /daynac info и сообщений reload. */
+    val hiddenLayerSizes: IntArray
+        get() = layerSizes.copyOfRange(1, layerSizes.size - 1)
+
+    /**
+     * Перестраивает сеть под новые скрытые слои. Возвращает false, если архитектура
+     * уже такая (ничего не изменилось); true — если перестроена.
+     *
+     * Перестройка сбрасывает веса в ноль и очищает lastTestSet/lastTrainResult:
+     * после смены архитектуры старая модель в любом случае несовместима, и сеть
+     * нужно обучать заново или загружать совместимую model.dat. Под mutationLock —
+     * сериализуется с train/loadFrom, и вызывающий код после true обязан
+     * перезагрузить или обучить модель до включения детекции.
+     */
+    fun setArchitecture(newHiddenSizes: IntArray): Boolean {
+        require(newHiddenSizes.isNotEmpty()) { "Нужен хотя бы один скрытый слой" }
+        require(newHiddenSizes.all { it >= 1 }) { "Размер скрытого слоя должен быть ≥ 1, получено ${newHiddenSizes.contentToString()}" }
+        mutationLock.withLock {
+            val newSizes = intArrayOf(inputSize, *newHiddenSizes, 1)
+            if (newSizes.contentEquals(layerSizes)) return false
+            layerSizes = newSizes
+            // Свежая архитектура → нулевые веса; predict даст мусор, поэтому
+            // детекцию отключает вызывающий код.
+            snapshot.set(emptyWeights())
+            lastTestSet = null
+            lastTrainResult = null
+            return true
+        }
+    }
 
     /**
      * Состояние сети. Объект, опубликованный через [snapshot], менять нельзя (copy-on-write):
@@ -111,17 +147,34 @@ class NeuralNetwork(
     private val snapshot = AtomicReference(emptyWeights())
 
     /**
-     * Рабочие буферы [predict]: нормализованный вход и активации слоёв. Размеры зависят
-     * только от архитектуры (она неизменна), а не от весов, поэтому буферы переживают
-     * смену [snapshot]. Свои на каждый поток: predict вызывается без блокировок из
-     * разных потоков и не реентерабелен, так что общий буфер был бы гонкой данных.
+     * Рабочие буферы [predict]: нормализованный вход и активации слоёв. Размеры
+     * привязаны к конкретному снапшоту весов: при смене архитектуры через
+     * [setArchitecture] буфер пересоздаётся под новый снапшот (см. [scratchFor]).
+     * Свои на каждый поток: predict вызывается без блокировок из разных потоков
+     * и не реентерабелен, так что общий буфер был бы гонкой данных.
      */
-    private class Scratch(inputSize: Int, layerSizes: IntArray) {
+    private class Scratch(state: Weights, inputSize: Int) {
         val input = DoubleArray(inputSize)
-        val layers = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
+        val layers = Array(state.weights.size) { DoubleArray(state.biases[it].size) }
+
+        /** Годен ли буфер для этого снапшота (размеры слоёв совпадают). */
+        fun matches(state: Weights, inputSize: Int): Boolean =
+            input.size == inputSize &&
+                    layers.size == state.weights.size &&
+                    layers.indices.all { layers[it].size == state.biases[it].size }
     }
 
-    private val scratch = ThreadLocal.withInitial { Scratch(inputSize, layerSizes) }
+    private val scratchRef = ThreadLocal.withInitial { arrayOfNulls<Scratch>(1) }
+
+    /** Буфер текущего потока, согласованный с размерами [state]. */
+    private fun scratchFor(state: Weights): Scratch {
+        val holder = scratchRef.get()
+        val existing = holder[0]
+        if (existing != null && existing.matches(state, inputSize)) return existing
+        val fresh = Scratch(state, inputSize)
+        holder[0] = fresh
+        return fresh
+    }
 
     /**
      * Сериализует train и loadFrom: иначе train, стартовавший до loadFrom, затёр бы
@@ -164,7 +217,7 @@ class NeuralNetwork(
             "Ожидался вектор из $inputSize признаков, получен ${rawFeatures.size}"
         }
         val state = snapshot.get()
-        val buf = scratch.get()
+        val buf = scratchFor(state)
         normalizeInto(rawFeatures, state, buf.input)
         return forwardOnly(state, buf.input, buf.layers)
     }
@@ -179,7 +232,7 @@ class NeuralNetwork(
     private fun normalize(features: DoubleArray, state: Weights): DoubleArray =
         DoubleArray(features.size).also { normalizeInto(features, state, it) }
 
-    private fun newLayerBuffers() = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
+    private fun newLayerBuffers(state: Weights) = Array(state.weights.size) { DoubleArray(state.biases[it].size) }
 
     private fun forwardLayer(state: Weights, l: Int, input: DoubleArray, output: DoubleArray, isLast: Boolean) {
         val weights = state.weights[l]
@@ -431,7 +484,7 @@ class NeuralNetwork(
         val testSet = lastTestSet ?: return null
         val state = snapshot.get()
 
-        val buffers = newLayerBuffers()
+        val buffers = newLayerBuffers(state)
         val probabilities = testSet.normalizedFeatures.map { forwardOnly(state, it, buffers) }
 
         val totalLegit = testSet.labels.count { it < 0.5 }
@@ -644,7 +697,7 @@ class NeuralNetwork(
     /** Средний BCE и accuracy (порог 0.5) на уже нормализованных сэмплах. */
     private fun evaluateNormalized(state: Weights, features: List<DoubleArray>, labels: DoubleArray): Evaluation {
         if (features.isEmpty()) return Evaluation(0.0, 0.0)
-        val buffers = newLayerBuffers()
+        val buffers = newLayerBuffers(state)
         var totalLoss = 0.0
         var correct = 0
         for (i in features.indices) {
@@ -679,16 +732,49 @@ class NeuralNetwork(
         }
     }
 
-    /** Проверяет, что модель в файле совместима с текущим [inputSize]. */
+    /**
+     * Проверяет, что модель в файле совместима с текущим [layerSizes].
+     */
     fun isCompatibleWith(file: File): Boolean {
         if (!file.exists()) return false
         return try {
             DataInputStream(file.inputStream().buffered()).use { input ->
-                input.readInt() == MAGIC &&
-                        input.readInt() == FORMAT_VERSION &&
-                        input.readInt() == FeatureExtractor.FEATURE_VERSION &&
-                        input.readInt() == inputSize &&
-                        input.readInt() == layerSizes.size
+                if (input.readInt() != MAGIC) return false
+                if (input.readInt() != FORMAT_VERSION) return false
+                if (input.readInt() != FeatureExtractor.FEATURE_VERSION) return false
+                if (input.readInt() != inputSize) return false
+                val sizes = layerSizes
+                if (input.readInt() != sizes.size) return false
+                // Полное сравнение размеров слоёв, а не только их количества:
+                // [3,4,1] и [3,8,1] дают одинаковый размер массива, но несовместимы.
+                for (size in sizes) {
+                    if (input.readInt() != size) return false
+                }
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Слои в model.dat не совпадают с текущими [layerSizes]? Причины несовместимости
+     * две: смена hidden-layers (файл снова станет совместимым, если вернуть старую
+     * архитектуру — его нельзя переименовывать) и смена версии признаков/формата
+     * (файл совместимым уже не будет никогда — его можно убирать с дороги).
+     * Для файлов с другим входом/версией возвращает false.
+     */
+    fun isArchitectureMismatch(file: File): Boolean {
+        if (!file.exists()) return false
+        return try {
+            DataInputStream(file.inputStream().buffered()).use { input ->
+                input.readInt() // MAGIC
+                input.readInt() // FORMAT_VERSION
+                input.readInt() // FEATURE_VERSION
+                input.readInt() // inputSize
+                val count = input.readInt()
+                val stored = IntArray(count) { input.readInt() }
+                !stored.contentEquals(layerSizes)
             }
         } catch (_: Exception) {
             false
