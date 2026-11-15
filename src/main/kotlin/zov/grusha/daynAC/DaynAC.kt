@@ -572,6 +572,16 @@ class DaynAC : JavaPlugin(), Listener {
                     val mode = args[2].lowercase()
                     when (mode) {
                         "legit", "cheat" -> {
+                            val existing = recordingPlayers[targetPlayer.uniqueId]
+                            if (existing != null) {
+                                // Защита от повторной записи: случайный повтор команды не должен
+                                // перезаписать активную сессию (и тем более сменить её метку).
+                                sender.sendMessage(
+                                    "§c[DaynAC] Для ${targetPlayer.name} уже идёт запись датасета в режиме §f${existing.label}§c." +
+                                            " Сначала остановите её: /daynac record ${targetPlayer.name} off"
+                                )
+                                return true
+                            }
                             val session = RecordingSession(mode, newSessionId())
                             recordingPlayers[targetPlayer.uniqueId] = session
                             sender.sendMessage("Запись датасета для ${targetPlayer.name} включена в режиме: $mode (сессия ${session.sessionId})")
@@ -579,12 +589,15 @@ class DaynAC : JavaPlugin(), Listener {
                         }
                         "off" -> {
                             val finished = recordingPlayers.remove(targetPlayer.uniqueId)
+                            if (finished == null) {
+                                sender.sendMessage("§e[DaynAC] Для ${targetPlayer.name} запись датасета не была активна.")
+                                return true
+                            }
                             sender.sendMessage(
                                 "Запись датасета для ${targetPlayer.name} выключена." +
-                                        (if (finished != null) " Записано векторов за сессию: ${finished.vectors}." else "")
+                                        " Записано векторов за сессию: ${finished.vectors}."
                             )
-                            sendActionBar(targetPlayer, "§7Запись датасета остановлена" +
-                                    (if (finished != null) " §8| §7векторов: §f${finished.vectors}" else ""))
+                            sendActionBar(targetPlayer, "§7Запись датасета остановлена §8| §7векторов: §f${finished.vectors}")
                         }
                         else -> {
                             sender.sendMessage("Использование: /daynac record <ник игрока> <legit|cheat|off>")
