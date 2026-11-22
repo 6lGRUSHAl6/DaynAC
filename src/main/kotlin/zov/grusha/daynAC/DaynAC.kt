@@ -80,7 +80,9 @@ class DaynAC : JavaPlugin(), Listener {
         val learningRate: Double,
         val patience: Int,
         val l2Lambda: Double,
-        val dropoutRate: Double
+        val dropoutRate: Double,
+        /** session | player — читается здесь же, на главном потоке, и уходит в поток обучения. */
+        val splitBy: String
     )
 
     /** Сессия записи датасета: метка класса и идентификатор сессии (от `record <ник> legit|cheat` до `off`). */
@@ -132,6 +134,13 @@ class DaynAC : JavaPlugin(), Listener {
                 resetIfIdle(player.uniqueId)
             }
         }, 20L, 20L)
+
+        // Строки датасета копятся в памяти и пишутся одним append'ом раз в 5 секунд:
+        // раньше appendText на каждый 16-й удар открывал файл прямо в тике сервера.
+        // Запись идёт в async-пуле; остаток сбрасывается в onDisable.
+        Bukkit.getScheduler().runTaskTimerAsynchronously(this, Runnable {
+            datasetManager.flushPendingWrites()
+        }, 100L, 100L)
 
         // Применяем архитектуру из конфига до загрузки модели: если hidden-layers
         // отличается от умолчания, сеть перестроится и совместимость model.dat
@@ -249,13 +258,88 @@ class DaynAC : JavaPlugin(), Listener {
             "training.dropout-rate должно быть в диапазоне 0..0.99 (1.0 отключить не даст), получено $dropoutRate"
         }
 
-        return TrainingSettings(learningRate, patience, l2Lambda, dropoutRate)
+        // Группа разбиения тоже часть настроек: фоновый поток обучения не должен
+        // читать plugin.config параллельно с /daynac reload на главном потоке.
+        val splitBy = (source.getString("training.split-by", "session") ?: "session").lowercase()
+        require(splitBy == "session" || splitBy == "player") {
+            "training.split-by должно быть session или player, получено \"$splitBy\""
+        }
+
+        return TrainingSettings(learningRate, patience, l2Lambda, dropoutRate, splitBy)
     }
 
     override fun onDisable() {
         logger.info("Disabling plugin...")
         detectionEngine.shutdown()
+        allInfoGUI.shutdown()
+        datasetManager.flushPendingWrites()
     }
+
+    /** Выполняет действие на главном потоке; после onDisable задачи молча отбрасываются. */
+    private fun postToMain(action: () -> Unit) {
+        if (!isEnabled) return
+        try {
+            Bukkit.getScheduler().runTask(this, Runnable(action))
+        } catch (_: IllegalPluginAccessException) {
+            // плагин выключился между проверкой isEnabled и отправкой
+        }
+    }
+
+    /**
+     * Выполняет тяжёлую работу (диск, вычисления) в async-пуле Bukkit и возвращает
+     * результат на главный поток, где только и можно безопасно трогать CommandSender
+     * и Bukkit API. Если плагин выключился, пока задача висела в очереди, работа
+     * просто отбрасывается — sendMessage после onDisable привёл бы к исключению.
+     */
+    private fun <T> offMainThenMain(
+        work: () -> T,
+        onError: (Exception) -> Unit,
+        reply: (T) -> Unit
+    ) {
+        try {
+            Bukkit.getScheduler().runTaskAsynchronously(this, Runnable {
+                val result = try {
+                    work()
+                } catch (e: Exception) {
+                    postToMain { onError(e) }
+                    return@Runnable
+                }
+                postToMain { reply(result) }
+            })
+        } catch (_: IllegalPluginAccessException) {
+            postToMain { onError(IllegalStateException("Плагин уже выключен")) }
+        }
+    }
+
+    private fun withPlayerName(targetId: UUID, fallback: String, respond: (String) -> Unit) {
+        Bukkit.getPlayer(targetId)?.name?.let { respond(it); return }
+        nameCache[targetId]?.let { respond(it); return }
+        // GUI-кэш здесь не читаем: там для неразрешённых игроков лежит короткий
+        // префикс UUID как заглушка, а команде нужно полное имя.
+        if (!isEnabled) { respond(fallback); return }
+        try {
+            Bukkit.getScheduler().runTaskAsynchronously(this, Runnable {
+                val name = try {
+                    Bukkit.getOfflinePlayer(targetId).name
+                } catch (_: Exception) {
+                    null
+                }
+                val found = name?.takeIf { it.isNotBlank() }
+                val resolved = found ?: fallback
+                if (found != null) {
+                    if (nameCache.size >= 10_000) nameCache.clear()
+                    nameCache[targetId] = found
+                    allInfoGUI.rememberName(targetId, found)
+                }
+                postToMain { respond(resolved) }
+            })
+        } catch (_: IllegalPluginAccessException) {
+            respond(fallback)
+        }
+    }
+
+    /** Имена, найденные командами асинхронно; обращение к ним не блокирует главный поток. */
+    private val nameCache = java.util.concurrent.ConcurrentHashMap<UUID, String>()
 
     override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<out String>): Boolean {
         if (command.name.equals("daynac", ignoreCase = true)) {
@@ -321,7 +405,7 @@ class DaynAC : JavaPlugin(), Listener {
                     }
                     sender.sendMessage(
                         "§a[DaynAC] Обучение запущено... §7(lr ${settings.learningRate}, l2 ${settings.l2Lambda}, " +
-                                "dropout ${settings.dropoutRate}, patience ${settings.patience})"
+                                "dropout ${settings.dropoutRate}, patience ${settings.patience}, split ${settings.splitBy})"
                     )
 
                     thread(name = "DaynAC-Training", isDaemon = true) {
@@ -345,14 +429,12 @@ class DaynAC : JavaPlugin(), Listener {
                         // сработает при любом исключении: IO, OOM, валидация, обучение.
                         try {
                             report("§7Загрузка датасета...")
-                            val dataset = datasetManager.readVectorSamples()
-                            val features = dataset.samples.map { it.features }
-                            val labels = dataset.samples.map { it.label }
+                            val dataset = datasetManager.readCompactDataset()
                             val legitCount = dataset.legitCount
                             val cheatCount = dataset.cheatCount
 
                             // Валидация внутри потока
-                            if (features.size < 10) {
+                            if (dataset.sampleCount < 10) {
                                 report("§c[DaynAC] Недостаточно данных: $legitCount легит / $cheatCount чит векторов (нужно ≥ 10). Соберите через /daynac record.")
                                 return@thread
                             }
@@ -365,11 +447,10 @@ class DaynAC : JavaPlugin(), Listener {
                                 return@thread
                             }
 
-                            // По какой группе делить выборку, чтобы окна одной сессии/игрока не попали
-                            // сразу в train и test (training.split-by: session | player).
-                            val splitBy = config.getString("training.split-by", "session")?.lowercase()
-                                ?.takeIf { it == "session" || it == "player" } ?: "session"
-                            val groups: List<String?> = dataset.samples.map { if (splitBy == "player") it.playerHash else it.sessionId }
+                            // splitBy прочитан и проверен на главном потоке до старта потока —
+                            // config здесь не трогаем: /daynac reload может идти параллельно.
+                            val splitBy = settings.splitBy
+                            val groups = dataset.groupsBy(splitBy)
 
                             // --- Визуализация обучения ---
                             val senderPlayer = sender as? Player
@@ -394,8 +475,7 @@ class DaynAC : JavaPlugin(), Listener {
                             try {
                                 val startTime = System.currentTimeMillis()
                                 val result = neuralNetwork.train(
-                                    samples = features,
-                                    labels = labels,
+                                    dataset = dataset,
                                     groups = groups,
                                     learningRate = settings.learningRate,
                                     maxEpochs = maxEpochs,
@@ -498,48 +578,70 @@ class DaynAC : JavaPlugin(), Listener {
                     sender.sendMessage("[DaynAC] Логгирование ударов: ${if (hitLogging) "§aвключено" else "§cвыключено"}")
                 }
                 args.isNotEmpty() && args[0] == "info" -> {
-                    val (legitCount, cheatCount) = datasetManager.getVectorDatasetStats()
-                    val (legitSessions, cheatSessions) = datasetManager.getSessionStats()
+                    // Чтение CSV (4 полных прохода) раньше шло прямо в тике — на большом
+                    // датасете это многосекундная пауза и watchdog-kick. Сводка теперь за
+                    // один проход в фоне; ответ отправляется на главном потоке.
                     val trainInfo = neuralNetwork.lastTrainResult
-                    sender.sendMessage(
-                        buildString {
-                            appendLine("[DaynAC] Датасет: $legitCount легит / $cheatCount чит векторов")
-                            appendLine("[DaynAC] Сессий записи: $legitSessions легит / $cheatSessions чит " +
-                                    "(для разбиения по сессиям нужно ≥ ${NeuralNetwork.MIN_GROUPS_PER_CLASS} на класс)")
-                            appendLine("[DaynAC] Модель: " + (if (detectionEngine.detectionEnabled) "активна" else "не обучена") +
-                                    ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)" +
-                                    ", скрытые слои: ${neuralNetwork.hiddenLayerSizes.toList()}")
-                            appendLine("[DaynAC] Временных исключений: ${exemptionManager.size()}")
-                            if (trainInfo != null) {
-                                fun num(v: Double) = String.format(Locale.US, "%.4f", v)
-                                fun pct(v: Double) = String.format(Locale.US, "%.1f%%", v * 100)
-                                appendLine("[DaynAC] Обучение: эпох ${trainInfo.epochsRun}" +
-                                        " (лучшая: ${trainInfo.bestEpoch}" +
-                                        if (trainInfo.earlyStopped) ", early stop)" else ")")
-                                appendLine("[DaynAC] Train loss/acc: ${num(trainInfo.trainLoss)} / ${pct(trainInfo.trainAccuracy)}")
-                                appendLine("[DaynAC] Val loss/acc:   ${num(trainInfo.valLoss)} / ${pct(trainInfo.valAccuracy)}")
-                                trainInfo.testLoss?.let { tl ->
-                                    appendLine("[DaynAC] Test loss/acc:  ${num(tl)} / ${pct(trainInfo.testAccuracy ?: 0.0)}")
-                                }
-                                appendLine("[DaynAC] Разрыв train/val (переобучение): ${pct(trainInfo.overfitGap)}" +
-                                        if (trainInfo.overfitGap > 0.05) " §c— выше нормы, соберите больше данных" else "")
-                            } else {
-                                appendLine("[DaynAC] Метрики обучения неизвестны (модель из старого формата файла)")
-                            }
-                            append("[DaynAC] Пороги: flag ${detectionEngine.flagThreshold} / reduce ${detectionEngine.reduceThreshold}" +
-                                    " / cancel ${detectionEngine.cancelThreshold} / punish ${detectionEngine.punishThreshold}" +
-                                    " / окно усреднения ${detectionEngine.maxRecentPredictions}" +
-                                    " / кулдаун алертов ${detectionEngine.alertCooldownSeconds} с")
-                            appendLine()
-                            append("[DaynAC] Наказание: " + when {
-                                !detectionEngine.punishEnabled -> "§eВЫКЛЮЧЕНО (режим наблюдения)"
-                                detectionEngine.punishAction == "none" -> "§7ничего (только лог)"
-                                else -> "§c${detectionEngine.punishAction}" +
-                                        (if (detectionEngine.punishAction == "ban" && detectionEngine.banWithIp) " + IP" else "") +
-                                        " §7(подтверждение: ${detectionEngine.punishConfirmWindows} независимых окон подряд)"
-                            })
+                    val detectionEnabled = detectionEngine.detectionEnabled
+                    val hiddenLayers = neuralNetwork.hiddenLayerSizes.toList()
+                    val exemptions = exemptionManager.size()
+                    val flag = detectionEngine.flagThreshold
+                    val reduce = detectionEngine.reduceThreshold
+                    val cancel = detectionEngine.cancelThreshold
+                    val punish = detectionEngine.punishThreshold
+                    val avgWindow = detectionEngine.maxRecentPredictions
+                    val alertCooldown = detectionEngine.alertCooldownSeconds
+                    val punishEnabled = detectionEngine.punishEnabled
+                    val punishAction = detectionEngine.punishAction
+                    val banWithIp = detectionEngine.banWithIp
+                    val confirmWindows = detectionEngine.punishConfirmWindows
+                    offMainThenMain(
+                        work = { datasetManager.getDatasetSummary() },
+                        onError = { e ->
+                            sender.sendMessage("§c[DaynAC] Не удалось прочитать статистику датасета: ${e.message}")
+                            logger.warning("[DaynAC] info: ${e.message}")
                         }
-                    )
+                    ) { s ->
+                        sender.sendMessage(
+                            buildString {
+                                appendLine("[DaynAC] Датасет: ${s.legitVectors} легит / ${s.cheatVectors} чит векторов")
+                                appendLine("[DaynAC] Сессий записи: ${s.legitSessions} легит / ${s.cheatSessions} чит " +
+                                        "(для разбиения по сессиям нужно ≥ ${NeuralNetwork.MIN_GROUPS_PER_CLASS} на класс)")
+                                appendLine("[DaynAC] Модель: " + (if (detectionEnabled) "активна" else "не обучена") +
+                                        ", вход: $inputSize признаков (окно $WINDOW_SIZE ударов)" +
+                                        ", скрытые слои: $hiddenLayers")
+                                appendLine("[DaynAC] Временных исключений: $exemptions")
+                                if (trainInfo != null) {
+                                    fun num(v: Double) = String.format(Locale.US, "%.4f", v)
+                                    fun pct(v: Double) = String.format(Locale.US, "%.1f%%", v * 100)
+                                    appendLine("[DaynAC] Обучение: эпох ${trainInfo.epochsRun}" +
+                                            " (лучшая: ${trainInfo.bestEpoch}" +
+                                            if (trainInfo.earlyStopped) ", early stop)" else ")")
+                                    appendLine("[DaynAC] Train loss/acc: ${num(trainInfo.trainLoss)} / ${pct(trainInfo.trainAccuracy)}")
+                                    appendLine("[DaynAC] Val loss/acc:   ${num(trainInfo.valLoss)} / ${pct(trainInfo.valAccuracy)}")
+                                    trainInfo.testLoss?.let { tl ->
+                                        appendLine("[DaynAC] Test loss/acc:  ${num(tl)} / ${pct(trainInfo.testAccuracy ?: 0.0)}")
+                                    }
+                                    appendLine("[DaynAC] Разрыв train/val (переобучение): ${pct(trainInfo.overfitGap)}" +
+                                            if (trainInfo.overfitGap > 0.05) " §c— выше нормы, соберите больше данных" else "")
+                                } else {
+                                    appendLine("[DaynAC] Метрики обучения неизвестны (модель из старого формата файла)")
+                                }
+                                append("[DaynAC] Пороги: flag $flag / reduce $reduce" +
+                                        " / cancel $cancel / punish $punish" +
+                                        " / окно усреднения $avgWindow" +
+                                        " / кулдаун алертов $alertCooldown с")
+                                appendLine()
+                                append("[DaynAC] Наказание: " + when {
+                                    !punishEnabled -> "§eВЫКЛЮЧЕНО (режим наблюдения)"
+                                    punishAction == "none" -> "§7ничего (только лог)"
+                                    else -> "§c$punishAction" +
+                                            (if (punishAction == "ban" && banWithIp) " + IP" else "") +
+                                            " §7(подтверждение: $confirmWindows независимых окон подряд)"
+                                })
+                            }
+                        )
+                    }
                 }
                 args.isNotEmpty() && args[0] == "reload" -> {
                     // reloadConfig() при синтаксической ошибке в YAML не бросает
@@ -628,7 +730,7 @@ class DaynAC : JavaPlugin(), Listener {
                                 else thresholdsError) +
                                 "\n§7Параметры обучения (для следующего /daynac train): lr ${newTraining.learningRate}" +
                                 " / l2 ${newTraining.l2Lambda} / dropout ${newTraining.dropoutRate}" +
-                                " / patience ${newTraining.patience}" +
+                                " / patience ${newTraining.patience} / split ${newTraining.splitBy}" +
                                 (architectureNote?.let { "\n$it" } ?: "")
                     )
                 }
@@ -688,64 +790,72 @@ class DaynAC : JavaPlugin(), Listener {
                     }
 
                     val thresholds = doubleArrayOf(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
-                    val metrics = neuralNetwork.evaluateThresholds(thresholds)
-                    if (metrics == null) {
-                        sender.sendMessage("§c[DaynAC] Test-сет недоступен: model.dat сохранён старой версией плагина (без test-сета). Один раз запустите /daynac train — дальше сводка будет работать и после рестарта.")
-                        return true
-                    }
+                    val reduce = detectionEngine.reduceThreshold
+                    val split = neuralNetwork.lastTrainResult?.split
+                    offMainThenMain(
+                        work = { neuralNetwork.evaluateThresholds(thresholds) },
+                        onError = { e ->
+                            sender.sendMessage("§c[DaynAC] Ошибка оценки модели: ${e.message}")
+                            logger.warning("[DaynAC] eval: ${e.message}")
+                        }
+                    ) { result ->
+                        val metrics = result
+                        if (metrics == null) {
+                            sender.sendMessage("§c[DaynAC] Test-сет недоступен: model.dat сохранён старой версией плагина (без test-сета). Один раз запустите /daynac train — дальше сводка будет работать и после рестарта.")
+                            return@offMainThenMain
+                        }
 
-                    val first = metrics.first()
-                    sender.sendMessage("§7[DaynAC] Оценка модели на test-сете (§f${first.totalLegit} §7legit / §f${first.totalCheat} §7cheat§7, в обучении не участвовал)")
-                    neuralNetwork.lastTrainResult?.split?.let { sp ->
-                        if (!sp.fullyGrouped) {
+                        val first = metrics.first()
+                        sender.sendMessage("§7[DaynAC] Оценка модели на test-сете (§f${first.totalLegit} §7legit / §f${first.totalCheat} §7cheat§7, в обучении не участвовал)")
+                        if (split != null && !split.fullyGrouped) {
                             sender.sendMessage("§e⚠ Test-сет получен случайным разбиением окон (мало сессий/игроков) — метрики оптимистичны.")
                         }
-                    }
-                    sender.sendMessage("§7Порог  Precision  Recall   F1     FPR  [95% ДИ]")
+                        sender.sendMessage("§7Порог  Precision  Recall   F1     FPR  [95% ДИ]")
 
-                    metrics.forEach { m ->
-                        val marker = if (kotlin.math.abs(m.threshold - detectionEngine.reduceThreshold) < 0.001) " §e←reduce" else ""
-                        val (fprLow, fprHigh) = m.falsePositiveRateInterval
-                        sender.sendMessage(String.format(
-                            Locale.US,
-                            "§f%.2f   %.3f      %.3f    %.3f  §c%.1f%% §7[%.1f–%.1f%%]%s",
-                            m.threshold, m.precision, m.recall, m.f1,
-                            m.falsePositiveRate * 100, fprLow * 100, fprHigh * 100, marker
-                        ))
-                    }
-
-                    // Рекомендуем порог, только если FPR ≤ 1% подтверждён статистически —
-                    // верхняя граница 95% ДИ, а не точечная оценка. Иначе на малом test-сете
-                    // «0 ошибок из 50» выглядело бы как доказанный FPR 0%.
-                    val targetFpr = 0.01
-                    val recommended = metrics
-                        .filter { it.falsePositiveRateInterval.second <= targetFpr }
-                        .maxByOrNull { it.recall }
-                    if (recommended != null) {
-                        val (recallLow, recallHigh) = recommended.recallInterval
-                        sender.sendMessage(String.format(
-                            Locale.US,
-                            "§aРекомендация:§f reduce-threshold = %.2f — FPR %.1f%% (95%% ДИ до %.1f%%), recall %.1f%% [%.1f–%.1f%%]",
-                            recommended.threshold,
-                            recommended.falsePositiveRate * 100, recommended.falsePositiveRateInterval.second * 100,
-                            recommended.recall * 100, recallLow * 100, recallHigh * 100
-                        ))
-                    } else {
-                        val neededLegit = zov.grusha.daynAC.ml.Stats.minSamplesForZeroErrors(targetFpr)
-                        sender.sendMessage(
-                            "§eНи один порог не подтверждает FPR ≤ 1% с 95% уверенностью. " +
-                                    "Legit-окон в test: §f${first.totalLegit}§e; даже при нуле ложных срабатываний нужно ≥ §f${neededLegit}§e."
-                        )
-                        val zeroErrors = metrics.filter { it.falsePositives == 0 }.maxByOrNull { it.recall }
-                        if (zeroErrors != null) {
+                        metrics.forEach { m ->
+                            val marker = if (kotlin.math.abs(m.threshold - reduce) < 0.001) " §e←reduce" else ""
+                            val (fprLow, fprHigh) = m.falsePositiveRateInterval
                             sender.sendMessage(String.format(
                                 Locale.US,
-                                "§7Без ложных срабатываний: порог %.2f (recall %.1f%%), но реальный FPR может быть до %.1f%% — " +
-                                        "не подтверждено, для автобана нужны новые данные.",
-                                zeroErrors.threshold, zeroErrors.recall * 100, zeroErrors.falsePositiveRateInterval.second * 100
+                                "§f%.2f   %.3f      %.3f    %.3f  §c%.1f%% §7[%.1f–%.1f%%]%s",
+                                m.threshold, m.precision, m.recall, m.f1,
+                                m.falsePositiveRate * 100, fprLow * 100, fprHigh * 100, marker
+                            ))
+                        }
+
+                        // Рекомендуем порог, только если FPR ≤ 1% подтверждён статистически —
+                        // верхняя граница 95% ДИ, а не точечная оценка. Иначе на малом test-сете
+                        // «0 ошибок из 50» выглядело бы как доказанный FPR 0%.
+                        val targetFpr = 0.01
+                        val recommended = metrics
+                            .filter { it.falsePositiveRateInterval.second <= targetFpr }
+                            .maxByOrNull { it.recall }
+                        if (recommended != null) {
+                            val (recallLow, recallHigh) = recommended.recallInterval
+                            sender.sendMessage(String.format(
+                                Locale.US,
+                                "§aРекомендация:§f reduce-threshold = %.2f — FPR %.1f%% (95%% ДИ до %.1f%%), recall %.1f%% [%.1f–%.1f%%]",
+                                recommended.threshold,
+                                recommended.falsePositiveRate * 100, recommended.falsePositiveRateInterval.second * 100,
+                                recommended.recall * 100, recallLow * 100, recallHigh * 100
                             ))
                         } else {
-                            sender.sendMessage("§eНа каждом пороге есть ложные срабатывания — модель пока плохо различает классы: нужно больше разнообразных данных или пересмотр признаков.")
+                            val neededLegit = zov.grusha.daynAC.ml.Stats.minSamplesForZeroErrors(targetFpr)
+                            sender.sendMessage(
+                                "§eНи один порог не подтверждает FPR ≤ 1% с 95% уверенностью. " +
+                                        "Legit-окон в test: §f${first.totalLegit}§e; даже при нуле ложных срабатываний нужно ≥ §f${neededLegit}§e."
+                            )
+                            val zeroErrors = metrics.filter { it.falsePositives == 0 }.maxByOrNull { it.recall }
+                            if (zeroErrors != null) {
+                                sender.sendMessage(String.format(
+                                    Locale.US,
+                                    "§7Без ложных срабатываний: порог %.2f (recall %.1f%%), но реальный FPR может быть до %.1f%% — " +
+                                            "не подтверждено, для автобана нужны новые данные.",
+                                    zeroErrors.threshold, zeroErrors.recall * 100, zeroErrors.falsePositiveRateInterval.second * 100
+                                ))
+                            } else {
+                                sender.sendMessage("§eНа каждом пороге есть ложные срабатывания — модель пока плохо различает классы: нужно больше разнообразных данных или пересмотр признаков.")
+                            }
                         }
                     }
                 }
@@ -760,16 +870,15 @@ class DaynAC : JavaPlugin(), Listener {
                         sender.sendMessage("§cИгрок §f${args[1]}§c не найден (никогда не заходил на сервер).")
                         return true
                     }
-                    val targetName = Bukkit.getPlayer(targetId)?.name
-                        ?: Bukkit.getOfflinePlayer(targetId).name
-                        ?: args[1]
-
+                    val senderName = sender.name
                     detectionEngine.resetFlags(targetId, keepCarryOver = false)
                     hitTracker.removePlayer(targetId)
                     snapshotTracker.resetHitTiming(targetId)
 
-                    sender.sendMessage("§a[DaynAC] Флаги и окно игрока §f$targetName§a сброшены.")
-                    logger.info("[DaynAC] ${sender.name} сбросил флаги игрока $targetName")
+                    withPlayerName(targetId, args[1]) { targetName ->
+                        sender.sendMessage("§a[DaynAC] Флаги и окно игрока §f$targetName§a сброшены.")
+                        logger.info("[DaynAC] $senderName сбросил флаги игрока $targetName")
+                    }
                 }
                 args.isNotEmpty() && args[0] == "exempt" -> {
                     if (args.size < 2) {
@@ -782,25 +891,28 @@ class DaynAC : JavaPlugin(), Listener {
                         sender.sendMessage("§cИгрок §f${args[1]}§c не найден (никогда не заходил на сервер).")
                         return true
                     }
-                    val targetName = Bukkit.getPlayer(targetId)?.name
-                        ?: Bukkit.getOfflinePlayer(targetId).name
-                        ?: args[1]
+                    val senderName = sender.name
 
                     // /daynac exempt <ник>  — бессрочное исключение
                     if (args.size == 2) {
                         exemptionManager.exempt(targetId, 0L)
-                        sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a добавлен в исключения §fбессрочно§a.")
-                        logger.info("[DaynAC] ${sender.name} выдал бессрочное исключение игроку $targetName")
+                        withPlayerName(targetId, args[1]) { targetName ->
+                            sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a добавлен в исключения §fбессрочно§a.")
+                            logger.info("[DaynAC] $senderName выдал бессрочное исключение игроку $targetName")
+                        }
                         return true
                     }
 
                     val arg = args[2].lowercase()
                     if (arg == "off" || arg == "remove") {
-                        if (exemptionManager.unexempt(targetId)) {
-                            sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a удалён из исключений.")
-                            logger.info("[DaynAC] ${sender.name} снял исключение с игрока $targetName")
-                        } else {
-                            sender.sendMessage("§e[DaynAC] Игрок §f$targetName§e не в списке исключений.")
+                        val removed = exemptionManager.unexempt(targetId)
+                        withPlayerName(targetId, args[1]) { targetName ->
+                            if (removed) {
+                                sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a удалён из исключений.")
+                                logger.info("[DaynAC] $senderName снял исключение с игрока $targetName")
+                            } else {
+                                sender.sendMessage("§e[DaynAC] Игрок §f$targetName§e не в списке исключений.")
+                            }
                         }
                         return true
                     }
@@ -814,8 +926,10 @@ class DaynAC : JavaPlugin(), Listener {
                     val until = Instant.ofEpochMilli(expiry)
                         .atZone(ZoneId.systemDefault())
                         .format(EXEMPT_DATE_FORMAT)
-                    sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a в исключениях до §f$until§a.")
-                    logger.info("[DaynAC] ${sender.name} выдал исключение игроку $targetName до $until")
+                    withPlayerName(targetId, args[1]) { targetName ->
+                        sender.sendMessage("§a[DaynAC] Игрок §f$targetName§a в исключениях до §f$until§a.")
+                        logger.info("[DaynAC] $senderName выдал исключение игроку $targetName до $until")
+                    }
                 }
                 else -> {
                     sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|reset|eval|clearflags|exempt|reload>")
@@ -907,7 +1021,7 @@ class DaynAC : JavaPlugin(), Listener {
             // кратности суммарного счётчика.
             if (session.hits % WINDOW_SIZE == 0) {
                 featureExtractor.extract(hitTracker.getHistory(attacker))?.let { vector ->
-                    datasetManager.writeVectorSample(
+                    datasetManager.enqueueVectorSample(
                         label, vector, session.sessionId, datasetManager.playerHash(attacker.uniqueId)
                     )
                     session.vectors++

@@ -6,6 +6,7 @@ import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 
 class DatasetManager(
     private val dataFolder: File,
@@ -18,6 +19,9 @@ class DatasetManager(
      * [sessionId] и [playerHash] нужны только для честного разбиения на train/val/test
      * (окна одного игрока или одной сессии очень похожи друг на друга) и НЕ входят
      * в признаки модели. null — строка из старого формата без метаданных.
+     *
+     * Класс оставлен для совместимости (тесты, ручный разбор CSV). Путь обучения
+     * использует [TrainingDataset] — плоский массив без отдельного объекта на сэмпл.
      */
     class VectorSample(
         val features: DoubleArray,
@@ -33,12 +37,26 @@ class DatasetManager(
         val cheatCount: Int
     )
 
+    /** Сводка для /daynac info: считается за один проход по обоим CSV. */
+    class DatasetSummary(
+        val legitVectors: Int,
+        val cheatVectors: Int,
+        val legitSessions: Int,
+        val cheatSessions: Int
+    )
+
+    /** Метаданные одной строки CSV: группы для разбиения. */
+    private data class Meta(val sessionId: String?, val playerHash: String?)
+
     private companion object {
         /** Колонки метаданных в конце строки векторного CSV (после признаков). */
         val META_COLUMNS = listOf("session_id", "player_hash")
 
         /** Версия признаков у датасетов, созданных до появления dataset.featver. */
         const val LEGACY_FEATURE_VERSION = 1
+
+        /** Сколько подробных предупреждений о битых строках выводить за файл. */
+        const val MAX_DETAILED_WARNINGS = 5
     }
 
     private val legitVectorFile = File(dataFolder, "legit_vectors.csv")
@@ -47,6 +65,16 @@ class DatasetManager(
 
     /** Версия определения признаков, на которой записан датасет (см. [FeatureExtractor.FEATURE_VERSION]). */
     private val featureVersionFile = File(dataFolder, "dataset.featver")
+
+    /** Строки, ожидающие записи. Publication через ConcurrentLinkedQueue даёт happens-before. */
+    private data class PendingWrite(
+        val file: File,
+        val vector: FeatureExtractor.FeatureVector,
+        val sessionId: String,
+        val playerHash: String
+    )
+
+    private val pendingWrites = ConcurrentLinkedQueue<PendingWrite>()
 
     /** Число числовых признаков в одной строке вектора (без метаданных). */
     private val featureCount = windowSize * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
@@ -167,130 +195,142 @@ class DatasetManager(
         )
     }
 
-    /** Результат парсинга отдельной строки CSV. */
-    private sealed class ParseResult {
-        object Ignored : ParseResult() // Заголовок или пустая строка
-        class Success(val vector: DoubleArray, val sessionId: String?, val playerHash: String?) : ParseResult()
-        class Error(val reason: String) : ParseResult()
-    }
+    /** Есть ли в строке ровно featureCount (или featureCount + 2) колонок. */
+    private fun columnCount(line: String): Int = line.trim().split(',').size
+
+    private fun hasMetaColumns(columns: Int): Boolean = columns == featureCount + META_COLUMNS.size
+
+    /** Быстрая проверка формата строки без парсинга чисел (для подсчёта и сводки). */
+    private fun isValidColumns(columns: Int): Boolean =
+        columns == featureCount || hasMetaColumns(columns)
 
     /**
-     * Единая функция парсинга строки векторного датасета. Принимает оба формата:
-     * только признаки (старый) или признаки + session_id + player_hash (новый).
+     * Парсит строку прямо в плоский массив: ни одного `DoubleArray` на сэмпл.
+     * @return метаданные строки; некорректная строка выбрасывает [IllegalArgumentException]
      */
-    private fun parseVectorLine(line: String): ParseResult {
+    private fun parseInto(line: String, out: DoubleArray, offset: Int): Meta {
         val trimmed = line.trim()
-        if (trimmed.isEmpty() || trimmed.startsWith("h0")) return ParseResult.Ignored
-
         val parts = trimmed.split(',')
-        val hasMeta = parts.size == featureCount + META_COLUMNS.size
-        if (parts.size != featureCount && !hasMeta) {
-            return ParseResult.Error(
+        val hasMeta = hasMetaColumns(parts.size)
+        if (!isValidColumns(parts.size)) {
+            throw IllegalArgumentException(
                 "ожидалось $featureCount (или ${featureCount + META_COLUMNS.size} с метаданными) элементов, получено ${parts.size}"
             )
         }
-
-        val vector = DoubleArray(featureCount)
         for (i in 0 until featureCount) {
             val v = parts[i].trim().toDoubleOrNull()
-                ?: return ParseResult.Error("нечисловое значение '${parts[i]}' на позиции $i")
-            vector[i] = v
+                ?: throw IllegalArgumentException("нечисловое значение '${parts[i]}' на позиции $i")
+            out[offset + i] = v
         }
-
-        val sessionId = if (hasMeta) parts[featureCount].trim().ifEmpty { null } else null
-        val playerHash = if (hasMeta) parts[featureCount + 1].trim().ifEmpty { null } else null
-        return ParseResult.Success(vector, sessionId, playerHash)
+        return Meta(
+            sessionId = if (hasMeta) parts[featureCount].trim().ifEmpty { null } else null,
+            playerHash = if (hasMeta) parts[featureCount + 1].trim().ifEmpty { null } else null
+        )
     }
 
     /**
-     * Лёгкая проверка формата строки без выделения DoubleArray и парсинга чисел.
-     * Используется в статистике для мгновенного подсчёта валидных строк.
+     * Читает оба CSV в ОДИН плоский [TrainingDataset]. Делает два прохода по файлам:
+     * первый — подсчёт валидных строк, чтобы выделить массивы точного размера, второй —
+     * парсинг. Диск читается в фоновом потоке обучения; на главном потоке работы нет.
      */
-    private fun isValidVectorLine(line: String): Boolean {
-        val trimmed = line.trim()
-        if (trimmed.isEmpty() || trimmed.startsWith("h0")) return false
-        val parts = trimmed.split(',')
-        val hasMeta = parts.size == featureCount + META_COLUMNS.size
-        return parts.size == featureCount || hasMeta
-    }
+    @Synchronized
+    fun readCompactDataset(): TrainingDataset {
+        val legitRows = countValidRows(legitVectorFile)
+        val cheatRows = countValidRows(cheatVectorFile)
+        val total = legitRows + cheatRows
 
-    /**
-     * Пишет вектор признаков окна ударов (windowSize * 21 + 7 значений) и две колонки
-     * метаданных: [sessionId] (сессия записи) и [playerHash] (см. [playerHash]).
-     * Метаданные в обучение не идут — по ним делится выборка на train/val/test.
-     *
-     * Вызывается только когда [FeatureExtractor.extract] вернул непустой вектор —
-     * строк в векторных CSV меньше, чем в поштучных, это нормально.
-     */
-    fun writeVectorSample(label: String, vector: FeatureExtractor.FeatureVector, sessionId: String, playerHash: String) {
-        val targetFile = when (label) {
-            "legit" -> legitVectorFile
-            "cheat" -> cheatVectorFile
-            else -> return // неизвестная метка — не пишем никуда
-        }
+        val features = DoubleArray(total * featureCount)
+        val labels = DoubleArray(total)
+        val sessions = arrayOfNulls<String>(total)
+        val hashes = arrayOfNulls<String>(total)
 
-        // Запятые и переводы строк в идентификаторах сломали бы CSV
-        fun clean(id: String) = id.replace(Regex("[,\\r\\n]"), "_")
-        targetFile.appendText(vector.toCsvRow() + "," + clean(sessionId) + "," + clean(playerHash) + "\n")
-    }
-
-    /**
-     * Читает все векторные сэмплы (legit_vectors.csv + cheat_vectors.csv) для обучения,
-     * вместе с метаданными сессии и игрока.
-     */
-    fun readVectorSamples(): VectorDataset {
-        val samples = mutableListOf<VectorSample>()
-        var legitParsed = 0
-        var cheatParsed = 0
-
+        var written = 0
         fun loadFile(file: File, label: Double) {
             if (!file.exists()) return
             var lineNumber = 0
-            var skippedCount = 0
-            val maxDetailedWarnings = 5
-
-            fun logWarning(reason: String) {
-                if (skippedCount < maxDetailedWarnings) {
+            var skipped = 0
+            fun warn(reason: String) {
+                if (skipped < MAX_DETAILED_WARNINGS) {
                     System.err.println("[WARN] [${file.name}:$lineNumber] Пропуск: $reason")
-                } else if (skippedCount == maxDetailedWarnings) {
-                    System.err.println("[WARN] [${file.name}] Достигнут лимит подробных предупреждений ($maxDetailedWarnings). Дальнейшие пропуски выводятся только в итоговый счетчик.")
+                } else if (skipped == MAX_DETAILED_WARNINGS) {
+                    System.err.println(
+                        "[WARN] [${file.name}] Достигнут лимит подробных предупреждений ($MAX_DETAILED_WARNINGS). " +
+                                "Дальнейшие пропуски выводятся только в итоговый счетчик."
+                    )
                 }
             }
-
             file.forEachLine { line ->
                 lineNumber++
-                when (val result = parseVectorLine(line)) {
-                    is ParseResult.Ignored -> return@forEachLine
-                    is ParseResult.Error -> {
-                        logWarning(result.reason)
-                        skippedCount++
-                    }
-                    is ParseResult.Success -> {
-                        samples.add(VectorSample(result.vector, label, result.sessionId, result.playerHash))
-                        if (label == 0.0) legitParsed++ else cheatParsed++
-                    }
+                val trimmed = line.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("h0")) return@forEachLine
+                val meta = try {
+                    parseInto(line, features, written * featureCount)
+                } catch (e: IllegalArgumentException) {
+                    warn(e.message ?: "некорректная строка")
+                    skipped++
+                    return@forEachLine
                 }
+                labels[written] = label
+                sessions[written] = meta.sessionId
+                hashes[written] = meta.playerHash
+                written++
             }
-
-            if (skippedCount > 0) {
-                System.err.println("[INFO] [${file.name}] Всего пропущено некорректных строк: $skippedCount")
+            if (skipped > 0) {
+                System.err.println("[INFO] [${file.name}] Всего пропущено некорректных строк: $skipped")
             }
         }
 
         loadFile(legitVectorFile, 0.0)
         loadFile(cheatVectorFile, 1.0)
 
-        return VectorDataset(samples, legitParsed, cheatParsed)
+        // Битые строки, найденные только при парсинге чисел, ужимаются здесь.
+        val needCopy = written != total
+        return TrainingDataset(
+            features = if (needCopy) features.copyOf(written * featureCount) else features,
+            labels = if (needCopy) labels.copyOf(written) else labels,
+            sessionIds = if (needCopy) sessions.copyOf(written) else sessions,
+            playerHashes = if (needCopy) hashes.copyOf(written) else hashes,
+            sampleCount = written,
+            legitCount = labels.count { it == 0.0 },
+            cheatCount = labels.count { it == 1.0 }
+        )
+    }
+
+    private fun countValidRows(file: File): Int =
+        if (!file.exists()) 0
+        else file.useLines { lines ->
+            lines.count { line ->
+                val trimmed = line.trim()
+                trimmed.isNotEmpty() && !trimmed.startsWith("h0") && isValidColumns(columnCount(trimmed))
+            }
+        }
+
+    /**
+     * Читает все векторные сэмплы (legit_vectors.csv + cheat_vectors.csv) — совместимый
+     * с прежним API вариант [readCompactDataset]. Само обучение этим путём не идёт:
+     * здесь на каждый сэмпл создаётся отдельный DoubleArray, что дорого по памяти.
+     */
+    fun readVectorSamples(): VectorDataset {
+        val compact = readCompactDataset()
+        val samples = ArrayList<VectorSample>(compact.sampleCount)
+        for (i in 0 until compact.sampleCount) {
+            val from = i * featureCount
+            samples.add(
+                VectorSample(
+                    compact.features.copyOfRange(from, from + featureCount),
+                    compact.labels[i],
+                    compact.sessionIds[i],
+                    compact.playerHashes[i]
+                )
+            )
+        }
+        return VectorDataset(samples, compact.legitCount, compact.cheatCount)
     }
 
     /** Краткая статистика датасета для команды info (учитывает только валидные сэмплы). */
     fun getVectorDatasetStats(): Pair<Int, Int> {
-        fun countValidSamples(file: File): Int =
-            if (!file.exists()) 0
-            else file.useLines { lines ->
-                lines.count { line -> isValidVectorLine(line) }
-            }
-        return Pair(countValidSamples(legitVectorFile), countValidSamples(cheatVectorFile))
+        val s = getDatasetSummary()
+        return s.legitVectors to s.cheatVectors
     }
 
     /**
@@ -298,22 +338,93 @@ class DatasetManager(
      * формата без session_id не считаются — у них нет группы.
      */
     fun getSessionStats(): Pair<Int, Int> {
-        fun countSessions(file: File): Int =
-            if (!file.exists()) 0
-            else file.useLines { lines ->
-                val sessions = mutableSetOf<String>()
+        val s = getDatasetSummary()
+        return s.legitSessions to s.cheatSessions
+    }
+
+    /**
+     * Всё, что показывает /daynac info, за один проход по каждому файлу вместо
+     * четырёх (прежде stats и sessions читали CSV независимо). Вызывается на
+     * фоновом потоке: диск не должен блокировать тик сервера.
+     */
+    @Synchronized
+    fun getDatasetSummary(): DatasetSummary {
+        fun scan(file: File): Pair<Int, Int> {
+            if (!file.exists()) return 0 to 0
+            return file.useLines { lines ->
+                var vectors = 0
+                val sessions = HashSet<String>()
                 for (line in lines) {
                     val trimmed = line.trim()
                     if (trimmed.isEmpty() || trimmed.startsWith("h0")) continue
                     val parts = trimmed.split(',')
-                    val hasMeta = parts.size == featureCount + META_COLUMNS.size
-                    if (hasMeta) {
-                        val sessionId = parts[featureCount].trim()
-                        if (sessionId.isNotEmpty()) sessions.add(sessionId)
+                    if (!isValidColumns(parts.size)) continue
+                    vectors++
+                    if (hasMetaColumns(parts.size)) {
+                        val session = parts[featureCount].trim()
+                        if (session.isNotEmpty()) sessions.add(session)
                     }
                 }
-                sessions.size
+                vectors to sessions.size
             }
-        return Pair(countSessions(legitVectorFile), countSessions(cheatVectorFile))
+        }
+
+        val (legitVectors, legitSessions) = scan(legitVectorFile)
+        val (cheatVectors, cheatSessions) = scan(cheatVectorFile)
+        return DatasetSummary(legitVectors, cheatVectors, legitSessions, cheatSessions)
+    }
+
+    /** Запятые и переводы строк в идентификаторах сломали бы CSV. */
+    private fun cleanCsv(id: String): String = id.replace(Regex("[,\\r\\n]"), "_")
+
+    private fun csvRow(vector: FeatureExtractor.FeatureVector, sessionId: String, playerHash: String): String =
+        vector.toCsvRow() + "," + cleanCsv(sessionId) + "," + cleanCsv(playerHash) + "\n"
+
+    private fun targetFileFor(label: String): File? = when (label) {
+        "legit" -> legitVectorFile
+        "cheat" -> cheatVectorFile
+        else -> null
+    }
+
+    /**
+     * Немедленная запись (для тестов и ручных вызовов). Основной путь боёвого сервера —
+     * [enqueueVectorSample]: открывать файл на каждый 16-й удар в тике нельзя.
+     */
+    @Synchronized
+    fun writeVectorSample(label: String, vector: FeatureExtractor.FeatureVector, sessionId: String, playerHash: String) {
+        val targetFile = targetFileFor(label) ?: return
+        targetFile.appendText(csvRow(vector, sessionId, playerHash))
+    }
+
+    /**
+     * Кладывает вектор в буфер без диска и без форматирования строки — вызывается из
+     * обработчика удара на главном потоке. Файл открывается один раз на пачку в
+     * [flushPendingWrites], который вызывается фоновым планировщиком плагина.
+     */
+    fun enqueueVectorSample(label: String, vector: FeatureExtractor.FeatureVector, sessionId: String, playerHash: String) {
+        val targetFile = targetFileFor(label) ?: return
+        pendingWrites.add(PendingWrite(targetFile, vector, sessionId, playerHash))
+    }
+
+    /** Сколько векторов ждёт записи (для диагностики и тестов). */
+    fun pendingWriteCount(): Int = pendingWrites.size
+
+    /**
+     * Сливает накопленные строки в CSV: по одному append на файл, а не на сэмпл.
+     * @return число записанных векторов
+     */
+    @Synchronized
+    fun flushPendingWrites(): Int {
+        if (pendingWrites.isEmpty()) return 0
+        val byFile = HashMap<File, StringBuilder>()
+        var count = 0
+        while (true) {
+            val entry = pendingWrites.poll() ?: break
+            byFile.getOrPut(entry.file) { StringBuilder() }
+                .append(csvRow(entry.vector, entry.sessionId, entry.playerHash))
+            count++
+        }
+        for ((file, text) in byFile) file.appendText(text.toString())
+        return count
     }
 }

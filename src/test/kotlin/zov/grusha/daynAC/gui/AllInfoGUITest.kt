@@ -436,6 +436,34 @@ class AllInfoGUITest {
     }
 
     @Test
+    fun `shutdown closes open guis and restores spectator`() {
+        val target = server.addPlayer("Cheater")
+        track(target.uniqueId, listOf(0.9))
+        val admin = admin(Permissions.VIEW, Permissions.SPECTATE)
+        val start = Location(admin.world, 8.0, 60.0, -2.0)
+        admin.teleport(start)
+        admin.gameMode = GameMode.CREATIVE
+        val inventory = gui.open(admin)
+        gui.onInventoryClick(click(admin, compassSlot(inventory, target.uniqueId)))
+        assertEquals(GameMode.SPECTATOR, admin.gameMode)
+
+        gui.shutdown()
+
+        assertTrue(admin.openInventory.topInventory !== inventory, "GUI должен закрыться при выключении плагина")
+        assertEquals(GameMode.CREATIVE, admin.gameMode)
+        assertTrue(admin.location.distance(start) < 0.01)
+        assertFalse(gui.resetSpectate(admin), "точка возврата больше не должна существовать")
+    }
+
+    @Test
+    fun `name cache can be read and filled without blocking resolution`() {
+        val id = UUID.randomUUID()
+        assertNull(gui.cachedName(id))
+        gui.rememberName(id, " remembered ")
+        assertEquals(" remembered ", gui.cachedName(id))
+    }
+
+    @Test
     fun `switching observed players keeps the original return point`() {
         val first = server.addPlayer("First")
         val second = server.addPlayer("Second")

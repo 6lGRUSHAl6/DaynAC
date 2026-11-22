@@ -175,4 +175,57 @@ class DatasetManagerTest {
         assertTrue(versionFile.exists())
         assertEquals(FeatureExtractor.FEATURE_VERSION.toString(), versionFile.readText().trim())
     }
+
+    @Test
+    fun `enqueued samples stay in memory until flush`(@TempDir tmp: Path) {
+        val dm = DatasetManager(tmp.toFile(), windowSize = 16)
+        dm.enqueueVectorSample("legit", vec(0.5), "s1", "h1")
+        dm.enqueueVectorSample("cheat", vec(0.9), "s2", "h2")
+
+        assertEquals(2, dm.pendingWriteCount())
+        assertEquals(0, File(tmp.toFile(), "legit_vectors.csv").readLines().count { it.isNotBlank() && !it.startsWith("h0") })
+
+        assertEquals(2, dm.flushPendingWrites())
+        assertEquals(0, dm.pendingWriteCount())
+        assertEquals(0, dm.flushPendingWrites(), "повторный flush ничего не должен добавить")
+
+        val dataset = dm.readCompactDataset()
+        assertEquals(1, dataset.legitCount)
+        assertEquals(1, dataset.cheatCount)
+        assertEquals(0.5, dataset.features[0])
+        assertEquals(0.9, dataset.features[343])
+        assertEquals("s1", dataset.sessionIds[0])
+        assertEquals("h2", dataset.playerHashes[1])
+    }
+
+    @Test
+    fun `compact dataset exposes grouping arrays`(@TempDir tmp: Path) {
+        val dm = DatasetManager(tmp.toFile(), windowSize = 16)
+        dm.writeVectorSample("legit", vec(), "session-A", "hash-A")
+        dm.writeVectorSample("cheat", vec(), "session-B", "hash-B")
+
+        val dataset = dm.readCompactDataset()
+        assertEquals(686, dataset.features.size)
+        assertEquals(343, dataset.featureCount)
+        assertEquals(2, dataset.sampleCount)
+        assertEquals(1, dataset.legitCount)
+        assertEquals(1, dataset.cheatCount)
+        assertEquals(listOf("session-A", "session-B"), dataset.groupsBy("session").toList())
+        assertEquals(listOf("hash-A", "hash-B"), dataset.groupsBy("player").toList())
+    }
+
+    @Test
+    fun `dataset summary counts vectors and sessions in one pass`(@TempDir tmp: Path) {
+        val dm = DatasetManager(tmp.toFile(), windowSize = 16)
+        dm.writeVectorSample("legit", vec(), "s1", "h")
+        dm.writeVectorSample("legit", vec(), "s1", "h")
+        dm.writeVectorSample("legit", vec(), "s2", "h")
+        dm.writeVectorSample("cheat", vec(), "s3", "h")
+
+        val s = dm.getDatasetSummary()
+        assertEquals(3, s.legitVectors)
+        assertEquals(1, s.cheatVectors)
+        assertEquals(2, s.legitSessions)
+        assertEquals(1, s.cheatSessions)
+    }
 }

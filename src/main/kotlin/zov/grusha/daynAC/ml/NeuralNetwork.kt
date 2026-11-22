@@ -26,6 +26,12 @@ import kotlin.math.sqrt
  *
  * Потокобезопасность: [predict] не берёт блокировок и читает неизменяемый снапшот весов;
  * [train] и [loadFrom] сериализуются [mutationLock] и публикуют результат одним атомарным set().
+ *
+ * Память: обучение принимает [TrainingDataset] с признаками в одном плоском массиве и
+ * нормализует каждый сэмпл в небольшой буфер прямо перед шагом SGD — вторая копия
+ * всего датасета не создаётся. Test-сет хранится не как нормализованные вектора, а как
+ * два отсортированных массива вероятностей (по классу): это позволяет считать любые
+ * пороги бинарным поиском и не раздувать model.dat пропорционально датасету.
  */
 class NeuralNetwork(
     val inputSize: Int,
@@ -117,13 +123,17 @@ class NeuralNetwork(
     }
 
     /**
-     * Нормализованный test-сет последнего train(): модель на нём не училась и эпоха по нему
-     * не выбиралась. Сохраняется в model.dat дополнительным блоком после весов, поэтому
-     * /daynac eval работает и после рестарта сервера (см. saveTo/loadFrom).
+     * Test-сет последнего train(): модель на нём не училась и эпоха по нему не выбиралась.
+     *
+     * Вместо нормализованных векторов (343 double на окно, т.е. ~2.7 КБ на сэмпл в
+     * model.dat) храним только предсказанные вероятности — по одному double на окно,
+     * раздельно для legit и cheat. Массивы отсортированы, поэтому долю выше любого
+     * порога можно получить бинарным поиском, а /daynac eval работает и после
+     * рестарта сервера (см. saveTo/loadFrom).
      */
     private class HoldoutSet(
-        val normalizedFeatures: List<DoubleArray>,
-        val labels: DoubleArray
+        val legitProbabilities: DoubleArray,
+        val cheatProbabilities: DoubleArray
     )
 
     @Volatile
@@ -194,6 +204,10 @@ class NeuralNetwork(
         private const val FORMAT_VERSION = 3   // v2: + метрики обучения; v3: + версия признаков.
         // Блок test-сета добавлен ниже метрик как необязательный хвост (версию не меняли,
         // чтобы старые model.dat оставались совместимы и не требовали переобучения).
+        // Новый блок пишет отрицательный count как маркер «компактный формат»: внутри два
+        // массива вероятностей вместо сырых нормализованных векторов. Читатель понимает
+        // оба варианта, поэтому старые model.dat грузятся как раньше.
+        private const val COMPACT_TEST_BLOCK = -1
 
         /** Доли validation (early stopping) и test (финальная оценка) на класс; остальное — train. */
         private const val VAL_FRACTION = 0.2
@@ -228,9 +242,13 @@ class NeuralNetwork(
         }
     }
 
-    /** Новый массив: для train, где нормализованные сэмплы живут весь цикл обучения. */
-    private fun normalize(features: DoubleArray, state: Weights): DoubleArray =
-        DoubleArray(features.size).also { normalizeInto(features, state, it) }
+    /** Нормализация сэмпла `index` из плоского датасета в переиспользуемый буфер. */
+    private fun normalizeAt(features: DoubleArray, index: Int, state: Weights, out: DoubleArray) {
+        val base = index * inputSize
+        for (i in 0 until inputSize) {
+            out[i] = (features[base + i] - state.featureMean[i]) / state.featureStd[i]
+        }
+    }
 
     private fun newLayerBuffers(state: Weights) = Array(state.weights.size) { DoubleArray(state.biases[it].size) }
 
@@ -302,9 +320,9 @@ class NeuralNetwork(
         private set
 
     /**
-     * Стратифицированный split 60/20/20 (train/val/test), z-score по train, обучение по одному
-     * сэмплу с early stopping по val и восстановлением лучших весов. Test-сет в обучении
-     * и выборе эпохи не участвует.
+     * Совместимый API для тестов и маленьких датасетов: разворачивает список векторов в
+     * плоский массив и делегирует в [trainInternal]. Большой датасет (/daynac train)
+     * должен идти через перегрузку [train] с [TrainingDataset] — без лишних копий.
      *
      * @param samples векторы признаков длиной [inputSize]
      * @param labels 0.0 = легит, 1.0 = чит
@@ -330,9 +348,81 @@ class NeuralNetwork(
         onProgress: ((epoch: Int, trainLoss: Double, valLoss: Double?, valAcc: Double?) -> Unit)? = null
     ): TrainResult {
         require(samples.size == labels.size) { "samples и labels разной длины" }
-        require(samples.size >= 10) { "Датасет слишком мал: ${samples.size} сэмплов (нужно ≥ 10)" }
         require(samples.all { it.size == inputSize }) { "Все сэмплы должны быть длиной $inputSize" }
-        require(groups == null || groups.size == samples.size) { "groups и samples разной длины" }
+        val flat = DoubleArray(samples.size * inputSize)
+        for (i in samples.indices) samples[i].copyInto(flat, i * inputSize)
+        return trainInternal(
+            features = flat,
+            labels = labels.toDoubleArray(),
+            sampleCount = samples.size,
+            groups = groups?.toTypedArray(),
+            learningRate = learningRate,
+            maxEpochs = maxEpochs,
+            patience = patience,
+            l2Lambda = l2Lambda,
+            dropoutRate = dropoutRate,
+            onProgress = onProgress
+        )
+    }
+
+    /**
+     * Основной путь обучения: признаки уже лежат в одном плоском массиве. [groups]
+     * по умолчанию берёт grouping из датасета (сессии); фоновый поток обучения передаёт
+     * `dataset.groupsBy(splitBy)`, прочитанный на главном потоке до старта.
+     */
+    fun train(
+        dataset: TrainingDataset,
+        groups: Array<String?>? = null,
+        learningRate: Double = 0.002,
+        maxEpochs: Int = 1000,
+        patience: Int = 40,
+        l2Lambda: Double = 1e-4,
+        dropoutRate: Double = 0.15,
+        onProgress: ((epoch: Int, trainLoss: Double, valLoss: Double?, valAcc: Double?) -> Unit)? = null
+    ): TrainResult {
+        require(dataset.featureCount == inputSize) {
+            "Ожидалось $inputSize признаков на сэмпл, в датасете ${dataset.featureCount}"
+        }
+        return trainInternal(
+            features = dataset.features,
+            labels = dataset.labels,
+            sampleCount = dataset.sampleCount,
+            groups = groups ?: dataset.sessionIds,
+            learningRate = learningRate,
+            maxEpochs = maxEpochs,
+            patience = patience,
+            l2Lambda = l2Lambda,
+            dropoutRate = dropoutRate,
+            onProgress = onProgress
+        )
+    }
+
+    /**
+     * Стратифицированный split 60/20/20 (train/val/test), z-score по train, обучение по одному
+     * сэмплу с early stopping по val и восстановлением лучших весов. Test-сет в обучении
+     * и выборе эпохи не участвует.
+     *
+     * Нормализованные копии всех сэмплов НЕ создаются: [computeNormStats] делает один
+     * последовательный проход по train-индексам, а каждый сэмпл нормализуется в общий
+     * буфер непосредственно перед forward/backward.
+     */
+    private fun trainInternal(
+        features: DoubleArray,
+        labels: DoubleArray,
+        sampleCount: Int,
+        groups: Array<String?>?,
+        learningRate: Double,
+        maxEpochs: Int,
+        patience: Int,
+        l2Lambda: Double,
+        dropoutRate: Double,
+        onProgress: ((epoch: Int, trainLoss: Double, valLoss: Double?, valAcc: Double?) -> Unit)?
+    ): TrainResult {
+        require(features.size == sampleCount * inputSize) {
+            "features должны содержать ровно sampleCount * inputSize чисел"
+        }
+        require(sampleCount >= 10) { "Датасет слишком мал: $sampleCount сэмплов (нужно ≥ 10)" }
+        require(groups == null || groups.size == sampleCount) { "groups и samples разной длины" }
         val legitTotal = labels.count { it == 0.0 }
         val cheatTotal = labels.count { it == 1.0 }
         require(legitTotal >= MIN_SAMPLES_PER_CLASS && cheatTotal >= MIN_SAMPLES_PER_CLASS) {
@@ -346,21 +436,13 @@ class NeuralNetwork(
             val split = splitIndices(labels, groups, Random(seed))
 
             initWeights(local)
-            computeNormStats(local, split.train.map { samples[it] })
-
-            fun featuresOf(idx: List<Int>) = idx.map { normalize(samples[it], local) }
-            fun labelsOf(idx: List<Int>) = DoubleArray(idx.size) { labels[idx[it]] }
-
-            val trainFeatures = featuresOf(split.train)
-            val valFeatures = featuresOf(split.validation)
-            val testFeatures = featuresOf(split.test)
-            val trainLabels = labelsOf(split.train)
-            val valLabels = labelsOf(split.validation)
-            val testLabels = labelsOf(split.test)
+            computeNormStats(local, features, split.train)
 
             val context = StepContext(layerSizes, learningRate, l2Lambda, dropoutRate)
             val best = local.deepCopy()
-            val order = IntArray(trainFeatures.size)
+            val order = split.train.copyOf()
+            val stepInput = DoubleArray(inputSize)
+            val evalBuffers = newLayerBuffers(local)
             val valCheckInterval = max(1, min(5, maxEpochs / 50))
             var bestValLoss = Double.POSITIVE_INFINITY
             var bestEpoch = 0
@@ -370,7 +452,6 @@ class NeuralNetwork(
 
             while (epoch < maxEpochs) {
                 val epochRng = Random(seed + epoch + 1)
-                for (i in order.indices) order[i] = i
                 order.shuffleInPlace(epochRng)
 
                 val t = (epoch + 1).toDouble()
@@ -378,15 +459,15 @@ class NeuralNetwork(
                 context.biasCorrection2 = 1.0 - BETA2.pow(t)
 
                 var epochLoss = 0.0
-                for (i in order) {
-                    val label = trainLabels[i]
-                    val prediction = trainStep(local, context, trainFeatures[i], label, epochRng)
-                    epochLoss += bceLoss(prediction, label)
+                for (idx in order) {
+                    normalizeAt(features, idx, local, stepInput)
+                    val prediction = trainStep(local, context, stepInput, labels[idx], epochRng)
+                    epochLoss += bceLoss(prediction, labels[idx])
                 }
                 val trainLoss = epochLoss / order.size
 
                 if (epoch % valCheckInterval == 0) {
-                    val valResult = evaluateNormalized(local, valFeatures, valLabels)
+                    val valResult = evaluateIndices(local, features, labels, split.validation, stepInput, evalBuffers)
                     onProgress?.invoke(epoch, trainLoss, valResult.avgLoss, valResult.accuracy)
 
                     if (valResult.avgLoss < bestValLoss) {
@@ -410,11 +491,12 @@ class NeuralNetwork(
 
             local.copyFrom(best)
 
-            val finalTrain = evaluateNormalized(local, trainFeatures, trainLabels)
-            val finalVal = evaluateNormalized(local, valFeatures, valLabels)
-            val finalTest = evaluateNormalized(local, testFeatures, testLabels)
+            val finalTrain = evaluateIndices(local, features, labels, split.train, stepInput, evalBuffers)
+            val finalVal = evaluateIndices(local, features, labels, split.validation, stepInput, evalBuffers)
+            val (legitProbs, cheatProbs) = testProbabilities(local, features, labels, split.test, stepInput, evalBuffers)
+            val finalTest = metricsOf(legitProbs, cheatProbs)
 
-            lastTestSet = HoldoutSet(testFeatures, testLabels)
+            lastTestSet = HoldoutSet(legitProbs, cheatProbs)
             snapshot.set(local)
 
             val result = TrainResult(
@@ -432,6 +514,71 @@ class NeuralNetwork(
             lastTrainResult = result
             return result
         }
+    }
+
+    /** Средний BCE и accuracy по подмножеству индексов плоского датасета. */
+    private fun evaluateIndices(
+        state: Weights,
+        features: DoubleArray,
+        labels: DoubleArray,
+        indices: IntArray,
+        input: DoubleArray,
+        buffers: Array<DoubleArray>
+    ): Evaluation {
+        if (indices.isEmpty()) return Evaluation(0.0, 0.0)
+        var totalLoss = 0.0
+        var correct = 0
+        for (idx in indices) {
+            normalizeAt(features, idx, state, input)
+            val prediction = forwardOnly(state, input, buffers)
+            totalLoss += bceLoss(prediction, labels[idx])
+            if ((prediction >= 0.5) == (labels[idx] >= 0.5)) correct++
+        }
+        return Evaluation(totalLoss / indices.size, correct.toDouble() / indices.size)
+    }
+
+    /**
+     * Тестовые вероятности: по одному double на окно вместо 343 чисел в старом формате.
+     * Массивы сортируются сразу — evaluateThresholds считает confusion matrix бинарным
+     * поиском, а saveTo пишет их как есть.
+     */
+    private fun testProbabilities(
+        state: Weights,
+        features: DoubleArray,
+        labels: DoubleArray,
+        indices: IntArray,
+        input: DoubleArray,
+        buffers: Array<DoubleArray>
+    ): Pair<DoubleArray, DoubleArray> {
+        val legit = DoubleArray(indices.size)
+        val cheat = DoubleArray(indices.size)
+        var nLegit = 0
+        var nCheat = 0
+        for (idx in indices) {
+            normalizeAt(features, idx, state, input)
+            val p = forwardOnly(state, input, buffers)
+            if (labels[idx] < 0.5) legit[nLegit++] = p else cheat[nCheat++] = p
+        }
+        java.util.Arrays.sort(legit, 0, nLegit)
+        java.util.Arrays.sort(cheat, 0, nCheat)
+        return legit.copyOf(nLegit) to cheat.copyOf(nCheat)
+    }
+
+    /** Метрики по уже посчитанным вероятностям (порядок не важен, но импорт детерминирован). */
+    private fun metricsOf(legit: DoubleArray, cheat: DoubleArray): Evaluation {
+        val total = legit.size + cheat.size
+        if (total == 0) return Evaluation(0.0, 0.0)
+        var totalLoss = 0.0
+        var correct = 0
+        for (p in legit) {
+            totalLoss += bceLoss(p, 0.0)
+            if (p < 0.5) correct++
+        }
+        for (p in cheat) {
+            totalLoss += bceLoss(p, 1.0)
+            if (p >= 0.5) correct++
+        }
+        return Evaluation(totalLoss / total, correct.toDouble() / total)
     }
 
     /**
@@ -478,38 +625,41 @@ class NeuralNetwork(
 
     /**
      * Матрицы ошибок на test-сете последнего train() для каждого порога из [thresholds].
-     * @return null, если в этом сеансе ещё не было train()
+     * Вероятности уже посчитаны обучением и отсортированы, поэтому каждый порог
+     * обрабатывается бинарным поиском — ни forward-pass, ни прохода по всем окнам.
+     * @return null, если в этом сеансе ещё не было train() и model.dat без test-блока
      */
     fun evaluateThresholds(thresholds: DoubleArray): List<ThresholdMetrics>? {
         val testSet = lastTestSet ?: return null
-        val state = snapshot.get()
+        val legit = testSet.legitProbabilities
+        val cheat = testSet.cheatProbabilities
+        val totalLegit = legit.size
+        val totalCheat = cheat.size
 
-        val buffers = newLayerBuffers(state)
-        val probabilities = testSet.normalizedFeatures.map { forwardOnly(state, it, buffers) }
-
-        val totalLegit = testSet.labels.count { it < 0.5 }
-        val totalCheat = testSet.labels.count { it >= 0.5 }
+        /** Индекс первого элемента ≥ [value] в отсортированном массиве. */
+        fun lowerBound(values: DoubleArray, value: Double): Int {
+            var lo = 0
+            var hi = values.size
+            while (lo < hi) {
+                val mid = (lo + hi) ushr 1
+                if (values[mid] < value) lo = mid + 1 else hi = mid
+            }
+            return lo
+        }
 
         return thresholds.map { threshold ->
-            var tp = 0; var fp = 0; var tn = 0; var fn = 0
-            for (i in probabilities.indices) {
-                val predictedCheat = probabilities[i] >= threshold
-                val actualCheat = testSet.labels[i] >= 0.5
-                when {
-                    predictedCheat && actualCheat -> tp++
-                    predictedCheat && !actualCheat -> fp++
-                    !predictedCheat && !actualCheat -> tn++
-                    else -> fn++
-                }
-            }
+            val tp = cheat.size - lowerBound(cheat, threshold)
+            val fn = cheat.size - tp
+            val fp = legit.size - lowerBound(legit, threshold)
+            val tn = legit.size - fp
             ThresholdMetrics(threshold, tp, fp, tn, fn, totalLegit, totalCheat)
         }
     }
 
     private class IndexSplit(
-        val train: List<Int>,
-        val validation: List<Int>,
-        val test: List<Int>,
+        val train: IntArray,
+        val validation: IntArray,
+        val test: IntArray,
         val summary: SplitSummary
     )
 
@@ -521,15 +671,15 @@ class NeuralNetwork(
      * Строки без группы считаются отдельными группами по одному окну. Иначе — случайное
      * разбиение окон, что отражено в [SplitSummary].
      */
-    private fun splitIndices(labels: List<Double>, groups: List<String?>?, rng: Random): IndexSplit {
+    private fun splitIndices(labels: DoubleArray, groups: Array<String?>?, rng: Random): IndexSplit {
         val train = ArrayList<Int>()
         val validation = ArrayList<Int>()
         val test = ArrayList<Int>()
         val grouped = BooleanArray(2)
         val groupCounts = IntArray(2)
 
-        for ((c, label) in listOf(0.0, 1.0).withIndex()) {
-            val classIdx = labels.indices.filter { labels[it] == label }
+        for ((c, label) in doubleArrayOf(0.0, 1.0).withIndex()) {
+            val classIdx = (0 until labels.size).filter { labels[it] == label }
             val byGroup = LinkedHashMap<String, MutableList<Int>>()
             for (i in classIdx) {
                 val g = groups?.get(i) ?: continue
@@ -569,7 +719,7 @@ class NeuralNetwork(
             legitGroups = groupCounts[0], cheatGroups = groupCounts[1],
             trainSize = train.size, valSize = validation.size, testSize = test.size
         )
-        return IndexSplit(train, validation, test, summary)
+        return IndexSplit(train.toIntArray(), validation.toIntArray(), test.toIntArray(), summary)
     }
 
     /** He-инициализация весов (оптимальна для ReLU), bias и моменты Adam — нули. */
@@ -694,34 +844,23 @@ class NeuralNetwork(
         return -(label * ln(p) + (1.0 - label) * ln(1.0 - p))
     }
 
-    /** Средний BCE и accuracy (порог 0.5) на уже нормализованных сэмплах. */
-    private fun evaluateNormalized(state: Weights, features: List<DoubleArray>, labels: DoubleArray): Evaluation {
-        if (features.isEmpty()) return Evaluation(0.0, 0.0)
-        val buffers = newLayerBuffers(state)
-        var totalLoss = 0.0
-        var correct = 0
-        for (i in features.indices) {
-            val prediction = forwardOnly(state, features[i], buffers)
-            totalLoss += bceLoss(prediction, labels[i])
-            val predictedClass = if (prediction >= 0.5) 1.0 else 0.0
-            if (predictedClass == labels[i]) correct++
-        }
-        return Evaluation(totalLoss / features.size, correct.toDouble() / features.size)
-    }
-
     private data class Evaluation(val avgLoss: Double, val accuracy: Double)
 
-    /** Z-score статистики по train-выборке; константный признак получает std = 1.0. */
-    private fun computeNormStats(state: Weights, trainFeatures: List<DoubleArray>) {
-        val n = trainFeatures.size
+    /**
+     * Z-score статистики по train-выборке; константный признак получает std = 1.0.
+     * Читает плоский массив прямо по индексам train — лишних копий признаков нет.
+     */
+    private fun computeNormStats(state: Weights, features: DoubleArray, trainIndices: IntArray) {
+        val n = trainIndices.size
+        if (n == 0) return
         for (i in 0 until inputSize) {
             var mean = 0.0
-            for (sample in trainFeatures) mean += sample[i]
+            for (idx in trainIndices) mean += features[idx * inputSize + i]
             mean /= n
 
             var variance = 0.0
-            for (sample in trainFeatures) {
-                val d = sample[i] - mean
+            for (idx in trainIndices) {
+                val d = features[idx * inputSize + i] - mean
                 variance += d * d
             }
             variance /= n
@@ -821,17 +960,17 @@ class NeuralNetwork(
                 }
 
                 // --- Необязательный блок test-сета --------------------------------
-                // Сохраняем нормализованные окна (те же данные, по которым считались
-                // test-метрики во время train), чтобы /daynac eval и /daynac info
-                // показывали сводку и после рестарта сервера, без переобучения.
+                // Храним не сами окна, а только вероятности по каждому классу: 8 байт
+                // на сэмпл вместо 8 * (inputSize + 1). Раньше блок рос вместе с датасетом
+                // и для 100k окон добавлял ~275 МБ к model.dat.
                 val ts = lastTestSet
                 if (ts != null) {
                     output.writeBoolean(true)
-                    output.writeInt(ts.normalizedFeatures.size)
-                    for (i in ts.normalizedFeatures.indices) {
-                        for (d in ts.normalizedFeatures[i]) output.writeDouble(d)
-                        output.writeDouble(ts.labels[i])
-                    }
+                    output.writeInt(COMPACT_TEST_BLOCK)
+                    output.writeInt(ts.legitProbabilities.size)
+                    for (p in ts.legitProbabilities) output.writeDouble(p)
+                    output.writeInt(ts.cheatProbabilities.size)
+                    for (p in ts.cheatProbabilities) output.writeDouble(p)
                     // Разбиение датасета — для честного предупреждения в eval о
                     // случайном (не по группам) split после рестарта.
                     val sp = tr?.split
@@ -868,22 +1007,37 @@ class NeuralNetwork(
     /**
      * Читает необязательный блок test-сета из model.dat (см. saveTo).
      * Возвращает Pair(testSet, splitSummary); для старых файлов без блока — (null, null).
-     * EOF внутри блока трактует как отсутствие блока: обрыв посреди записи в
-     * model.dat невозможен (saveTo пишет во временный файл и атомарно
-     * переименовывает), значит файл просто сохранён старой версией плагина.
+     * Поддерживаются оба формата: новый компактный (маркер [COMPACT_TEST_BLOCK] и два
+     * массива вероятностей) и старый (нормализованные окна + метки — probabilities
+     * пересчитываются по загруженным весам). EOF внутри блока трактуется как отсутствие
+     * блока: обрыв посреди записи невозможен, значит файл сохранён старой версией плагина.
      */
-    private fun readTestSetBlock(input: DataInputStream): Pair<HoldoutSet?, SplitSummary?> {
+    private fun readTestSetBlock(input: DataInputStream, state: Weights): Pair<HoldoutSet?, SplitSummary?> {
         if (input.read() != 1) return null to null
         return try {
-            val count = input.readInt()
-            check(count >= 0) { "Повреждённый блок test-сета (отрицательный размер: $count)" }
-            val features = ArrayList<DoubleArray>(count)
-            val labels = DoubleArray(count)
-            for (i in 0 until count) {
-                val sample = DoubleArray(inputSize)
-                for (k in sample.indices) sample[k] = input.readDouble()
-                features.add(sample)
-                labels[i] = input.readDouble()
+            val countOrMarker = input.readInt()
+            val testSet = if (countOrMarker == COMPACT_TEST_BLOCK) {
+                val nLegit = input.readInt()
+                check(nLegit >= 0) { "Повреждённый блок test-сета (отрицательный размер legit: $nLegit)" }
+                val legit = DoubleArray(nLegit) { input.readDouble() }
+                val nCheat = input.readInt()
+                check(nCheat >= 0) { "Повреждённый блок test-сета (отрицательный размер cheat: $nCheat)" }
+                val cheat = DoubleArray(nCheat) { input.readDouble() }
+                HoldoutSet(legit, cheat)
+            } else {
+                val count = countOrMarker
+                check(count >= 0) { "Повреждённый блок test-сета (отрицательный размер: $count)" }
+                val buffers = newLayerBuffers(state)
+                val legitProbs = ArrayList<Double>(count)
+                val cheatProbs = ArrayList<Double>(count)
+                for (i in 0 until count) {
+                    val sample = DoubleArray(inputSize)
+                    for (k in sample.indices) sample[k] = input.readDouble()
+                    val label = input.readDouble()
+                    val probability = forwardOnly(state, sample, buffers)
+                    if (label < 0.5) legitProbs.add(probability) else cheatProbs.add(probability)
+                }
+                HoldoutSet(legitProbs.sorted().toDoubleArray(), cheatProbs.sorted().toDoubleArray())
             }
             val split = if (input.read() == 1) {
                 SplitSummary(
@@ -896,7 +1050,7 @@ class NeuralNetwork(
                     testSize = input.readInt()
                 )
             } else null
-            HoldoutSet(features, labels) to split
+            testSet to split
         } catch (_: EOFException) {
             null to null
         }
@@ -957,7 +1111,7 @@ class NeuralNetwork(
                     // (FORMAT_VERSION 3 без test-блока) заканчиваются после блока
                     // метрик — read() вернёт -1, и это не ошибка. Восстанавливаем
                     // lastTestSet, чтобы /daynac eval работал после рестарта.
-                    val (testSet, testSplit) = readTestSetBlock(input)
+                    val (testSet, testSplit) = readTestSetBlock(input, loaded)
                     lastTestSet = testSet
 
                     // testLoss/testAccuracy/split не писались в файл: пересчитываем
@@ -965,7 +1119,7 @@ class NeuralNetwork(
                     // лучшие веса, при которых train считал финальные метрики) —
                     // /daynac info показывает полную сводку и после рестарта.
                     lastTrainResult = trainResult?.let { tr ->
-                        val eval = testSet?.let { evaluateNormalized(loaded, it.normalizedFeatures, it.labels) }
+                        val eval = testSet?.let { metricsOf(it.legitProbabilities, it.cheatProbabilities) }
                         tr.copy(
                             testLoss = eval?.avgLoss,
                             testAccuracy = eval?.accuracy,

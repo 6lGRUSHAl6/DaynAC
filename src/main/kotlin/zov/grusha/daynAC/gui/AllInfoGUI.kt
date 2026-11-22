@@ -97,6 +97,31 @@ class AllInfoGUI(
 
     private val resolvingNames = AtomicBoolean(false)
 
+    /** Имя из кэша без диска/сети. Безопасно читать с главного потока. */
+    fun cachedName(uuid: UUID): String? = nameCache[uuid]
+
+    /** Кэширует имя, найденное командой вне потока отрисовки GUI. */
+    fun rememberName(uuid: UUID, name: String) {
+        nameCache[uuid] = name
+        unresolvedNames.remove(uuid)
+    }
+
+    fun shutdown() {
+        // Копия: closeInventory() синхронно вызовет onClose, который меняет openGuis.
+        for ((adminId, gui) in openGuis.toList()) {
+            val admin = Bukkit.getPlayer(adminId) ?: continue
+            if (admin.openInventory.topInventory === gui) admin.closeInventory()
+        }
+        openGuis.clear()
+        openPages.clear()
+        for (adminId in spectateReturnPoints.keys.toList()) {
+            val admin = Bukkit.getPlayer(adminId) ?: continue
+            resetSpectate(admin)
+        }
+        spectateReturnPoints.clear()
+        unresolvedNames.clear()
+    }
+
     /** Собирает и открывает GUI для администратора. */
     fun open(admin: Player): Inventory {
         val inventory = Bukkit.createInventory(null, GUI_SIZE, TITLE)
@@ -281,7 +306,7 @@ class AllInfoGUI(
         // они пусты, хотя журнал сохранён — карточка это покажет.
         val active = engine.getRecentPredictions(card.uuid)
         val flagsCleared = active.isEmpty()
-        val average = active.average() // NaN при снятых флагах — тогда в лоре прочерк
+        val average = active.average() // NaN при снятых флагах - тогда в лоре прочерк
 
         val item = ItemStack(Material.COMPASS)
         val meta = item.itemMeta as CompassMeta

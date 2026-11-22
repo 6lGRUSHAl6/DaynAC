@@ -403,4 +403,74 @@ class NeuralNetworkTest {
         assertEquals(before.testAccuracy!!, after.testAccuracy!!, 1e-12)
         assertEquals(before.split, after.split)
     }
+
+    // --- компактный путь обучения ---------------------------------------
+
+    @Test
+    fun `compact training gives the same result as list API`() {
+        val (samples, labels) = tinyDataset()
+        val groups = List(samples.size) { "g$it" }
+
+        val nnList = tinyNetwork()
+        val listResult = nnList.train(samples, labels, groups = groups, maxEpochs = 20, patience = 5)
+
+        val flat = DoubleArray(samples.size * 3)
+        for (i in samples.indices) samples[i].copyInto(flat, i * 3)
+        val dataset = TrainingDataset(
+            features = flat,
+            labels = labels.toDoubleArray(),
+            sessionIds = groups.toTypedArray(),
+            playerHashes = groups.toTypedArray(),
+            sampleCount = samples.size,
+            legitCount = 5,
+            cheatCount = 5
+        )
+        val nnCompact = tinyNetwork()
+        val compactResult = nnCompact.train(dataset, groups = groups.toTypedArray(), maxEpochs = 20, patience = 5)
+
+        assertEquals(listResult.trainLoss, compactResult.trainLoss, 1e-12)
+        assertEquals(listResult.valLoss, compactResult.valLoss, 1e-12)
+        assertEquals(listResult.testLoss!!, compactResult.testLoss!!, 1e-12)
+        assertEquals(listResult.split, compactResult.split)
+
+        val thresholds = doubleArrayOf(0.3, 0.5, 0.7)
+        val listMetrics = nnList.evaluateThresholds(thresholds)!!
+        val compactMetrics = nnCompact.evaluateThresholds(thresholds)!!
+        for (i in thresholds.indices) {
+            assertEquals(listMetrics[i].truePositives, compactMetrics[i].truePositives)
+            assertEquals(listMetrics[i].falsePositives, compactMetrics[i].falsePositives)
+            assertEquals(listMetrics[i].falseNegativeRate, compactMetrics[i].falseNegativeRate, 1e-12)
+        }
+    }
+
+    @Test
+    fun `model file size is independent of holdout size`(@TempDir tmp: Path) {
+        // 343 признака — как в бою. В старом формате test-блок для 60+ окон добавил бы
+        // ~165 КБ; компактный хранит по одному double на окно.
+        fun modelSize(perClass: Int): Long {
+            val features = DoubleArray(perClass * 2 * 343) { it % 17 / 17.0 }
+            val labels = DoubleArray(perClass * 2) { if (it < perClass) 0.0 else 1.0 }
+            val dataset = TrainingDataset(
+                features = features,
+                labels = labels,
+                sessionIds = arrayOfNulls(labels.size),
+                playerHashes = arrayOfNulls(labels.size),
+                sampleCount = labels.size,
+                legitCount = perClass,
+                cheatCount = perClass
+            )
+            val nn = NeuralNetwork(inputSize = 343, hiddenSizes = intArrayOf(4))
+            nn.train(dataset, maxEpochs = 3, patience = 1)
+            val file = tmp.resolve("model-$perClass.dat").toFile()
+            nn.saveTo(file)
+            return file.length()
+        }
+
+        val small = modelSize(5)
+        val large = modelSize(60)
+        assertTrue(
+            kotlin.math.abs(large - small) < 2048,
+            "model.dat вырос с ${small} до $large байт только из-за размера test-сета"
+        )
+    }
 }
