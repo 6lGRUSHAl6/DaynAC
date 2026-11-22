@@ -154,7 +154,7 @@ Each command requires its own permission (see [Permissions](#permissions)); `day
 | `/daynac debug` | Toggle per-hit logging to players with `daynac.alerts` and to the console; the value is saved to `config.yml` | `daynac.config` |
 | `/daynac clearflags <player>` | Manually reset a player's flags and current window (also works for offline players) | `daynac.config` |
 | `/daynac exempt <player> [time\|off]` | Grant a temporary exemption from detection (`30s`, `5m`, `2h`, `1d`); without time - permanent; `off` - remove | `daynac.exempt.manage` |
-| `/daynac reload` | Reload `config.yml` on the fly: thresholds, punishment settings and `hidden-layers` are applied immediately; on an error (broken YAML, invalid values) the previous settings stay in force. While `/daynac train` is running, an architecture change is postponed until it finishes | `daynac.config` |
+| `/daynac reload` | Reload `config.yml` on the fly: thresholds, punishment settings, `hidden-layers` and training hyperparameters are applied immediately; on an error (broken YAML, invalid values) the previous settings stay in force. While `/daynac train` is running, an architecture change is postponed until it finishes | `daynac.config` |
 
 ---
 
@@ -238,7 +238,7 @@ These columns are not used for training; they are used to split the dataset. Fil
 - Splits the dataset 60/20/20 into train/validation/test (stratified by class) and normalizes features (z-score) using the training portion only.
 - If there are ≥ 3 groups per class, it splits by **whole groups** (`training.split-by: session` or `player`), so windows from the same player never end up in both training and testing. With fewer groups, the split is random by window, and the plugin warns that the metrics are likely inflated.
 - Trains with early stopping on validation loss and restores the best weights. The test set is not used for training or epoch selection.
-- Parameters: Adam (lr 0.001), one sample at a time, BCE, L2 `1e-4`, dropout 0.15 on hidden layers, up to 1000 epochs; validation loss is checked every 5 epochs, and training stops after 15 checks without improvement.
+- Parameters: Adam, one sample at a time, BCE, up to 1000 epochs; validation loss is checked every 5 epochs. `learning-rate` (0.001), `l2-lambda` (0.0001), `dropout-rate` (0.15) and `patience` (15 checks) are set in `config.yml` (section `training`) and validated by `/daynac reload`.
 - At least 10 vectors in total and at least 5 per class are required (in practice, hundreds are recommended).
 - Training runs in a background thread, and only one run can be active at a time. Progress is shown in real time: a live progress bar in the action bar (for the player, at most twice a second) and progress updates in chat every 10% of the epochs.
 - On completion: a report with train/validation/test metrics, a description of the split, and the train/validation gap (overfitting, warning threshold 5 percentage points); the model is saved to `model.dat` together with the test set and the split (so the `/daynac eval` report survives a restart), and detection is enabled automatically.
@@ -375,6 +375,10 @@ detection:
 
 training:
   split-by: session          # session | player: what to split train/val/test by
+  learning-rate: 0.001       # Adam step (usually 0.001–0.003)
+  patience: 15               # validation checks without improvement; 0 = no early stopping
+  l2-lambda: 0.0001          # L2 penalty on weights (1e-4); 0 = disabled
+  dropout-rate: 0.15         # hidden-layer dropout; 0 = disabled, < 1
 ```
 
 Placeholders in `punish-message`:
@@ -388,7 +392,7 @@ Placeholders in `punish-message`:
 | `{action}` | `kick`, `ban` or `ban-ip` |
 
 > [!IMPORTANT]
-> Threshold ordering is validated at startup and at `/daynac reload`: `flag ≤ reduce < cancel ≤ punish`; also `punish-confirm-windows ≥ 1`, `max-recent-predictions ≥ 1`, and `alert-cooldown-seconds`, `inactivity-reset-seconds` and `carry-over-seconds` cannot be negative. The `detection` options, `hidden-layers` and `hit-logging` are applied by `/daynac reload` without a server restart: thresholds and punishment settings are applied atomically (either fully new or fully previous), and after a `hidden-layers` change detection only works with a model of the new architecture. A YAML syntax error or an invalid value applies nothing.
+> Threshold ordering is validated at startup and at `/daynac reload`: `flag ≤ reduce < cancel ≤ punish`; also `punish-confirm-windows ≥ 1`, `max-recent-predictions ≥ 1`, and `alert-cooldown-seconds`, `inactivity-reset-seconds` and `carry-over-seconds` cannot be negative. The `detection` options, `hidden-layers`, `hit-logging` and the `training` hyperparameters (`learning-rate`, `patience`, `l2-lambda`, `dropout-rate`) are applied by `/daynac reload` without a server restart: thresholds and punishment settings are applied atomically (either fully new or fully previous), and after a `hidden-layers` change detection only works with a model of the new architecture. Training hyperparameters are read on every `/daynac train` and do not affect an already trained model (retrain to apply them). Ranges: `learning-rate` 0.000001..1.0, `patience` ≥ 0, `l2-lambda` ≥ 0, `dropout-rate` 0..0.99. A YAML syntax error or an invalid value applies nothing.
 
 ---
 

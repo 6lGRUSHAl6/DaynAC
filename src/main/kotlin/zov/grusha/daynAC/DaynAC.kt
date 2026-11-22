@@ -72,6 +72,17 @@ class DaynAC : JavaPlugin(), Listener {
 
     private val recordingPlayers = mutableMapOf<UUID, RecordingSession>()
 
+    /**
+     * Гиперпараметры обучения из секции `training` config.yml. Читаются на главном потоке
+     * перед запуском /daynac train: в фоновом потоке конфиг трогать не нужно.
+     */
+    private data class TrainingSettings(
+        val learningRate: Double,
+        val patience: Int,
+        val l2Lambda: Double,
+        val dropoutRate: Double
+    )
+
     /** Сессия записи датасета: метка класса и идентификатор сессии (от `record <ник> legit|cheat` до `off`). */
     private data class RecordingSession(val label: String, val sessionId: String) {
         /** Сколько ударов сделано с начала этой сессии (счётчик окна внутри сессии, не суммарный). */
@@ -194,6 +205,53 @@ class DaynAC : JavaPlugin(), Listener {
         return layers.toIntArray()
     }
 
+    /**
+     * Читает гиперпараметры обучения из `training.*` переданного конфига. Отсутствующие
+     * ключи дают те же значения, что были зашиты в вызов train() раньше (lr 0.001,
+     * patience 15, L2 1e-4, dropout 0.15), так что старый config.yml продолжает работать.
+     * Ошибка бросает IllegalArgumentException с human-readable текстом: /daynac reload
+     * отклонит весь конфиг, а /daynac train не запустится.
+     */
+    private fun readTrainingSettings(source: FileConfiguration = config): TrainingSettings {
+        fun number(path: String, default: Double): Double {
+            val raw = source.get(path) ?: return default
+            // SnakeYAML не всегда распознаёт 1e-4 как число, поэтому строковую
+            // запись тоже принимаем — главное, чтобы она парсилась как double.
+            val value = when (raw) {
+                is Number -> raw.toDouble()
+                is String -> raw.trim().toDoubleOrNull()
+                    ?: throw IllegalArgumentException("$path должно быть числом, а не \"$raw\"")
+                else -> throw IllegalArgumentException("$path должно быть числом, а не \"$raw\"")
+            }
+            require(value.isFinite()) { "$path должно быть конечным числом" }
+            return value
+        }
+
+        fun integer(path: String, default: Int): Int {
+            val value = number(path, default.toDouble())
+            require(value == value.toInt().toDouble()) { "$path должно быть целым числом, получено $value" }
+            return value.toInt()
+        }
+
+        val learningRate = number("training.learning-rate", 0.001)
+        require(learningRate in 1e-6..1.0) {
+            "training.learning-rate должно быть в диапазоне 0.000001..1.0 (обычно 0.001–0.003), получено $learningRate"
+        }
+
+        val patience = integer("training.patience", 15)
+        require(patience >= 0) { "training.patience не может быть отрицательным, получено $patience" }
+
+        val l2Lambda = number("training.l2-lambda", 1e-4)
+        require(l2Lambda >= 0.0) { "training.l2-lambda не может быть отрицательным, получено $l2Lambda" }
+
+        val dropoutRate = number("training.dropout-rate", 0.15)
+        require(dropoutRate in 0.0..<1.0) {
+            "training.dropout-rate должно быть в диапазоне 0..0.99 (1.0 отключить не даст), получено $dropoutRate"
+        }
+
+        return TrainingSettings(learningRate, patience, l2Lambda, dropoutRate)
+    }
+
     override fun onDisable() {
         logger.info("Disabling plugin...")
         detectionEngine.shutdown()
@@ -247,12 +305,24 @@ class DaynAC : JavaPlugin(), Listener {
                         return true
                     }
 
+                    // Читаем и проверяем гиперпараметры до захвата слота: невалидный
+                    // config.yml не должен ни запускать обучение, ни блокировать его.
+                    val settings = try {
+                        readTrainingSettings()
+                    } catch (e: IllegalArgumentException) {
+                        sender.sendMessage("§c[DaynAC] ${e.message} — обучение не запущено.")
+                        return true
+                    }
+
                     // Занимаем слот обучения сразу, чтобы не было гонок
                     if (!training.compareAndSet(false, true)) {
                         sender.sendMessage("Обучение уже идёт, дождитесь завершения.")
                         return true
                     }
-                    sender.sendMessage("§a[DaynAC] Обучение запущено...")
+                    sender.sendMessage(
+                        "§a[DaynAC] Обучение запущено... §7(lr ${settings.learningRate}, l2 ${settings.l2Lambda}, " +
+                                "dropout ${settings.dropoutRate}, patience ${settings.patience})"
+                    )
 
                     thread(name = "DaynAC-Training", isDaemon = true) {
                         val senderPlayerId = (sender as? Player)?.uniqueId
@@ -327,9 +397,11 @@ class DaynAC : JavaPlugin(), Listener {
                                     samples = features,
                                     labels = labels,
                                     groups = groups,
-                                    learningRate = 0.001,
+                                    learningRate = settings.learningRate,
                                     maxEpochs = maxEpochs,
-                                    patience = 15,
+                                    patience = settings.patience,
+                                    l2Lambda = settings.l2Lambda,
+                                    dropoutRate = settings.dropoutRate,
                                     onProgress = { epoch, trainLoss, valLoss, valAcc ->
                                         val now = System.currentTimeMillis()
 
@@ -487,11 +559,13 @@ class DaynAC : JavaPlugin(), Listener {
 
                     // 1. Валидация всего нового конфига до каких-либо изменений.
                     // Любое исключение здесь — полный откат: ни reloadConfig(),
-                    // ни hit-logging, ни архитектура, ни пороги не тронуты,
-                    // как и обещано в README.
+                    // ни hit-logging, ни архитектура, ни пороги, ни параметры
+                    // обучения не тронуты, как и обещано в README.
                     val newLayers: IntArray
+                    val newTraining: TrainingSettings
                     try {
                         newLayers = readHiddenLayers(fileConfig)
+                        newTraining = readTrainingSettings(fileConfig)
                         detectionEngine.validate(fileConfig)
                     } catch (e: Exception) {
                         sender.sendMessage("§c[DaynAC] Перезагрузка отклонена — прежние настройки полностью в силе: ${e.message}")
@@ -552,6 +626,9 @@ class DaynAC : JavaPlugin(), Listener {
                                             " / окно усреднения ${detectionEngine.maxRecentPredictions}" +
                                             " / кулдаун алертов ${detectionEngine.alertCooldownSeconds} с"
                                 else thresholdsError) +
+                                "\n§7Параметры обучения (для следующего /daynac train): lr ${newTraining.learningRate}" +
+                                " / l2 ${newTraining.l2Lambda} / dropout ${newTraining.dropoutRate}" +
+                                " / patience ${newTraining.patience}" +
                                 (architectureNote?.let { "\n$it" } ?: "")
                     )
                 }
