@@ -113,13 +113,36 @@ class NeuralNetwork(
         layerSizes: IntArray,
         val learningRate: Double,
         val l2Lambda: Double,
-        val dropoutRate: Double
+        val dropoutRate: Double,
+        val fastMath: Boolean = false
     ) {
         val activations = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
         val masks = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
         val deltas = Array(layerSizes.size - 1) { DoubleArray(layerSizes[it + 1]) }
         var biasCorrection1 = 1.0
         var biasCorrection2 = 1.0
+    }
+
+    /**
+     * Та же последовательность, что у java.util.Random, но seed хранится в
+     * обычном Long. В JDK next(bits) идёт через AtomicLong с CAS;
+     * в однопоточном обучении это чистая трата времени (десятки миллионов CAS
+     * за эпоху на dropout-маски). nextDouble()/nextGaussian()/nextInt() унаследованы
+     * и вызывают наш next(bits), поэтому распределение и порядок чисел не меняются.
+     */
+    internal class FastRandom(seed: Long) : Random(0L) {
+        private var fastSeed: Long = (seed xor MULTIPLIER) and MASK
+
+        override fun next(bits: Int): Int {
+            fastSeed = (fastSeed * MULTIPLIER + ADDEND) and MASK
+            return (fastSeed ushr (48 - bits)).toInt()
+        }
+
+        private companion object {
+            const val MULTIPLIER = 0x5DEECE66DL
+            const val ADDEND = 0xBL
+            const val MASK = 0x0000FFFFFFFFFFFFL
+        }
     }
 
     /**
@@ -200,6 +223,14 @@ class NeuralNetwork(
         private const val BETA1 = 0.9
         private const val BETA2 = 0.999
         private const val ADAM_EPS = 1e-8
+
+        /**
+         * Опциональный быстрый путь шага Adam. Включается только явным
+         * -Ddaynac.training.fast-math=true (для бенчмарка), по умолчанию выключен:
+         * результат отличается от оригинала в последних битах.
+         */
+        private val FAST_MATH = System.getProperty("daynac.training.fast-math", "false")
+            .equals("true", ignoreCase = true)
         private const val MAGIC = 0x44414E41
         private const val FORMAT_VERSION = 3   // v2: + метрики обучения; v3: + версия признаков.
         // Блок test-сета добавлен ниже метрик как необязательный хвост (версию не меняли,
@@ -433,12 +464,12 @@ class NeuralNetwork(
             lastTestSet = null
 
             val local = snapshot.get().deepCopy()
-            val split = splitIndices(labels, groups, Random(seed))
+            val split = splitIndices(labels, groups, FastRandom(seed))
 
             initWeights(local)
             computeNormStats(local, features, split.train)
 
-            val context = StepContext(layerSizes, learningRate, l2Lambda, dropoutRate)
+            val context = StepContext(layerSizes, learningRate, l2Lambda, dropoutRate, FAST_MATH)
             val best = local.deepCopy()
             val order = split.train.copyOf()
             val stepInput = DoubleArray(inputSize)
@@ -451,7 +482,7 @@ class NeuralNetwork(
             var epoch = 0
 
             while (epoch < maxEpochs) {
-                val epochRng = Random(seed + epoch + 1)
+                val epochRng = FastRandom(seed + epoch + 1)
                 order.shuffleInPlace(epochRng)
 
                 val t = (epoch + 1).toDouble()
@@ -724,7 +755,7 @@ class NeuralNetwork(
 
     /** He-инициализация весов (оптимальна для ReLU), bias и моменты Adam — нули. */
     private fun initWeights(state: Weights) {
-        val rng = Random(seed)
+        val rng = FastRandom(seed)
         for (l in state.weights.indices) {
             val scale = sqrt(2.0 / layerSizes[l])
             state.biases[l].fill(0.0)
@@ -797,10 +828,21 @@ class NeuralNetwork(
             }
         }
 
+        if (ctx.fastMath) updateWeightsFast(state, ctx, features)
+        else updateWeights(state, ctx, features)
+
+        return prediction
+    }
+
+    /** Оригинальный шаг Adam: делим m и v на bias correction на каждом весе. */
+    private fun updateWeights(state: Weights, ctx: StepContext, features: DoubleArray) {
         val learningRate = ctx.learningRate
         val l2Lambda = ctx.l2Lambda
         val bias1 = ctx.biasCorrection1
         val bias2 = ctx.biasCorrection2
+        val layerCount = state.weights.size
+        val activations = ctx.activations
+        val deltas = ctx.deltas
 
         for (l in 0 until layerCount) {
             val prev = if (l == 0) features else activations[l - 1]
@@ -835,8 +877,53 @@ class NeuralNetwork(
                 biases[j] -= learningRate * (mb / bias1) / (sqrt(vb / bias2) + ADAM_EPS)
             }
         }
+    }
 
-        return prediction
+    /**
+     * Опциональный (~system property daynac.training.fast-math) вариант шага Adam:
+     * деление на bias correction вынесено из цикла по весам. Арифметика меняется
+     * в последних битах, поэтому путь по умолчанию остаётся прежним.
+     */
+    private fun updateWeightsFast(state: Weights, ctx: StepContext, features: DoubleArray) {
+        val lrOverBias1 = ctx.learningRate / ctx.biasCorrection1
+        val invBias2 = 1.0 / ctx.biasCorrection2
+        val l2Lambda = ctx.l2Lambda
+        val layerCount = state.weights.size
+        val activations = ctx.activations
+        val deltas = ctx.deltas
+
+        for (l in 0 until layerCount) {
+            val prev = if (l == 0) features else activations[l - 1]
+            val delta = deltas[l]
+            val weights = state.weights[l]
+            val mWeights = state.mWeights[l]
+            val vWeights = state.vWeights[l]
+            val biases = state.biases[l]
+            val mBiases = state.mBiases[l]
+            val vBiases = state.vBiases[l]
+
+            for (j in weights.indices) {
+                val dj = delta[j]
+                val wj = weights[j]
+                val mj = mWeights[j]
+                val vj = vWeights[j]
+
+                for (k in wj.indices) {
+                    val grad = Math.min(CLAMP, Math.max(-CLAMP, dj * prev[k] + l2Lambda * wj[k]))
+                    val m = BETA1 * mj[k] + (1.0 - BETA1) * grad
+                    val v = BETA2 * vj[k] + (1.0 - BETA2) * grad * grad
+                    mj[k] = m
+                    vj[k] = v
+                    wj[k] -= lrOverBias1 * m / (sqrt(v * invBias2) + ADAM_EPS)
+                }
+
+                val mb = BETA1 * mBiases[j] + (1.0 - BETA1) * dj
+                val vb = BETA2 * vBiases[j] + (1.0 - BETA2) * dj * dj
+                mBiases[j] = mb
+                vBiases[j] = vb
+                biases[j] -= lrOverBias1 * mb / (sqrt(vb * invBias2) + ADAM_EPS)
+            }
+        }
     }
 
     private fun bceLoss(prediction: Double, label: Double): Double {

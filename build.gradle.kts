@@ -55,6 +55,31 @@ tasks {
         useJUnitPlatform()
     }
 
+    // Headless-бенчмарк обучения: тот же датасет/конфиг/код, что /daynac train, но без сервера.
+    // Пример: ./gradlew benchTrain --args="run/plugins/DaynAC 200 0 build/reports/bench.jsonl"
+    register<JavaExec>("benchTrain") {
+        group = "benchmark"
+        description = "Runs the training pipeline headlessly and prints deterministic metrics + timings"
+        classpath = sourceSets.test.get().runtimeClasspath
+        mainClass.set("zov.grusha.daynAC.ml.TrainBenchmarkKt")
+        jvmArgs("-Xms2G", "-Xmx2G")
+        if (providers.gradleProperty("fastMath").isPresent) {
+            jvmArgs("-Ddaynac.training.fast-math=true")
+        }
+    }
+
+    // Тот же бенчмарк, но с JFR-записью для поиска горячих методов.
+    register<JavaExec>("benchTrainJfr") {
+        group = "benchmark"
+        description = "Same benchmark with a JFR recording in build/reports/bench.jfr"
+        classpath = sourceSets.test.get().runtimeClasspath
+        mainClass.set("zov.grusha.daynAC.ml.TrainBenchmarkKt")
+        jvmArgs(
+            "-Xms2G", "-Xmx2G",
+            "-XX:StartFlightRecording=filename=build/reports/bench.jfr,settings=profile,dumponexit=true"
+        )
+    }
+
     runServer {
         // Configure the Minecraft version for our task.
         // This is the only required configuration besides applying the plugin.

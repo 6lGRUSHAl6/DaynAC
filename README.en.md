@@ -245,6 +245,11 @@ These columns are not used for training; they are used to split the dataset. Fil
 
 A large gap between train and validation accuracy means the data is insufficient or too uniform.
 
+> [!NOTE]
+> An optional `-Ddaynac.training.fast-math=true` JVM flag enables a faster Adam step (bias-correction divisions are hoisted out of the per-weight loop). On the sample dataset it trained ~15% faster with identical accuracy/FPR and a loss difference below 1e-5. It is disabled by default: enable it only after comparing the metrics on your own dataset.
+>
+> The same run can be measured without a server: `./gradlew benchTrain --args="run/plugins/DaynAC 1000 -1"`, or with the fast path via `./gradlew benchTrain -PfastMath --args="run/plugins/DaynAC 1000 -1"`. The benchmark reads the same `config.yml`/CSV files and prints timings, metrics and the SHA-256 of `model.dat`. The `run/plugins/DaynAC` directory is created by the server and is not tracked in git, so it must exist locally before measuring.
+
 ### `/daynac eval`
 
 Shows precision, recall, F1 and FPR on the test set for a range of thresholds (0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99), with 95% Wilson confidence intervals; the current `reduce-threshold` is marked in the table. A threshold is recommended only if the **upper bound** of the FPR is ≤ 1%. Even with zero errors, this requires ≥ 381 legit windows in the test set (roughly 1,900 legit vectors in the whole dataset). Until you have that much data, the plugin will tell you plainly that a low FPR is not statistically confirmed.
