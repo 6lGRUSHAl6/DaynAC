@@ -8,7 +8,7 @@ load: POSTWORLD
 commands:
   daynac:
     description: Daynac anticheat command
-    usage: /daynac <ver|record|train|info|debug|allinfo|reset|eval|clearflags|exempt|reload>
+    usage: /daynac <ver|record|train|info|debug|allinfo|reset|eval|dataset|clearflags|exempt|reload>
 
 permissions:
   daynac.admin:
@@ -20,6 +20,7 @@ permissions:
       daynac.spectate: true
       daynac.record: true
       daynac.train: true
+      daynac.dataset: true
       daynac.config: true
       daynac.exempt.manage: true
   daynac.view:
@@ -36,6 +37,9 @@ permissions:
     default: false
   daynac.train:
     description: Обучение и оценка модели - /daynac train, eval
+    default: false
+  daynac.dataset:
+    description: Архивирование датасета - /daynac dataset export, verify, import
     default: false
   daynac.config:
     description: /daynac reload и debug (меняет config.yml)

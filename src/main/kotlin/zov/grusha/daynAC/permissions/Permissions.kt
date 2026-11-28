@@ -15,6 +15,7 @@ object Permissions {
     const val SPECTATE = "daynac.spectate"            // телепорт из GUI и возврат через /daynac reset
     const val RECORD = "daynac.record"                // запись датасета (даёт игроку иммунитет на время сессии)
     const val TRAIN = "daynac.train"                  // train, eval
+    const val DATASET = "daynac.dataset"              // dataset export/verify/import (архивирование датасета)
     const val CONFIG = "daynac.config"                // reload, debug, clearflags
     const val EXEMPT = "daynac.exempt"                // иммунитет к детекции
     const val EXEMPT_MANAGE = "daynac.exempt.manage"  // выдача/снятие временных исключений
@@ -28,6 +29,7 @@ object Permissions {
         "record" to RECORD,
         "train" to TRAIN,
         "eval" to TRAIN,
+        "dataset" to DATASET,
         "clearflags" to CONFIG,
         "exempt" to EXEMPT_MANAGE,
         "reload" to CONFIG,

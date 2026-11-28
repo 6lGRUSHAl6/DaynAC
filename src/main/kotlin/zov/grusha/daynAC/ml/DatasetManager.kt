@@ -1,16 +1,18 @@
 package zov.grusha.daynAC.ml
 
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 
 class DatasetManager(
-    private val dataFolder: File,
-    private val windowSize: Int = 16
+    internal val dataFolder: File,
+    internal val windowSize: Int = 16
 ) {
 
     /**
@@ -59,12 +61,12 @@ class DatasetManager(
         const val MAX_DETAILED_WARNINGS = 5
     }
 
-    private val legitVectorFile = File(dataFolder, "legit_vectors.csv")
-    private val cheatVectorFile = File(dataFolder, "cheat_vectors.csv")
-    private val saltFile = File(dataFolder, "dataset.salt")
+    internal val legitVectorFile = File(dataFolder, "legit_vectors.csv")
+    internal val cheatVectorFile = File(dataFolder, "cheat_vectors.csv")
+    internal val saltFile = File(dataFolder, "dataset.salt")
 
     /** Версия определения признаков, на которой записан датасет (см. [FeatureExtractor.FEATURE_VERSION]). */
-    private val featureVersionFile = File(dataFolder, "dataset.featver")
+    internal val featureVersionFile = File(dataFolder, "dataset.featver")
 
     /** Строки, ожидающие записи. Publication через ConcurrentLinkedQueue даёт happens-before. */
     private data class PendingWrite(
@@ -77,10 +79,46 @@ class DatasetManager(
     private val pendingWrites = ConcurrentLinkedQueue<PendingWrite>()
 
     /** Число числовых признаков в одной строке вектора (без метаданных). */
-    private val featureCount = windowSize * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
+    internal val featureCount = windowSize * FeatureExtractor.PER_HIT_FEATURES + FeatureExtractor.AGGREGATE_FEATURES
+
+    /**
+     * Даёт архиватору тот же мьютекс, под которым идут [writeVectorSample],
+     * [readCompactDataset] и [getDatasetSummary]: снимок датасета не должен
+     * пересекаться с записью или чтением, которые уже работают с CSV.
+     */
+    @Synchronized
+    fun <T> withDatasetLock(action: () -> T): T = action()
+
+    /** Признак «идёт export/import архива»: две изменяющие операции одновременно не допускаются. */
+    private val archiveBusy = AtomicBoolean(false)
+
+    /**
+     * Выполняет [action] как единственную изменяющую операцию архива. Вторая параллельная
+     * попытка (из другой команды или потока) сразу получает понятную ошибку, а не гонку за файлы.
+     */
+    internal fun <T> runExclusiveArchiveOp(action: () -> T): T {
+        check(archiveBusy.compareAndSet(false, true)) {
+            "уже выполняется другая операция с архивом датасета — дождитесь её завершения"
+        }
+        try {
+            return action()
+        } finally {
+            archiveBusy.set(false)
+        }
+    }
+
+    /** Идёт ли сейчас export/import архива (чтобы, например, не стартовать обучение посреди импорта). */
+    fun isArchiveBusy(): Boolean = archiveBusy.get()
+
+    /** Версия признаков, на которой записан датасет (нет файла = версия 1, как у старых датасетов). */
+    internal fun storedFeatureVersion(): Int =
+        featureVersionFile.takeIf { it.exists() }
+            ?.readText()?.trim()?.toIntOrNull()
+            ?: LEGACY_FEATURE_VERSION
 
     /** Соль для player_hash: хэши стабильны на этом сервере, но не раскрывают UUID. */
-    private val salt: String
+    @Volatile
+    private var salt: String = ""
 
     init {
         if (!dataFolder.exists()) dataFolder.mkdirs()
@@ -101,9 +139,7 @@ class DatasetManager(
      */
     private fun archiveDatasetIfFeatureVersionChanged() {
         val current = FeatureExtractor.FEATURE_VERSION
-        val stored = featureVersionFile.takeIf { it.exists() }
-            ?.readText()?.trim()?.toIntOrNull()
-            ?: LEGACY_FEATURE_VERSION
+        val stored = storedFeatureVersion()
 
         if (stored != current) {
             for (file in listOf(legitVectorFile, cheatVectorFile)) {
@@ -139,6 +175,11 @@ class DatasetManager(
         val created = bytes.joinToString("") { "%02x".format(it) }
         saltFile.writeText(created)
         return created
+    }
+
+    /** Перечитать соль после восстановления архива: иначе новые хэши не совпадут со старыми. */
+    internal fun reloadSalt() {
+        salt = loadOrCreateSalt()
     }
 
     /**
@@ -180,7 +221,7 @@ class DatasetManager(
                 if (isFirstLine) { isFirstLine = false; return@forEachLine }
                 val line = raw.trim()
                 if (line.isEmpty()) return@forEachLine
-                if (line.split(',').size == featureCount) {
+                if (columnCount(line) == featureCount) {
                     out.write("$line,,\n")
                     migrated++
                 } else {
@@ -196,7 +237,23 @@ class DatasetManager(
     }
 
     /** Есть ли в строке ровно featureCount (или featureCount + 2) колонок. */
-    private fun columnCount(line: String): Int = line.trim().split(',').size
+    private fun columnCount(line: String): Int {
+        var commas = 0
+        for (ch in line.trim()) if (ch == ',') commas++
+        return commas + 1
+    }
+
+    /** Поле с номером [index] (с нуля) без разбиения всей строки на подстроки. */
+    private fun fieldAt(line: String, index: Int): String {
+        var start = 0
+        repeat(index) {
+            val comma = line.indexOf(',', start)
+            if (comma < 0) return ""
+            start = comma + 1
+        }
+        val end = line.indexOf(',', start).let { if (it < 0) line.length else it }
+        return line.substring(start, end)
+    }
 
     private fun hasMetaColumns(columns: Int): Boolean = columns == featureCount + META_COLUMNS.size
 
@@ -245,6 +302,8 @@ class DatasetManager(
         val hashes = arrayOfNulls<String>(total)
 
         var written = 0
+        var legitWritten = 0
+        var cheatWritten = 0
         fun loadFile(file: File, label: Double) {
             if (!file.exists()) return
             var lineNumber = 0
@@ -263,6 +322,7 @@ class DatasetManager(
                 lineNumber++
                 val trimmed = line.trim()
                 if (trimmed.isEmpty() || trimmed.startsWith("h0")) return@forEachLine
+                if (written >= total) return@forEachLine // файл вырос между проходами: массивы уже выделены
                 val meta = try {
                     parseInto(line, features, written * featureCount)
                 } catch (e: IllegalArgumentException) {
@@ -274,6 +334,7 @@ class DatasetManager(
                 sessions[written] = meta.sessionId
                 hashes[written] = meta.playerHash
                 written++
+                if (label == 0.0) legitWritten++ else cheatWritten++
             }
             if (skipped > 0) {
                 System.err.println("[INFO] [${file.name}] Всего пропущено некорректных строк: $skipped")
@@ -291,8 +352,10 @@ class DatasetManager(
             sessionIds = if (needCopy) sessions.copyOf(written) else sessions,
             playerHashes = if (needCopy) hashes.copyOf(written) else hashes,
             sampleCount = written,
-            legitCount = labels.count { it == 0.0 },
-            cheatCount = labels.count { it == 1.0 }
+            // Раньше считалось по labels целиком: при пропущенных строках хвост массива (нули)
+            // записывался в legit, и счётчик класса завышался.
+            legitCount = legitWritten,
+            cheatCount = cheatWritten
         )
     }
 
@@ -357,11 +420,11 @@ class DatasetManager(
                 for (line in lines) {
                     val trimmed = line.trim()
                     if (trimmed.isEmpty() || trimmed.startsWith("h0")) continue
-                    val parts = trimmed.split(',')
-                    if (!isValidColumns(parts.size)) continue
+                    val columns = columnCount(trimmed)
+                    if (!isValidColumns(columns)) continue
                     vectors++
-                    if (hasMetaColumns(parts.size)) {
-                        val session = parts[featureCount].trim()
+                    if (hasMetaColumns(columns)) {
+                        val session = fieldAt(trimmed, featureCount).trim()
                         if (session.isNotEmpty()) sessions.add(session)
                     }
                 }
@@ -416,15 +479,26 @@ class DatasetManager(
     @Synchronized
     fun flushPendingWrites(): Int {
         if (pendingWrites.isEmpty()) return 0
-        val byFile = HashMap<File, StringBuilder>()
-        var count = 0
+        val byFile = LinkedHashMap<File, MutableList<PendingWrite>>()
         while (true) {
             val entry = pendingWrites.poll() ?: break
-            byFile.getOrPut(entry.file) { StringBuilder() }
-                .append(csvRow(entry.vector, entry.sessionId, entry.playerHash))
-            count++
+            byFile.getOrPut(entry.file) { ArrayList() }.add(entry)
         }
-        for ((file, text) in byFile) file.appendText(text.toString())
+        var count = 0
+        var failure: IOException? = null
+        for ((file, entries) in byFile) {
+            val text = StringBuilder()
+            for (entry in entries) text.append(csvRow(entry.vector, entry.sessionId, entry.playerHash))
+            try {
+                file.appendText(text.toString())
+                count += entries.size
+            } catch (e: IOException) {
+                // Не теряем уже снятые с очереди векторы: вернём их и повторим при следующем сбросе.
+                pendingWrites.addAll(entries)
+                if (failure == null) failure = e else failure.addSuppressed(e)
+            }
+        }
+        failure?.let { throw it }
         return count
     }
 }

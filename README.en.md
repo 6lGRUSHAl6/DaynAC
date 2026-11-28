@@ -147,6 +147,9 @@ Each command requires its own permission (see [Permissions](#permissions)); `day
 | `/daynac record <player> <legit\|cheat\|off>` | Record dataset samples for a player | `daynac.record` |
 | `/daynac train` | Train the model on the collected dataset | `daynac.train` |
 | `/daynac eval` | Test-set metrics across a range of thresholds | `daynac.train` |
+| `/daynac dataset export [name] [--no-salt]` | Create a verified `.dac` dataset archive (includes the salt by default) | `daynac.dataset` |
+| `/daynac dataset verify <name>` | Fully verify an archive without touching the CSVs | `daynac.dataset` |
+| `/daynac dataset import <name> [--replace-salt]` | Restore the CSVs byte-for-byte from a verified archive | `daynac.dataset` |
 | `/daynac info` | Dataset, sessions, training metrics, model state and architecture, thresholds, punishment mode, number of exemptions | `daynac.view` |
 | `/daynac ver [player]` | Without a name: plugin status; with a name: the player's last and average score and hit count in the current window | `daynac.view` |
 | `/daynac allinfo` | Player-monitoring GUI (teleporting from it needs `daynac.spectate`) | `daynac.view` |
@@ -155,6 +158,8 @@ Each command requires its own permission (see [Permissions](#permissions)); `day
 | `/daynac clearflags <player>` | Manually reset a player's flags and current window (also works for offline players) | `daynac.config` |
 | `/daynac exempt <player> [time\|off]` | Grant a temporary exemption from detection (`30s`, `5m`, `2h`, `1d`); without time - permanent; `off` - remove | `daynac.exempt.manage` |
 | `/daynac reload` | Reload `config.yml` on the fly: thresholds, punishment settings, `hidden-layers` and training hyperparameters are applied immediately; on an error (broken YAML, invalid values) the previous settings stay in force. While `/daynac train` is running, an architecture change is postponed until it finishes | `daynac.config` |
+
+`/daynac dataset ...` commands run on a separate thread and reply when done; `export` and `import` are refused during `/daynac train` or another archive operation, while `verify` is read-only. The transfer workflow, flags and headless usage are described in [Dataset archive `.dac`](#dataset-archive-dac).
 
 ---
 
@@ -169,6 +174,7 @@ Permissions are checked per subcommand, so access can be granted in parts (for e
 | `daynac.spectate` | teleport to a player from `/daynac allinfo` in spectator mode and return via `/daynac reset` |
 | `daynac.record` | `/daynac record` |
 | `daynac.train` | `/daynac train`, `eval` |
+| `daynac.dataset` | `/daynac dataset export`, `verify`, `import` (dataset archiving) |
 | `daynac.config` | `/daynac reload`, `debug`, `clearflags` |
 | `daynac.exempt.manage` | `/daynac exempt` (grant and revoke temporary exemptions) |
 | `daynac.exempt` | permanent exemption from detection; **not** part of `daynac.admin` |
@@ -411,9 +417,80 @@ Everything is stored locally in `plugins/DaynAC/`. There is no telemetry.
 | `legit_vectors.csv`, `cheat_vectors.csv` | the dataset (vectors + `session_id`, `player_hash`) |
 | `dataset.salt` | salt for `player_hash`; do not lose or publish it |
 | `dataset.featver` | the feature version the dataset was collected with |
+| `*.dac` | compressed dataset archive for transfer/long-term storage (see below) |
 | `model.dat` | the trained model (weights, normalization, feature version, train/validation/test metrics, test set and split) |
 | `exemptions.yml` | temporary exemptions from detection (UUID + expiration time) |
-| `*.bak`, `*.featv<N>.bak`, `model.dat.old` | backups made on a format or feature-version change |
+| `*.bak`, `*.featv<N>.bak`, `model.dat.old` | backups made on a format or feature-version change; `*.preimport-*.bak` — copies made before restoring an archive |
+
+### Dataset archive `.dac`
+
+**Why.** A `.dac` is a snapshot of the dataset for moving it to another server, long-term storage, or a "restore point" before a feature-version change. It is **not a working store**: the plugin keeps appending to plain `legit_vectors.csv` / `cheat_vectors.csv`, and training always reads the CSVs. Unpacking is needed only once — before training on a transferred dataset.
+
+The archive contains only the two CSVs and (by default) `dataset.salt`. `model.dat`, `config.yml` and `exemptions.yml` are **not** included — copy them separately when migrating a server if you need them.
+
+#### Quick workflow
+
+1. On the source server: `/daynac dataset export` (safe on a running server). Without a name it creates `dataset-YYYYMMDD-HHMMSS.dac` in `plugins/DaynAC/`. The command is asynchronous; an existing archive with that name is replaced only after the new one passes its self-check. Note what `verify` reports.
+2. Copy the `.dac` to the target server by any means (an archive containing the salt — over a secure channel only).
+3. On the target: `/daynac dataset verify <name>` to see the feature version, window, row counts and whether the salt is present. Verify is read-only and never changes the dataset.
+4. `/daynac dataset import <name>` to restore the CSVs. A different feature version, window or feature count is refused. A different salt requires an explicit `--replace-salt` (see below).
+5. Check `/daynac info` and run `/daynac train` if needed. Import does not start training by itself.
+
+#### Commands and flags
+
+| Command | Flags | Behavior |
+|---|---|---|
+| `/daynac dataset export [name]` | `--no-salt` — leave the salt out | Takes a consistent CSV snapshot under the dataset lock, writes it to a temporary file, reads it back and verifies it, then publishes the archive. Salt is included by default. |
+| `/daynac dataset verify <name>` | none | Full check: signature, format version, CRC of every chunk, archive SHA-256, size and SHA-256 of each restored CSV, training-row counts. Writes nothing. |
+| `/daynac dataset import <name>` | `--replace-salt` — allow replacing the local salt | Validates the archive, checks feature version/window/salt, creates backups and atomically replaces the CSVs. Rolls back on any error. |
+
+An archive name must be flat and inside `plugins/DaynAC/` (letters, digits, `.`, `_`, `-`; no paths or `..`). The `.dac` extension may be omitted. Flags can appear anywhere and are never treated as a filename. Tab completion offers the subcommands, `.dac` files in the plugin folder and the flags.
+
+`export` and `import` are refused while `/daynac train` is running or another archive operation is in progress: this protects the dataset from concurrent writers. `verify` can be run at any time.
+
+#### Headless usage
+
+The same three operations are available through Gradle tasks from the project root (same archiver code, same checks):
+
+```text
+./gradlew datasetExport  --args="run/plugins/DaynAC run/dataset.dac"
+./gradlew datasetExport  --args="run/plugins/DaynAC run/public.dac --no-salt"
+./gradlew datasetVerify  --args="run/dataset.dac"
+./gradlew datasetImport  --args="run/dataset.dac run/plugins/DaynAC"
+./gradlew datasetImport  --args="run/dataset.dac run/plugins/DaynAC --replace-salt"
+```
+
+Flags are separated from positional arguments and work in any position. **Unlike the in-game commands, the CLI does not share the server's lock**: run `export`/`import` with the server stopped, otherwise the snapshot may miss vectors still sitting in the write buffer. `verify` only reads the archive and is safe while the server runs.
+
+#### What is guaranteed
+
+- **Byte-for-byte reversible.** Regular rows are stored as raw `Double` bits (no float rounding), column-major, in blocks of 128 rows. Rows that cannot be printed back verbatim (unusual number formatting, empty lines, headers, junk) are stored verbatim in a raw chunk. Restored CSVs match the originals byte for byte, including CRLF and trailing line endings.
+- **Manifest.** The header records the format version, feature version, window size, feature count, per-class training-row counts, creation time, salt SHA-256 and the SHA-256 of each source CSV. An archive from another feature version, window or feature schema is refused.
+- **Two checks.** CRC32 of every chunk's payload plus SHA-256 over all bytes up to the end marker. A bad chunk, a truncated file or trailing bytes are rejected by `import` and `verify` **before** any file is replaced.
+- **Checked before publishing.** `export` writes a temporary file, reads it back with the same decoder, checks it against the manifest and only then atomically publishes it; the temporary file is flushed to disk (`fsync`). Stale leftovers from interrupted operations older than an hour are cleaned up automatically.
+- **Atomic install with rollback.** Before replacement, the current CSVs are copied to `*.preimport-*.bak`. Pending vectors are first flushed into the **current** files so they cannot mix with the restored dataset. If anything fails after the first replacement, the previous files are restored from backups; if the rollback itself fails, the backups are deliberately kept. Backups also remain after a successful import — remove them manually once you are satisfied with the dataset.
+- **Salt under control.** By default the archive includes `dataset.salt`, so `player_hash` values match hashes of newly recorded players. Comparison trims whitespace. If the server's salt differs, import refuses to replace it without `--replace-salt`.
+
+#### Salt in detail
+
+`dataset.salt` is a secret: `player_hash` values are derived from it. **An archive containing the salt is sensitive** — transfer it only over a secure channel. For public distribution use `--no-salt`: such an archive restores the CSVs but leaves the target server's local salt untouched.
+
+`--replace-salt` is only for a deliberate switch to a different salt (for example, moving to a clean server with its own salt). It changes `player_hash` for **all future** samples, so older rows will carry hashes made with the previous salt. The old salt file is preserved as `*.preimport-*.bak`. If the salts already match, `--replace-salt` replaces nothing.
+
+#### Format (for the curious)
+
+The format is versioned (currently v1) and needs no external libraries: `deflate` comes from `java.util.zip` in the JDK. Roughly:
+
+```text
+DAYNAC01 | int version | int flags | int featVer | int window | int featCount
+         | int legitRows | int cheatRows | long createdAt | byte[32] saltSha
+chunks: [type:1][payloadLen:4][deflateLen:4][crc32:4][deflate(payload)] ...
+        1 FILE (length + SHA-256 + plan), 2 PLAN (0=numeric, 1=raw line),
+        3 NUMERIC (double bits, column-major), 4 RAW (length-prefixed lines), 5 SALT, 0 END
+SHA-256(all bytes through END) | DACEND01
+```
+
+Decoder limits protect against a hostile or broken archive: lines up to 16 MB, plan up to 16 MB, chunk payload up to 64 MB. On the sample dataset (1863 rows, ~10.6 MB of CSV) the archive is ~3.6 MB; data is written in chunks, so memory use does not grow with the dataset.
 
 ---
 
@@ -440,6 +517,7 @@ src/main/kotlin/zov/grusha/daynAC/
 ├── ml/
 │   ├── FeatureExtractor.kt# hit window → 343-feature vector
 │   ├── DatasetManager.kt  # CSV datasets, sessions, feature version
+│   ├── DatasetArchive.kt  # lossless .dac archive: manifest, CRC/SHA, atomic import
 │   ├── NeuralNetwork.kt   # MLP + backprop, lock-free inference
 │   └── Stats.kt           # Wilson intervals and sample-size estimate for /daynac eval
 ├── detection/
@@ -456,6 +534,7 @@ Key engineering decisions:
 - **Atomic settings swap.** Thresholds live in an immutable snapshot behind a single `@Volatile` reference: `/daynac reload` validates the whole config and swaps the settings in one reference assignment. Every property read returns either the fully old or the fully new snapshot; briefly mixing values from the two sets within a single hit is safe because each set is validated on its own.
 - **Data-leakage protection.** Non-overlapping windows when recording, session/player-based splitting, class stratification, and normalization from the training portion only.
 - **Feature versioning.** Old datasets and models are never silently mixed with new ones.
+- **Custom dataset archiver.** `.dac` stores doubles bit-exactly and restores CSVs verbatim; the manifest, CRC32/SHA-256, export self-check and atomic import with backups prevent a corrupt or incompatible archive from replacing the working dataset.
 - **Bounded memory growth.** Per-player state maps are cleaned by TTL (1 hour), the score log is capped at 100 entries, and expired exemptions are removed lazily and on a schedule.
 - **Single-threaded data.** `HitTracker` and the detection handlers run only on the Bukkit main thread; only `predict` is computed asynchronously.
 - **Version compatibility.** Cosmetic and auxiliary calls (action bar, kick/ban) have a fallback path on `LinkageError`.

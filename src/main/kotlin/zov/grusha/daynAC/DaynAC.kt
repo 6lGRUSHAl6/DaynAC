@@ -16,6 +16,7 @@ import zov.grusha.daynAC.tracking.SnapshotTracker
 import java.util.Locale
 import java.util.UUID
 import zov.grusha.daynAC.tracking.HitTracker
+import zov.grusha.daynAC.ml.DatasetArchive
 import zov.grusha.daynAC.ml.DatasetManager
 import zov.grusha.daynAC.ml.FeatureExtractor
 import zov.grusha.daynAC.ml.NeuralNetwork
@@ -139,7 +140,12 @@ class DaynAC : JavaPlugin(), Listener {
         // раньше appendText на каждый 16-й удар открывал файл прямо в тике сервера.
         // Запись идёт в async-пуле; остаток сбрасывается в onDisable.
         Bukkit.getScheduler().runTaskTimerAsynchronously(this, Runnable {
-            datasetManager.flushPendingWrites()
+            try {
+                datasetManager.flushPendingWrites()
+            } catch (e: java.io.IOException) {
+                // Векторы возвращены в очередь и будут записаны при следующем сбросе.
+                logger.warning("Не удалось записать датасет, повтор через 5 с: ${e.message}")
+            }
         }, 100L, 100L)
 
         // Применяем архитектуру из конфига до загрузки модели: если hidden-layers
@@ -272,7 +278,11 @@ class DaynAC : JavaPlugin(), Listener {
         logger.info("Disabling plugin...")
         detectionEngine.shutdown()
         allInfoGUI.shutdown()
-        datasetManager.flushPendingWrites()
+        try {
+            datasetManager.flushPendingWrites()
+        } catch (e: java.io.IOException) {
+            logger.severe("Не удалось сбросить буфер датасета при выключении: ${e.message}")
+        }
     }
 
     /** Выполняет действие на главном потоке; после onDisable задачи молча отбрасываются. */
@@ -341,6 +351,50 @@ class DaynAC : JavaPlugin(), Listener {
     /** Имена, найденные командами асинхронно; обращение к ним не блокирует главный поток. */
     private val nameCache = java.util.concurrent.ConcurrentHashMap<UUID, String>()
 
+    /** Имя архива из команды: только плоское имя внутри plugins/DaynAC, без путей и без ведущего '-' (это флаг). */
+    private fun datasetArchiveFile(name: String): File? {
+        if (name.isEmpty() || name.length > 128 || !name.matches(Regex("[A-Za-z0-9_.-]+"))) return null
+        if (name.startsWith("..") || name.startsWith("-")) return null
+        val file = File(dataFolder, if (name.endsWith(".dac", ignoreCase = true)) name else "$name.dac")
+        return file.canonicalFile.takeIf { it.parentFile == dataFolder.canonicalFile }
+    }
+
+    /** Архивирование датасета может занять секунды — не держим главный поток сервера. */
+    private fun runDatasetJob(sender: CommandSender, work: () -> String) {
+        val senderPlayerId = (sender as? Player)?.uniqueId
+        fun report(message: String) {
+            val plain = message.replace("§[0-9a-fk-or]".toRegex(), "")
+            if (!isEnabled) { logger.info(plain); return }
+            try {
+                Bukkit.getScheduler().runTask(this@DaynAC, Runnable {
+                    val target: CommandSender? =
+                        if (senderPlayerId != null) Bukkit.getPlayer(senderPlayerId) else sender
+                    if (target != null) target.sendMessage(message) else logger.info(plain)
+                })
+            } catch (_: IllegalPluginAccessException) {
+                logger.info(plain)
+            }
+        }
+        thread(name = "DaynAC-Dataset", isDaemon = true) {
+            try {
+                report(work())
+            } catch (e: Exception) {
+                val reason = e.message ?: e.javaClass.simpleName
+                logger.warning("Ошибка архива датасета: $reason")
+                report("§c[DaynAC] $reason")
+            }
+        }
+    }
+
+    /** Почему export/import сейчас запускать нельзя (null — можно). verify только читает архив и не блокируется. */
+    private fun datasetBlockReason(): String? = when {
+        training.get() ->
+            "§c[DaynAC] Дождитесь завершения /daynac train: архив не должен менять датасет во время обучения."
+        datasetManager.isArchiveBusy() ->
+            "§c[DaynAC] Уже идёт другая операция с архивом датасета — дождитесь её завершения."
+        else -> null
+    }
+
     override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<out String>): Boolean {
         if (command.name.equals("daynac", ignoreCase = true)) {
             // Право проверяется по подкомандам. Пустая или неизвестная подкоманда требует
@@ -386,6 +440,10 @@ class DaynAC : JavaPlugin(), Listener {
                 args.isNotEmpty() && args[0] == "train" -> {
                     if (training.get()) {
                         sender.sendMessage("Обучение уже идёт, дождитесь завершения.")
+                        return true
+                    }
+                    if (datasetManager.isArchiveBusy()) {
+                        sender.sendMessage("§c[DaynAC] Идёт архивирование датасета — дождитесь завершения и повторите.")
                         return true
                     }
 
@@ -546,6 +604,78 @@ class DaynAC : JavaPlugin(), Listener {
                             training.set(false)
                         }
                     }
+                }
+                args.isNotEmpty() && args[0] == "dataset" -> {
+                    val action = args.getOrNull(1)?.lowercase()
+                    // Флаги и имя архива разделяем явно: раньше args[2] всегда считался именем, и
+                    // `export --no-salt` создавал файл "--no-salt.dac" с солью внутри.
+                    val rest = args.drop(2)
+                    val flags = rest.filter { it.startsWith("--") }.toSet()
+                    val names = rest.filterNot { it.startsWith("--") }
+                    when (action) {
+                        "export" -> {
+                            if (!flags.all { it == "--no-salt" } || names.size > 1) {
+                                sender.sendMessage("§c[DaynAC] Использование: /daynac dataset export [имя] [--no-salt]")
+                                return true
+                            }
+                            val file = if (names.isEmpty()) {
+                                File(
+                                    dataFolder,
+                                    "dataset-" + java.time.LocalDateTime.now()
+                                        .format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")) + ".dac"
+                                )
+                            } else datasetArchiveFile(names[0])
+                            if (file == null) {
+                                sender.sendMessage("§c[DaynAC] Некорректное имя архива. Использование: /daynac dataset export [имя] [--no-salt]")
+                                return true
+                            }
+                            datasetBlockReason()?.let { sender.sendMessage(it); return true }
+                            val includeSalt = "--no-salt" !in flags
+                            runDatasetJob(sender) {
+                                val result = DatasetArchive(datasetManager).export(
+                                    file, DatasetArchive.ExportOptions(includeSalt = includeSalt)
+                                )
+                                "§a[DaynAC] Архив §f${file.name}§a: ${result.bytes / 1024} КБ, " +
+                                        "${result.numericRows} числовых / ${result.rawLines} служебных строк" +
+                                        if (result.includedSalt)
+                                            "§7. В архиве есть dataset.salt — не публикуйте его"
+                                        else "§7. Соль не включена"
+                            }
+                        }
+                        "verify" -> {
+                            val file = names.singleOrNull()?.let(::datasetArchiveFile)
+                            if (file == null || flags.isNotEmpty()) {
+                                sender.sendMessage("§c[DaynAC] Использование: /daynac dataset verify <имя.dac>")
+                                return true
+                            }
+                            runDatasetJob(sender) {
+                                val info = DatasetArchive(datasetManager).verify(file)
+                                "§a[DaynAC] §f${file.name}§a: признаки v${info.featureVersion}, вход ${info.featureCount}, " +
+                                        "строк ${info.legitRows}/${info.cheatRows} (legit/cheat), " +
+                                        "${info.numericRows} числовых / ${info.rawLines} служебных, " +
+                                        "соль ${if (info.includedSalt) "есть" else "нет"}"
+                            }
+                        }
+                        "import" -> {
+                            val file = names.singleOrNull()?.let(::datasetArchiveFile)
+                            if (file == null || !flags.all { it == "--replace-salt" }) {
+                                sender.sendMessage("§c[DaynAC] Использование: /daynac dataset import <имя.dac> [--replace-salt]")
+                                return true
+                            }
+                            datasetBlockReason()?.let { sender.sendMessage(it); return true }
+                            runDatasetJob(sender) {
+                                val result = DatasetArchive(datasetManager).import(
+                                    file, DatasetArchive.ImportOptions(replaceSalt = "--replace-salt" in flags)
+                                )
+                                "§a[DaynAC] Датасет восстановлен: ${result.numericRows} числовых / ${result.rawLines} служебных строк" +
+                                        if (result.saltReplaced) "§7. Соль заменена, прежняя сохранена в *.preimport-*.bak" else ""
+                            }
+                        }
+                        else -> sender.sendMessage(
+                            "§c[DaynAC] Использование: /daynac dataset <export [имя] [--no-salt]|verify <имя>|import <имя> [--replace-salt]>"
+                        )
+                    }
+                    return true
                 }
                 args.isNotEmpty() && args[0] == "allinfo" -> {
                     val admin = sender as? Player
@@ -932,7 +1062,7 @@ class DaynAC : JavaPlugin(), Listener {
                     }
                 }
                 else -> {
-                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|reset|eval|clearflags|exempt|reload>")
+                    sender.sendMessage("Неизвестная команда. Доступно: /daynac <ver|record|train|info|debug|allinfo|reset|eval|dataset|clearflags|exempt|reload>")
                 }
             }
             return true
@@ -958,6 +1088,11 @@ class DaynAC : JavaPlugin(), Listener {
                 2 -> {
                     val sub = args[0].lowercase()
                     val perm = Permissions.SUBCOMMANDS[sub]
+                    if (sub == "dataset" && perm != null && sender.hasPermission(perm)) {
+                        return listOf("export", "verify", "import")
+                            .filter { it.startsWith(args[1], ignoreCase = true) }
+                            .toMutableList()
+                    }
                     // Подсказки ников: online для всех, кто оперирует игроком по имени.
                     if (sub in setOf("ver", "record", "clearflags", "exempt") &&
                         perm != null && sender.hasPermission(perm)) {
@@ -968,6 +1103,17 @@ class DaynAC : JavaPlugin(), Listener {
                     }
                 }
                 3 -> {
+                    if (args[0].equals("dataset", ignoreCase = true) &&
+                        sender.hasPermission(Permissions.DATASET) &&
+                        args[1] in setOf("verify", "import")
+                    ) {
+                        return (dataFolder.listFiles { f -> f.isFile && f.name.endsWith(".dac") }
+                            ?: emptyArray())
+                            .map { it.name }
+                            .filter { it.startsWith(args[2], ignoreCase = true) }
+                            .toMutableList()
+                    }
+
                     if (args[0].equals("record", ignoreCase = true) && sender.hasPermission(Permissions.RECORD)) {
                         return listOf("legit", "cheat", "off")
                             .filter { it.startsWith(args[2], ignoreCase = true) }
@@ -976,6 +1122,22 @@ class DaynAC : JavaPlugin(), Listener {
                     if (args[0].equals("exempt", ignoreCase = true) && sender.hasPermission(Permissions.EXEMPT_MANAGE)) {
                         return listOf("30s", "5m", "30m", "1h", "6h", "24h", "off")
                             .filter { it.startsWith(args[2], ignoreCase = true) }
+                            .toMutableList()
+                    }
+                }
+                4 -> {
+                    if (args[0].equals("dataset", ignoreCase = true) && args[1].equals("import", ignoreCase = true) &&
+                        sender.hasPermission(Permissions.DATASET)
+                    ) {
+                        return listOf("--replace-salt")
+                            .filter { it.startsWith(args[3], ignoreCase = true) }
+                            .toMutableList()
+                    }
+                    if (args[0].equals("dataset", ignoreCase = true) && args[1].equals("export", ignoreCase = true) &&
+                        sender.hasPermission(Permissions.DATASET)
+                    ) {
+                        return listOf("--no-salt")
+                            .filter { it.startsWith(args[3], ignoreCase = true) }
                             .toMutableList()
                     }
                 }

@@ -17,7 +17,7 @@ class PermissionsTest {
 
     private val allPermissions = listOf(
         Permissions.ADMIN, Permissions.VIEW, Permissions.ALERTS, Permissions.SPECTATE,
-        Permissions.RECORD, Permissions.TRAIN, Permissions.CONFIG,
+        Permissions.RECORD, Permissions.TRAIN, Permissions.DATASET, Permissions.CONFIG,
         Permissions.EXEMPT, Permissions.EXEMPT_MANAGE
     )
 
@@ -72,6 +72,7 @@ class PermissionsTest {
         assertEquals(Permissions.RECORD, Permissions.SUBCOMMANDS["record"])
         assertEquals(Permissions.TRAIN, Permissions.SUBCOMMANDS["train"])
         assertEquals(Permissions.TRAIN, Permissions.SUBCOMMANDS["eval"])
+        assertEquals(Permissions.DATASET, Permissions.SUBCOMMANDS["dataset"])
         assertFalse(Permissions.SUBCOMMANDS["record"] == Permissions.VIEW)
     }
 

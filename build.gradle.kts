@@ -80,6 +80,20 @@ tasks {
         )
     }
 
+    // Архиватор датасета: тот же код, что и у /daynac dataset, но без запуска сервера.
+    // Пример: ./gradlew datasetExport --args="run/plugins/DaynAC run/dataset.dac"
+    fun datasetCli(name: String, description: String, action: String) = register<JavaExec>(name) {
+        group = "dataset"
+        this.description = description
+        classpath = sourceSets.test.get().runtimeClasspath
+        mainClass.set("zov.grusha.daynAC.ml.DatasetArchiveCliKt")
+        systemProperty("daynac.dataset.action", action)
+        jvmArgs("-Xmx1G")
+    }
+    datasetCli("datasetExport", "Pack the CSV dataset into a verified .dac archive", "export")
+    datasetCli("datasetVerify", "Verify a .dac archive without touching the dataset", "verify")
+    datasetCli("datasetImport", "Restore a verified .dac archive into the dataset folder", "import")
+
     runServer {
         // Configure the Minecraft version for our task.
         // This is the only required configuration besides applying the plugin.
